@@ -1,5 +1,8 @@
 # frostgate
 
+[![CI](https://github.com/ilyasmohaimel/frostgate/actions/workflows/ci.yml/badge.svg)](https://github.com/ilyasmohaimel/frostgate/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ilyasmohaimel/frostgate)](https://goreportcard.com/report/github.com/ilyasmohaimel/frostgate)
+
 > A fast, concurrent health-and-latency sentinel for self-hosted anti-censorship
 > endpoints (VLESS-Reality, Hysteria 2, TCP/TLS/HTTP) — written in Go, ships as a
 > single static ARM binary.
