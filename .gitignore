@@ -1,0 +1,15 @@
+# Binaries
+/frostgate
+/frostgate.exe
+/dist/
+*.exe
+*.test
+*.out
+
+# Local config (may contain real endpoint hostnames)
+/frostgate.yaml
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
