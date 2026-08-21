@@ -32,6 +32,7 @@ dist: ## Cross-compile static binaries (linux/amd64, linux/arm64)
 	mkdir -p dist
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-amd64 $(PKG)
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-arm64 $(PKG)
+	cd dist && sha256sum $(BINARY)-linux-amd64 $(BINARY)-linux-arm64 > SHA256SUMS && cat SHA256SUMS
 
 clean: ## Remove build artifacts
 	rm -f $(BINARY) $(BINARY).exe /tmp/frostgate-check

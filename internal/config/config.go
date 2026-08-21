@@ -114,10 +114,33 @@ func (e Endpoint) EffectiveURL() string {
 func (e Endpoint) HasCustomTimeout() bool { return e.Timeout.Duration != 0 }
 func (e Endpoint) HasCustomSamples() bool { return e.Samples != 0 }
 
+type BenchmarkConfig struct {
+	DownloadBytes int64  `yaml:"download_bytes,omitempty"`
+	DownloadURL   string `yaml:"download_url,omitempty"`
+}
+
+type HistoryConfig struct {
+	Enabled       *bool    `yaml:"enabled,omitempty"`
+	Retention     Duration `yaml:"retention,omitempty"`
+	WatchInterval Duration `yaml:"watch_interval,omitempty"`
+}
+
+type Destination struct {
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
+}
+
+type NetworkCheckConfig struct {
+	Destinations []Destination `yaml:"destinations,omitempty"`
+}
+
 type Config struct {
-	Defaults  Defaults      `yaml:"defaults"`
-	SingBox   SingBoxConfig `yaml:"singbox"`
-	Endpoints []Endpoint    `yaml:"endpoints"`
+	Defaults     Defaults           `yaml:"defaults"`
+	SingBox      SingBoxConfig      `yaml:"singbox"`
+	Benchmark    BenchmarkConfig    `yaml:"benchmark,omitempty"`
+	History      HistoryConfig      `yaml:"history,omitempty"`
+	NetworkCheck NetworkCheckConfig `yaml:"network_check,omitempty"`
+	Endpoints    []Endpoint         `yaml:"endpoints"`
 }
 
 const (
@@ -160,6 +183,25 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) error {
+	if cfg.Benchmark.DownloadBytes == 0 {
+		cfg.Benchmark.DownloadBytes = 8 * 1024 * 1024
+	}
+	if cfg.Benchmark.DownloadURL == "" {
+		cfg.Benchmark.DownloadURL = DefaultTestURL
+		// Actually benchmark default is speed.cloudflare
+		cfg.Benchmark.DownloadURL = "https://speed.cloudflare.com/__down?bytes=8000000"
+	}
+	if cfg.History.Retention.Duration == 0 {
+		cfg.History.Retention.Duration = 90 * 24 * time.Hour
+	}
+	if cfg.History.WatchInterval.Duration == 0 {
+		cfg.History.WatchInterval.Duration = 5 * time.Minute
+	}
+	if cfg.History.Enabled == nil {
+		def := true
+		cfg.History.Enabled = &def
+	}
+
 	if cfg.Defaults.Timeout.Duration == 0 {
 		cfg.Defaults.Timeout.Duration = DefaultTimeout
 	}

@@ -3,53 +3,53 @@
 [![CI](https://github.com/ilyasmohaimel/frostgate/actions/workflows/ci.yml/badge.svg)](https://github.com/ilyasmohaimel/frostgate/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ilyasmohaimel/frostgate)](https://goreportcard.com/report/github.com/ilyasmohaimel/frostgate)
 
-> Fast, local route sentinel — tells you which of *your* proxy routes actually works end-to-end and which to use.
+> Fast, local route toolkit — paste a proxy link and know which route actually works.
 
-**Port open ≠ proxy healthy.** Frostgate tests traffic *through* your tunnel, not just to it.
+**Port open ≠ proxy healthy.** Frostgate tests traffic *through* your tunnel, not just to it. No account, no cloud, no telemetry — everything stays on your machine.
 
 ---
 
-## 1-minute first-time flow
+## What Frostgate does
 
-```sh
-# 1. install (binary only, no VPS needed)
-curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/install.sh | sh
-
-# 2. verify
-frostgate --version
-frostgate --help
-
-# 3. setup (interactive — creates your private config)
-frostgate setup
-
-# 4. check
-frostgate --doctor
-frostgate
-frostgate --watch   # live TUI, q to quit
-```
-
-Installing Frostgate **does not** give you a proxy, does not configure a VPS, and does not grant access to anyone else's server. You supply your own infrastructure (or just test direct internet).
+- Paste proxy links directly — no JSON editing
+- Import subscriptions (plain, base64, Clash YAML, sing-box JSON)
+- End-to-end health checks (through sing-box)
+- Latency / loss / jitter
+- Real per-route download benchmarks
+- Failure diagnosis
+- Network / censorship-related signals
+- Compare home vs dorm vs mobile networks
+- Local history (bbolt, no CGO, no secrets)
+- Explainable recommendations (reliability > speed)
+- Live TUI + JSON/NDJSON automation
 
 ---
 
 ## Install
 
-### Recommended (binary)
+### Recommended
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/install.sh | sh
+
+frostgate --version
+frostgate --help
+
+frostgate setup
 ```
 
-Installs to `~/.local/bin/frostgate` (no `sudo`, no private config, no VPS contact). The script tries a prebuilt static binary for `linux-amd64` / `linux-arm64`; on `darwin` or other arches it falls back to `go install`.
+Installs to `~/.local/bin/frostgate` (no `sudo`, no VPS contact). Detects OS/kernel/arch/distro/shell/existing install locally (no telemetry). Verifies `SHA256SUMS` when available with `sha256sum`/`shasum`/`openssl`.
+
+On `linux-amd64` / `linux-arm64` uses prebuilt static binary. On `darwin`/other, `install.sh` falls back to `go install`.
 
 ### Via Go
 
 ```sh
 go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest
-# binary lands in $(go env GOPATH)/bin or ~/go/bin
+# binary in $(go env GOPATH)/bin or ~/go/bin
 ```
 
-If `go install @latest` fails with `sumdb 404` right after a release, use `GOSUMDB=off GOPROXY=direct go install ...@latest` once — sumdb catches up within minutes.
+If `go install @latest` fails with `sumdb 404` right after release: `GOSUMDB=off GOPROXY=direct go install ...@latest`.
 
 ### Manual binary
 
@@ -58,171 +58,583 @@ mkdir -p ~/.local/bin
 curl -fsSL https://github.com/ilyasmohaimel/frostgate/releases/latest/download/frostgate-linux-amd64 -o ~/.local/bin/frostgate
 chmod +x ~/.local/bin/frostgate
 # arm64: frostgate-linux-arm64
+# Verify:
+# curl -fsSL https://github.com/ilyasmohaimel/frostgate/releases/latest/download/SHA256SUMS | grep frostgate-linux-amd64
+# sha256sum ~/.local/bin/frostgate
 ```
 
-Only `linux-amd64` and `linux-arm64` have prebuilt binaries. macOS users should use `go install` or `install.sh` (which will automatically use `go install`).
+Only `linux-amd64` and `linux-arm64` have prebuilt binaries in v0.4.0. macOS/Windows prebuilt binaries are **planned, not yet first-class**. macOS users should use `go install`; Windows users should use WSL (treated as Linux).
 
-### Verify
+### Verify PATH
 
 ```sh
 frostgate --version
-frostgate --help
-```
-
-If `~/.local/bin` is not in `PATH`:
-
-```sh
-# bash/zsh
-export PATH="$HOME/.local/bin:$PATH"
-# fish
-fish_add_path ~/.local/bin
+# if not found:
+# bash/zsh: export PATH="$HOME/.local/bin:$PATH"
+# fish:     fish_add_path ~/.local/bin
 ```
 
 ---
 
-## After installation
+## Quick start (60 seconds)
 
-Frostgate is a **tester**, not a proxy. It does not route your normal traffic.
+```sh
+curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/install.sh | sh
+frostgate setup
+frostgate
+```
 
-- **Without a VPS:** you can still check direct internet.
-- **With a VPS:** Frostgate can test your VLESS/REALITY, Hysteria2, etc. through a local `sing-box` — you provide the VPS and credentials.
+Then:
+
+```sh
+frostgate benchmark
+```
 
 ---
 
-## Easiest first test (no VPS needed)
+## Paste a proxy link and go
 
-Frostgate works out of the box with a direct baseline. The setup wizard can create this for you, or do it manually:
+**Quote the URL** — query strings contain `&`, `?`, `#`.
 
 ```sh
-mkdir -p ~/.config/frostgate
-cat > ~/.config/frostgate/config.yaml <<'EOF'
+frostgate add 'vless://YOUR_LINK'
+frostgate add 'hysteria2://YOUR_LINK'
+# hy2:// alias also works
+```
+
+Frostgate will:
+
+- parse it (VLESS + REALITY + Vision, Hysteria2/salamander, IPv4/IPv6, fragment name, URL encoding, `hy2://`)
+- validate required fields (UUID, server, port, REALITY pbk/sni, Hysteria password, etc.)
+- derive a sensible route name (from `#fragment` or protocol)
+- allow `--name my-reality` override
+- dedupe via fingerprint (won't add same route 17 times if name changes)
+- backup `~/.config/frostgate/` to `backup-<timestamp>/`
+- update private `sing-box.json` + `config.yaml` (0600)
+- `sing-box check`
+- reload only the Frostgate sidecar (`127.0.0.1:9090`, never `0.0.0.0`)
+- test the new route end-to-end
+- report `latency/loss/jitter`
+
+Example:
+
+```
+Importing route...
+parsed VLESS + REALITY + Vision (jp-reality)
+sing-box config valid
+sidecar reloaded
+
+jp-reality
+Latency: 143ms
+Loss:    0%
+
+Route added.
+```
+
+If validation fails, the working config is rolled back. Duplicate:
+
+```
+Route already exists: primary-reality
+```
+
+No UUID/password/public-key is ever printed.
+
+---
+
+## Have a subscription?
+
+```sh
+frostgate import 'https://provider.example/subscription'
+```
+
+Frostgate:
+
+- fetches with timeout, 2 MiB limit, 5-redirect limit, `User-Agent: frostgate/0.4.0`, `https` by default
+- rejects `file://`, `data:`, `javascript:`; `http://` is allowed with context but `https` is preferred (no token logging)
+- does **not** store the subscription URL (one-time import)
+- decodes base64 subscriptions, parses Clash YAML and sing-box JSON where conversion is reliable
+- deduplicates, validates, writes private sidecar config, reloads, tests and ranks
+
+```
+Imported 23 routes.
+
+TESTING...
+
+ 1. JP Reality 03      UP     118ms
+ 2. HK Hysteria2       UP     124ms
+ ...
+
+20/23 usable.
+```
+
+Unsupported nodes are skipped with summary:
+
+```
+Imported: 17
+Skipped: 4
+
+Skipped:
+- 2 Trojan routes: unsupported
+- 1 malformed VLESS route
+- 1 unsupported transport
+```
+
+Zero usable routes → failure (not silent success).
+
+---
+
+## Test before adding
+
+```sh
+frostgate test 'vless://...'
+```
+
+Temporary, isolated, **no persistence**:
+
+- parses link
+- creates `0700` temp dir + `0600` config, random `127.0.0.1` ports, no secrets on cmdline
+- starts isolated sing-box, tests end-to-end, measures latency/jitter + download where possible
+- cleans up on `SIGINT`/`SIGTERM`/timeout/panic — no temp secrets remain
+- never modifies your Frostgate config
+
+```
+Protocol: VLESS + REALITY
+Status:   HEALTHY
+Loss:     0%
+Median:   156ms
+Jitter:   11ms
+Download: 72.4 Mbps
+
+This route was NOT saved.
+Use `frostgate add` to keep it.
+```
+
+Share link is never echoed.
+
+---
+
+## Benchmark everything
+
+```sh
+frostgate benchmark
+```
+
+Measures **per route** (traffic really goes through that outbound via `127.0.0.1:2080` → `frostgate-selector`):
+
+- status / loss / median / jitter / **real download Mbps**
+
+~8 MiB per route by default (`https://speed.cloudflare.com/__down?bytes=8000000`), configurable via `benchmark.download_bytes` / `download_url`. Expect ~8 MB per route; README documents this. Large lists (e.g. 100 routes → ~800 MiB) prompt for confirmation `[y/N]` in interactive mode.
+
+```
+FROSTGATE BENCHMARK
+
+ROUTE              STATUS   LOSS   MEDIAN   JITTER   DOWNLOAD
+Hysteria2          UP         0%    171ms      8ms    126 Mbps
+Primary Reality    UP         0%    278ms     14ms     81 Mbps
+Backup 03          DEGRADED   5%    205ms     42ms     36 Mbps
+
+BEST OVERALL: Hysteria2
+...
+```
+
+There is **no** `frostgate benchmark --throughput` — speed is already included. For metered connections:
+
+```sh
+frostgate benchmark --no-speed
+```
+
+Throughput tests run **sequentially** (not 100 parallel) for accurate results; latency probes stay concurrent but bounded. After benchmark, an explainable recommendation is shown — you don't need to run `frostgate recommend` immediately, but it exists for later queries.
+
+For network comparison:
+
+```sh
+frostgate benchmark --network home
+frostgate benchmark --network dorm
+frostgate benchmark --network mobile
+frostgate compare
+```
+
+---
+
+## Why is my proxy broken?
+
+```sh
+frostgate diagnose
+frostgate diagnose primary-reality
+```
+
+Layered, evidence-based diagnosis:
+
+- local network / interfaces
+- system DNS
+- direct internet / HTTPS `generate_204`
+- sing-box binary / sidecar (`frostgate-singbox.service`) / controller auth
+- outbound exists
+- server hostname resolves / TCP/443 reachability
+- end-to-end proxy URL test (authoritative)
+- backup route comparison
+
+```
+PRIMARY-REALITY
+
+Local internet            PASS
+DNS                       PASS
+Server TCP/443            PASS
+sing-box sidecar          PASS
+Controller                PASS
+Outbound exists           PASS
+End-to-end proxy          FAIL
+
+Likely problem:
+The server is reachable, but traffic cannot complete through the configured proxy outbound.
+
+Possible area:
+REALITY/VLESS authentication, transport configuration, server-side routing, or filtering on current network.
+
+Backup:
+Hysteria2 is working normally.
+```
+
+Wording is `likely`/`possible` unless the error proves the cause. Normal `frostgate` output may add a small hint; detailed diagnosis is behind `diagnose`.
+
+Supports `--json`.
+
+---
+
+## Is my network blocking something?
+
+```sh
+frostgate network-check
+```
+
+**Signals, not mathematical proof.** Frostgate does not claim to "detect the GFW".
+
+Checks:
+
+- default connectivity / IPv4 / IPv6 / HTTPS / captive portal (204)
+- system DNS vs trusted DoH (Cloudflare) — reports `Answers differ` not `POISONED` (CDNs legitimately differ)
+- UDP where meaningful (but `QUIC: not directly tested` if not reliable)
+- configured proxy routes
+- destination reachability (configurable): `https://github.com/`, `https://www.wikipedia.org/`, `https://www.google.com/generate_204`, `neutral` target
+
+```
+FROSTGATE NETWORK CHECK
+
+Connection
+IPv4                    PASS
+IPv6                    UNAVAILABLE
+HTTPS                   PASS
+Captive portal          NO
+
+DNS
+System resolver         PASS
+DoH resolver            PASS
+Answers differ          YES
+
+Routes
+Direct                  PASS
+Reality                 PASS
+Hysteria2               PASS
+
+Destinations
+GitHub direct           PASS
+Google direct           FAIL
+Google via Reality      PASS
+Google via Hysteria2    PASS
+
+Signals
+- direct access differs by destination
+- DNS answers differ from DoH
+- both configured proxy routes work
+
+Recommendation
+Use Hysteria2 on this network: fastest healthy route today.
+```
+
+Destinations are configurable via `network_check.destinations`.
+
+---
+
+## Compare networks
+
+```sh
+frostgate benchmark --network home
+frostgate benchmark --network dorm
+frostgate benchmark --network mobile
+frostgate compare
+```
+
+`--network <label>` writes `network=dorm` into history; `frostgate compare` queries last 30 days.
+
+```
+NETWORK COMPARISON
+
+                    HOME       DORM       MOBILE
+Reality
+  Availability       100%        72%         91%
+  Median             181ms      320ms       244ms
+  Download            84Mb       18Mb        51Mb
+
+Hysteria2
+  Availability       100%       100%        100%
+  Median             165ms      204ms       191ms
+  Download           132Mb       76Mb        89Mb
+
+Best:
+Home       Hysteria2
+Dorm       Hysteria2
+Mobile     Hysteria2
+```
+
+Labels are explicit — no NetworkManager/SSID dependency. Windows/macOS portability preserved.
+
+---
+
+## History
+
+Local-only, no cloud, no telemetry, no secrets.
+
+```sh
+frostgate history
+frostgate history --since 7d
+frostgate history --route primary-reality
+frostgate history --network dorm
+frostgate history --json
+```
+
+Storage: `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/frostgate/history.db` (bbolt, pure Go, no CGO, static binaries, `0600`, atomic).
+
+Stores: `timestamp/route/type/status/loss/median/min/max/mean/jitter/download/network/error-category` — **never** `UUID/password/VLESS URL/subscription URL/REALITY key/controller secret`.
+
+Automatically records normal `frostgate` runs, `benchmark`, `network-check`. Watch mode rate-limits to one snapshot per `5m` (configurable via `history.watch_interval`).
+
+```
+LAST 24 HOURS
+
+Reality
+Availability      96.3%
+Median            213ms
+Jitter            17ms
+Failures          11
+Trend             getting worse
+
+Hysteria2
+Availability      99.9%
+Median            174ms
+Jitter             8ms
+Failures           1
+Trend             stable
+
+Most reliable: Hysteria2
+```
+
+Retention: 90 days default (`history.retention: 90d`), auto-pruned.
+
+---
+
+## Recommend
+
+```sh
+frostgate recommend
+# also shown after benchmark
+```
+
+Deterministic, explainable, not AI.
+
+Inputs: health / loss / median / jitter / download / configured `priority` / history reliability / network-specific history.
+
+Priority is a **preference, not a command**. Example:
+
+- `Reality: 0% loss 280ms 80 Mbps prio 10` vs `Hysteria: 0% loss 170ms 125 Mbps prio 20` → `Hysteria best overall` (huge difference beats preference).
+- `Reality: 180ms` vs `Hysteria: 170ms` both stable → preference may decide `Reality`.
+- Uses ~30ms latency / 20 Mbps throughput "close enough" threshold, then priority tie-break.
+- Unstable faster route loses: `120ms/20% loss` < `160ms/0% loss`.
+- `down` never recommended; `degraded` only if no healthy.
+
+```
+RECOMMENDATION
+
+Best overall:
+Hysteria2
+
+Why:
+✓ 0% loss
+✓ 171ms median
+✓ 126 Mbps
+✓ lowest jitter
+✓ 99.9% availability over the last 7 days
+
+Preferred configured route:
+Reality
+
+Reality is currently ~107ms slower and ~45 Mbps slower.
+
+Most stable:
+Hysteria2
+
+Avoid:
+US Backup
+Reason: 34% loss
+
+Confidence: high
+Based on 53 measurements over 7 days
+```
+
+Confidence: `high` ≥50, `medium` ≥10, else `low`.
+
+Categories: `Best overall`, `Fastest`, `Most stable`, `Best fallback`, `Avoid`, `Configured preferred`.
+
+---
+
+## Normal `frostgate` vs benchmark
+
+```sh
+frostgate          # fast, low bandwidth: loss/median/jitter only
+frostgate benchmark # also downloads ~8 MiB per route
+```
+
+Don't burn data on every check.
+
+---
+
+## JSON automation
+
+```sh
+frostgate --json
+frostgate --watch --json   # NDJSON
+frostgate benchmark --json
+frostgate diagnose primary-reality --json
+frostgate network-check --json
+frostgate history --json
+frostgate recommend --json
+```
+
+`schema_version: 2` (+ `download_mbps`/`network`/`recommendation` where relevant). Never includes secrets. If this is a breaking change, schema version is incremented.
+
+---
+
+## Setup wizard
+
+```sh
+frostgate setup
+```
+
+- Preflight OS/arch, `0700` config dir, sing-box detection/install
+- `1` Import links (`vless://`/`hysteria2://`/`hy2://`), `2` existing controller, `3` direct only
+- Generates `controller-secret` (`0600`), `sing-box.json` (`0600`) with `127.0.0.1:9090` only, loopback `frostgate-mixed:2080` + `frostgate-selector`
+- `config.yaml` (`0600`)
+- Optional `frostgate-singbox.service` (`%h`, no secrets in ExecStart)
+- Validates with `sing-box check`, `frostgate --check/--doctor`, real probe
+
+Re-run is safe: `[a] Add route / [r] Reconfigure / [x] Reset (requires YES) / [c] Cancel` with `backup-<timestamp>/`.
+
+Final screen:
+
+```
+Frostgate setup complete.
+
+Routes:
+✓ primary-reality
+✓ hysteria2
+✓ direct
+
+Try:
+  frostgate
+  frostgate benchmark
+  frostgate --watch
+
+Useful:
+  frostgate diagnose
+  frostgate network-check
+  frostgate history
+```
+
+Internally `setup` reuses the same `route` import logic as `frostgate add`.
+
+---
+
+## Advanced configuration (most users don't need to edit)
+
+```yaml
 defaults:
   timeout: 5s
   samples: 4
   sample_interval: 150ms
   healthy_latency: 800ms
   max_jitter: 80ms
-endpoints:
-  - name: direct
-    type: http
-    url: https://www.gstatic.com/generate_204
-    priority: 100
-EOF
-chmod 600 ~/.config/frostgate/config.yaml
-```
 
-Then:
-
-```sh
-frostgate --check   # validates config
-frostgate           # one real measurement
-```
-
-Expected:
-
-```
-ROUTE     TYPE  STATUS  LOSS  MEDIAN  JITTER
-direct    http  ● up      0%     25ms      3ms
-
-best route: direct (25ms)
-```
-
-If this works, Frostgate itself is ready. Add proxy routes next.
-
----
-
-## Connect Frostgate to your own VPS
-
-```
-Frostgate → local sing-box (Clash API 127.0.0.1:9090) → your VPS
-                                                  → your REALITY  → internet
-                                                  → your Hysteria2 → internet
-```
-
-**You need your own VPS** (Oracle, Hetzner, any). Frostgate never contains or fetches anyone else's VPS, UUID, or keys. Each user pastes *their own* share links during `frostgate setup`.
-
-### Server vs client
-
-```text
-VPS (server):
-  Xray/VLESS+REALITY  (tcp/443)
-  Hysteria2           (udp/443)
-
-Your PC (client):
-  Frostgate
-  sing-box  (sidecar or your existing client)
-```
-
-VPS credentials belong in **your private** `~/.config/frostgate/sing-box.json` (mode `0600`), never in Git.
-
----
-
-## Recommended: `frostgate setup`
-
-This is the primary way — it creates everything safely with `0700`/`0600` permissions and never logs your share links.
-
-```sh
-frostgate setup
-```
-
-What it does:
-
-1. **Preflight** — checks OS/arch, creates `~/.config/frostgate` (`0700`), detects `sing-box`, offers to install stable `sing-box` if missing (via `pacman` on Arch or static binary on Linux; on macOS it points to docs).
-2. **Choose mode**
-   - `1` Import proxy route(s) — paste `vless://` / `hysteria2://` / `hy2://`
-   - `2` Use existing sing-box controller (advanced)
-   - `3` Direct only
-3. **Import** — paste one or more share links, name each route (`reality-primary`, `hysteria-backup`), add another? `[y/N]`. Direct baseline (`https://www.gstatic.com/generate_204`) is added by default.
-4. **Controller** — generates a random secret to `~/.config/frostgate/controller-secret` (`0600`), binds Clash API to `127.0.0.1:9090` only (never `0.0.0.0`).
-5. **Generate** — writes `sing-box.json` (`0600`) and `config.yaml` (`0600`) with your outbound tags.
-6. **Sidecar** — on Linux, offers to install `~/.config/systemd/user/frostgate-singbox.service` (`%h`, no secrets in ExecStart) and `systemctl --user enable --now`.
-7. **Validate** — runs `sing-box check`, `frostgate --check`, `frostgate --doctor`, and a real probe. It won't say “complete” if doctor still fails.
-
-Re-running `frostgate setup` is safe: it detects existing config and offers `[a] Add route / [r] Reconfigure / [x] Reset (requires YES) / [c] Cancel`, backing up to `~/.config/frostgate/backup-<timestamp>/` before destructive changes.
-
-After:
-
-```sh
-frostgate --doctor
-frostgate
-```
-
----
-
-## Manual alternative (advanced)
-
-If you already have a working `sing-box`, you can reuse it:
-
-```yaml
-# ~/.config/frostgate/config.yaml
 singbox:
   controller: http://127.0.0.1:9090
-  secret_file: ~/.config/frostgate/controller-secret   # or FROSTGATE_SINGBOX_SECRET
+  secret_file: ~/.config/frostgate/controller-secret
   test_url: https://www.gstatic.com/generate_204
+
+benchmark:
+  download_bytes: 8388608        # ~8 MiB per route
+  download_url: https://speed.cloudflare.com/__down?bytes=8000000
+
+history:
+  enabled: true
+  retention: 90d
+  watch_interval: 5m
+
+network_check:
+  destinations:
+    - name: github
+      url: https://github.com/
+    - name: google
+      url: https://www.google.com/generate_204
+    - name: wikipedia
+      url: https://www.wikipedia.org/
+
 endpoints:
-  - name: reality
-    type: singbox
-    outbound: reality-primary   # must match sing-box outbound tag
-    priority: 10
-  - name: hysteria2
-    type: singbox
-    outbound: hysteria-backup
-    priority: 20
   - name: direct
     type: http
     url: https://www.gstatic.com/generate_204
     priority: 100
+  - name: primary-reality
+    type: singbox
+    outbound: primary-reality
+    priority: 10
 ```
 
-`secret_file` supports `~` (expanded) or absolute path. You can also set `singbox.secret` directly (less recommended) or `FROSTGATE_SINGBOX_SECRET` env.
+Manual config is the **advanced path** — most users should prefer `frostgate setup` / `add` / `import`.
+
+---
+
+## Existing sing-box
+
+Link: `outbound: primary-reality` must exactly match `"tag": "primary-reality"` in `sing-box.json`.
+
+For end-to-end latency, Frostgate uses controller `GET /proxies/<tag>/delay?url=...`. For throughput, it switches `PUT /proxies/frostgate-selector` and downloads via `127.0.0.1:2080` (loopback only) when using the managed sidecar. If you bring your own controller without that selector/mixed inbound, `Download: N/A` with a `doctor` hint — throughput is not faked.
+
+---
+
+## Secret handling
+
+Share URLs **contain secrets** (UUID, password). Subscription URLs may contain tokens.
+
+- **Quote them**: `frostgate add 'vless://...'`
+- **Never commit** `~/.config/frostgate/` (`config.yaml`, `sing-box.json`, `controller-secret`, `mixed` inbound). Frostgate ships with only `203.0.113.0/24`, `example.com`, `YOUR_*` placeholders.
+- Frostgate stores imported credentials only in your private local config (`0600`), never in Git.
+- `history` excludes them (checked by tests). `logs`, `errors`, `history`, `JSON`, `TUI`, `tests`, `process args` are redacted via a central helper (no 8 slightly-different implementations).
+- Temporary `frostgate test` configs use `0700` dir + `0600` file, random loopback ports, no creds on cmdline, and are deleted even on `SIGINT`/`SIGTERM`/panic.
+
+---
+
+## After installation
+
+Frostgate is a tester, not a proxy. It doesn't route your apps.
+
+- Without VPS: direct baseline (`https://www.gstatic.com/generate_204`) works immediately (`frostgate setup → 3`).
+- With VPS: add your own VLESS/REALITY/Hysteria2 via `setup`/`add`/`import`; Frostgate's local sing-box sidecar does the tunneling.
+
+```
+Frostgate → local sing-box (127.0.0.1:9090) → your VPS → internet
+```
 
 ---
 
 ## sing-box examples (placeholders only)
-
-Use **current stable sing-box** syntax. Replace `YOUR_*` with your values — nothing here connects to any real server.
-
-### VLESS + REALITY
 
 ```json
 {
@@ -235,21 +647,12 @@ Use **current stable sing-box** syntax. Replace `YOUR_*` with your values — no
   "tls": {
     "enabled": true,
     "server_name": "YOUR_SNI",
-    "utls": {
-      "enabled": true,
-      "fingerprint": "chrome"
-    },
-    "reality": {
-      "enabled": true,
-      "public_key": "YOUR_REALITY_PUBLIC_KEY",
-      "short_id": "YOUR_SHORT_ID"
-    }
+    "utls": { "enabled": true, "fingerprint": "chrome" },
+    "reality": { "enabled": true, "public_key": "YOUR_REALITY_PUBLIC_KEY", "short_id": "YOUR_SHORT_ID" }
   },
   "packet_encoding": "xudp"
 }
 ```
-
-### Hysteria2
 
 ```json
 {
@@ -258,200 +661,79 @@ Use **current stable sing-box** syntax. Replace `YOUR_*` with your values — no
   "server": "YOUR_SERVER",
   "server_port": 443,
   "password": "YOUR_HYSTERIA_PASSWORD",
-  "obfs": {
-    "type": "salamander",
-    "password": "YOUR_SALAMANDER_PASSWORD"
-  },
-  "tls": {
-    "enabled": true,
-    "server_name": "YOUR_SNI",
-    "insecure": false
-  }
+  "obfs": { "type": "salamander", "password": "YOUR_SALAMANDER_PASSWORD" },
+  "tls": { "enabled": true, "server_name": "YOUR_SNI" }
 }
 ```
-
-### If you already have sing-box
-
-Just ensure your existing `sing-box.json` has a `tag` for each outbound you want tested, expose the Clash API on `127.0.0.1`, and point Frostgate at that controller/tags. `frostgate setup → 2` does exactly this without touching your sing-box config.
-
-### Dedicated sidecar (recommended)
-
-```
-~/.config/frostgate/
-├── config.yaml          0600
-├── sing-box.json        0600  ← your proxy credentials here
-└── controller-secret    0600
-```
-
-Permissions:
-
-```sh
-chmod 700 ~/.config/frostgate
-chmod 600 ~/.config/frostgate/config.yaml
-chmod 600 ~/.config/frostgate/sing-box.json
-chmod 600 ~/.config/frostgate/controller-secret
-```
-
-Frostgate never commits these; `.gitignore` ignores local `frostgate.yaml`.
 
 ---
 
 ## Controller security
 
-`sing-box.json` must contain:
-
-```json
-"experimental": {
-  "clash_api": {
-    "external_controller": "127.0.0.1:9090",
-    "secret": "YOUR_RANDOM_SECRET"
-  }
-}
-```
-
-Never `0.0.0.0` for normal use — the Clash API exposes control locally. Frostgate `setup` generates a random secret to `controller-secret` and uses `secret_file`.
-
-Frostgate supports `singbox.secret`, `singbox.secret_file`, or env `FROSTGATE_SINGBOX_SECRET` (env wins if set). Errors and JSON never dump UUIDs, keys, or tokens.
-
----
-
-## Outbound tags
-
-`outbound: primary-reality` in `config.yaml` must exactly match `"tag": "primary-reality"` in `sing-box.json`. That's the only link.
+`sing-box.json` → `experimental.clash_api.external_controller: "127.0.0.1:9090"` + `secret` (random, never `0.0.0.0`). Frostgate supports `singbox.secret`, `secret_file`, or `FROSTGATE_SINGBOX_SECRET` (env wins). Errors/JSON never dump secrets.
 
 ---
 
 ## Running the sidecar
 
-**Manual:**
-
 ```sh
 sing-box check -c ~/.config/frostgate/sing-box.json
 sing-box run -c ~/.config/frostgate/sing-box.json
-```
 
-**Systemd user service** (Linux, `%h` — no secrets in args, no root):
-
-```ini
-# ~/.config/systemd/user/frostgate-singbox.service
-[Unit]
-Description=Frostgate sing-box sidecar
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/sing-box run -c %h/.config/frostgate/sing-box.json
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.config/frostgate
-[Install]
-WantedBy=default.target
-```
-
-```sh
+# systemd user (Linux)
 systemctl --user daemon-reload
 systemctl --user enable --now frostgate-singbox.service
 systemctl --user status frostgate-singbox.service --no-pager
-ss -lntup | grep 9090   # must be 127.0.0.1:9090
+ss -lntup | grep 9090   # 127.0.0.1:9090
 ```
 
-`frostgate setup` creates this for you when you answer `Y`. On macOS/other OS, `setup` falls back to manual instructions.
+Service uses `%h` (no secrets in ExecStart), `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ReadWritePaths=%h/.config/frostgate`.
 
 ---
 
-## Verify everything
+## Verification
 
 ```sh
-frostgate --check    # config valid?
-frostgate --doctor   # sing-box + controller + outbounds + permissions
-frostgate            # one real measurement
-frostgate --watch    # live TUI (q to quit, r to refresh)
+frostgate --check
+frostgate --doctor
+frostgate
+frostgate --watch   # q quit, r refresh
+frostgate benchmark
+frostgate history
+frostgate recommend
+frostgate diagnose primary-reality
+frostgate network-check
 ```
 
-`--doctor` checks: config path/parse/permissions, test URL, DNS, `sing-box` version, controller reachable/auth, outbound tags, bind is loopback, sidecar state. Never prints secrets.
-
----
-
-## Output
-
-```
-ROUTE     TYPE     STATUS  LOSS  MEDIAN  JITTER  DETAIL
-reality   singbox  ● up      0%    180ms      8ms
-hysteria  singbox  ● up      0%    145ms      5ms
-direct    http     ● up      0%     25ms      2ms
-
-best route: reality (180ms)
-```
-
-- `STATUS` — usable? `up` / `degraded` / `down`
-- `LOSS` — failed samples / total (4 samples, 150ms apart)
-- `MEDIAN` — typical latency (median of successes)
-- `JITTER` — mean abs diff between consecutive successes; `0% loss + low jitter = stable`
-- `BEST ROUTE` — Frostgate recommends most reliable (health → loss → priority → median → jitter)
-
-`frostgate --json` emits `schema_version: 2` with `attempted/succeeded/failed/loss_pct/min/median/max/mean/jitter_ms/priority/category`. `frostgate --watch --json` is NDJSON (one JSON per interval, no ANSI).
-
----
-
-## Important limitation
-
-Frostgate **tests** routes; it does not proxy your apps. Your normal client (`Hiddify`, `v2rayN`, `sing-box` etc.) still carries traffic. Frostgate just tells you which outbound is healthy and fastest *now*. It does not auto-failover.
-
-A pass in Morocco ≠ a pass through the GFW. Test from the target network for truth. No single URL proves universal reachability.
-
----
-
-## Normal usage
-
-```sh
-frostgate                # quick check
-frostgate --watch        # live dashboard
-frostgate --doctor       # validate setup
-frostgate --json         # for scripts
-frostgate --watch --json | jq .
-```
-
-See `frostgate --help` for `--config`, `--timeout`, `--interval`, `--verbose`.
+`--doctor` checks: config path/parse/permissions, test URL, DNS, sing-box version, controller/auth, outbound tags, loopback bind, sidecar state.
 
 ---
 
 ## Update
-
-Rerun the installer — it atomically replaces the binary:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/install.sh | sh
 frostgate --version
 ```
 
-Go users: `go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest` (or `@vX.Y.Z`).
+Go users: `go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest` (or `@vX.Y.Z`). Checksums: `SHA256SUMS` is published with `v0.4.0` (`frostgate-linux-amd64`, `frostgate-linux-arm64`).
 
-### Checksums
-
-Releases currently publish only the binaries (`frostgate-linux-amd64`, `frostgate-linux-arm64`). Future releases will publish `SHA256SUMS` alongside them. You can always verify a download with:
-
-```sh
+```
 sha256sum ~/.local/bin/frostgate
-curl -fsSL https://github.com/ilyasmohaimel/frostgate/releases/latest/download/SHA256SUMS 2>/dev/null | grep frostgate || echo "no SHA256SUMS yet"
+curl -fsSL https://github.com/ilyasmohaimel/frostgate/releases/latest/download/SHA256SUMS | grep frostgate
 ```
 
-Do not trust a checksum file that is not from `https://github.com/ilyasmohaimel/frostgate/releases`.
+Only trust `https://github.com/ilyasmohaimel/frostgate/releases`.
 
 ---
 
 ## Uninstall
 
 ```sh
-rm ~/.local/bin/frostgate          # binary
-# optional: keep or remove private config
-#   keeps:  ~/.config/frostgate stays intact
-#   remove: rm -rf ~/.config/frostgate   # WARNING: deletes your Frostgate config + sing-box sidecar + controller-secret
+rm ~/.local/bin/frostgate
+# optional:
+# rm -rf ~/.config/frostgate   # WARNING: deletes config + sidecar + controller-secret
 
-# if you installed the sidecar service
 systemctl --user disable --now frostgate-singbox.service 2>/dev/null || true
 rm -f ~/.config/systemd/user/frostgate-singbox.service
 systemctl --user daemon-reload 2>/dev/null || true
@@ -459,9 +741,44 @@ systemctl --user daemon-reload 2>/dev/null || true
 
 ---
 
-## Your proxy credentials are yours
+## Limitations (honest)
 
-Frostgate ships with **no** VPS, UUID, REALITY keys, Hysteria passwords, or controller secrets. Example files use `example.com`, `203.0.113.0/24`, `YOUR_*` placeholders. Never commit your real `config.yaml`, `sing-box.json`, or `controller-secret`. The installer only installs the binary and never contacts any VPS.
+- `network-check` gives signals, not mathematical proof of censorship.
+- Speed results depend on benchmark target/network conditions; `history` is local.
+- Subscription formats vary — unsupported protocols are skipped with summary, not hidden.
+- `frostgate test`/`import` parsing supports `vless://`, `hysteria2://`, `hy2://` (REALITY/Vision common params); others (Trojan, SS, VMess) are reported as unsupported.
+- Frostgate does not route normal device traffic, does not auto-failover (planned), no web dashboard.
+- Windows/macOS prebuilt binaries are not first-class in v0.4.0 (planned: Windows + macOS Intel/Apple Silicon).
+
+---
+
+## Help
+
+```
+frostgate --help
+
+Core:
+  frostgate
+  frostgate --watch
+
+Setup:
+  frostgate setup
+  frostgate add <link> [--name name]
+  frostgate import <subscription-url>
+  frostgate test <link>
+
+Analysis:
+  frostgate benchmark [--network label] [--no-speed] [--json]
+  frostgate diagnose [route] [--json]
+  frostgate network-check [--json]
+  frostgate compare [--json]
+  frostgate recommend [--json]
+  frostgate history [--since duration] [--route name] [--network label] [--json]
+
+Diagnostics:
+  frostgate --doctor
+  frostgate --check
+```
 
 ---
 
@@ -470,21 +787,25 @@ Frostgate ships with **no** VPS, UUID, REALITY keys, Hysteria passwords, or cont
 ```sh
 make check   # fmt + vet + test + race + build
 make build
-make dist    # linux-amd64 + arm64 static
+make dist    # linux-amd64 + arm64 static + SHA256SUMS
 go test -race ./...
 ```
+
+Single Go binary, static Linux builds, pure-Go `bbolt` (no CGO, no Docker/Redis/Postgres/Electron).
+
+---
 
 ## Roadmap
 
 - [x] End-to-end via sing-box Clash API
-- [x] Live TUI (Bubble Tea)
-- [x] Multi-sample loss/jitter
-- [x] Priority-aware ranking
-- [x] `frostgate setup` wizard
-- [x] Doctor, JSON v2, XDG
-- [ ] History / Prometheus
-- [ ] Push alerts (ntfy)
-- [ ] Gated auto-failover
+- [x] Live TUI (Bubble Tea), multi-sample loss/jitter, priority ranking
+- [x] `frostgate setup` wizard, doctor, JSON v2, XDG
+- [x] `frostgate add` / `import` / `test`
+- [x] Real per-route download benchmark + `network-check` / `compare` / `history` / `recommend`
+- [x] Installer hardening with SHA256SUMS, atomic replace
+- [ ] First-class Windows + macOS Intel/Apple Silicon binaries/install (planned)
+- [ ] Gated auto-failover (planned)
+- [ ] Push alerts (ntfy) (planned)
 
 ## License
 

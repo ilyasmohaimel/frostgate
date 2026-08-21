@@ -6,6 +6,9 @@
 #   ./frostgate.yaml
 # and edit with your real endpoints. Private configs are gitignored.
 #
+# Most users should run `frostgate setup` / `frostgate add` / `frostgate import`
+# instead of editing this manually. This file is the advanced path.
+#
 # Probe types:
 #   tcp     - raw TCP connect time
 #   tls     - TCP + TLS handshake (use sni)
@@ -24,6 +27,24 @@ singbox:
   # secret: ""                  # or set FROSTGATE_SINGBOX_SECRET env
   # secret_file: ~/.config/frostgate/controller-secret
   test_url: https://www.gstatic.com/generate_204
+
+benchmark:
+  download_bytes: 8388608       # ~8 MiB per route
+  download_url: https://speed.cloudflare.com/__down?bytes=8000000
+
+history:
+  enabled: true
+  retention: 90d                # auto-prune after 90 days
+  watch_interval: 5m            # one persisted snapshot per 5m in --watch
+
+network_check:
+  destinations:
+    - name: github
+      url: https://github.com/
+    - name: wikipedia
+      url: https://www.wikipedia.org/
+    - name: google
+      url: https://www.google.com/generate_204
 
 endpoints:
   - name: direct-baseline

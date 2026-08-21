@@ -240,16 +240,16 @@ func TestResolveConfigPathXDG(t *testing.T) {
 }
 
 func TestResolveConfigPathLegacyFallback(t *testing.T) {
-	// create a temp dir and chdir there to test ./frostgate.yaml fallback
 	dir := t.TempDir()
 	oldWd, _ := os.Getwd()
 	os.Chdir(dir)
 	defer os.Chdir(oldWd)
-	// ensure XDG doesn't point to existing file
 	oldXdg := os.Getenv("XDG_CONFIG_HOME")
 	os.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "nonexistent"))
 	defer os.Setenv("XDG_CONFIG_HOME", oldXdg)
-	// create ./frostgate.yaml
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", dir)
+	defer os.Setenv("HOME", oldHome)
 	os.WriteFile(filepath.Join(dir, "frostgate.yaml"), []byte("test"), 0600)
 	got := ResolveConfigPath("")
 	if got != "frostgate.yaml" {

@@ -55,6 +55,18 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			map[string]any{"type": "block", "tag": "block"},
 		},
 	}
+	// Add benchmark selector and mixed inbound if we have proxy outbounds
+	hasProxy := len(vlessOutbounds)+len(hysteriaOutbounds) > 0
+	if hasProxy {
+		cfg["inbounds"] = []any{
+			map[string]any{
+				"type":        "mixed",
+				"tag":         "frostgate-mixed",
+				"listen":      "127.0.0.1",
+				"listen_port": 2080,
+			},
+		}
+	}
 	outbounds := cfg["outbounds"].([]any)
 	for _, v := range vlessOutbounds {
 		tlsCfg := map[string]any{
@@ -119,6 +131,37 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			// Not critical for setup
 		}
 		outbounds = append(outbounds, ob)
+	}
+	// Add selector for benchmark if we have proxies
+	if hasProxy {
+		var tags []string
+		for _, v := range vlessOutbounds {
+			tags = append(tags, v.Tag)
+		}
+		for _, h := range hysteriaOutbounds {
+			tags = append(tags, h.Tag)
+		}
+		selector := map[string]any{
+			"type":      "selector",
+			"tag":       "frostgate-selector",
+			"outbounds": tags,
+		}
+		if len(tags) > 0 {
+			selector["default"] = tags[0]
+		}
+		// Insert selector after direct/block
+		newOuts := []any{outbounds[0], outbounds[1], selector}
+		newOuts = append(newOuts, outbounds[2:]...)
+		outbounds = newOuts
+		cfg["route"] = map[string]any{
+			"rules": []any{
+				map[string]any{
+					"inbound":  "frostgate-mixed",
+					"outbound": "frostgate-selector",
+				},
+			},
+			"final": "direct",
+		}
 	}
 	cfg["outbounds"] = outbounds
 	return json.MarshalIndent(cfg, "", "  ")

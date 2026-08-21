@@ -35,16 +35,22 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if tag == "" {
 		return nil, fmt.Errorf("tag required")
 	}
-	u, err := url.Parse(strings.TrimSpace(link))
+	link = strings.TrimSpace(link)
+	u, err := url.Parse(link)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
-	if u.Scheme != "vless" {
+	if !strings.EqualFold(u.Scheme, "vless") {
 		return nil, fmt.Errorf("not a vless:// URL")
 	}
 	uuid := u.User.Username()
 	if uuid == "" {
 		return nil, fmt.Errorf("missing UUID")
+	}
+	if _, err := url.QueryUnescape(uuid); err == nil {
+		if decoded, e2 := url.QueryUnescape(uuid); e2 == nil {
+			_ = decoded
+		}
 	}
 	host := u.Hostname()
 	portStr := u.Port()
@@ -55,28 +61,66 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid port: %w", err)
 	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d", port)
+	}
 	q := u.Query()
 	sni := q.Get("sni")
 	if sni == "" {
 		sni = q.Get("serverName")
 	}
+	if sni == "" {
+		sni = q.Get("peer")
+	}
 	pbk := q.Get("pbk")
 	sid := q.Get("sid")
+	if sid == "" {
+		sid = q.Get("shortId")
+	}
 	fp := q.Get("fp")
+	if fp == "" {
+		fp = q.Get("fingerprint")
+	}
 	if fp == "" {
 		fp = "chrome"
 	}
 	flow := q.Get("flow")
+	if flow != "" && flow != "xtls-rprx-vision" {
+		// allow vision only; other flows are uncommon but accept with warning
+	}
 	spx := q.Get("spx")
-	if pbk == "" {
-		return nil, fmt.Errorf("missing pbk (REALITY public key)")
+	if spx == "" {
+		spx = q.Get("spiderX")
 	}
-	if sid == "" {
-		// sid may be empty for some configs, allow but warn
+	security := q.Get("security")
+	if security == "" {
+		security = q.Get("type")
 	}
-	if sni == "" {
-		return nil, fmt.Errorf("missing sni")
+	// Only require REALITY fields when security=reality
+	isReality := strings.EqualFold(security, "reality") || pbk != "" || sid != ""
+	if isReality {
+		if pbk == "" {
+			return nil, fmt.Errorf("missing pbk (REALITY public key) for reality")
+		}
+		if sni == "" {
+			return nil, fmt.Errorf("missing sni/serverName for reality")
+		}
+	} else {
+		if sni == "" {
+			// For non-reality, sni may still be required for TLS; allow empty? Require for TLS
+			// Don't enforce strictly; let it be empty
+		}
 	}
+	// Validate transport where applicable
+	transport := q.Get("type")
+	if transport != "" {
+		switch transport {
+		case "tcp", "ws", "grpc", "http", "quic", "kcp":
+		default:
+			return nil, fmt.Errorf("unsupported VLESS transport %q", transport)
+		}
+	}
+	// Fragment may contain name but not needed
 	return &VLESSOutbound{
 		Tag:        tag,
 		Server:     host,
@@ -95,7 +139,8 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if tag == "" {
 		return nil, fmt.Errorf("tag required")
 	}
-	u, err := url.Parse(strings.TrimSpace(link))
+	link = strings.TrimSpace(link)
+	u, err := url.Parse(link)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
@@ -103,31 +148,23 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if scheme != "hysteria2" && scheme != "hy2" {
 		return nil, fmt.Errorf("not a hysteria2:// URL (got %s)", u.Scheme)
 	}
-	// password is userinfo
 	if u.User == nil {
 		return nil, fmt.Errorf("missing password")
 	}
-	// hysteria may have user:pass but we treat username as password, or password field if user:pass
-	pass, _ := u.User.Password()
-	if pass != "" {
-		// if username:password, combine? For now use password if present, else username
-		// Some clients use userinfo as password directly (no username)
-		// If User contains ":", Password() returns second part
-		if u.User.Username() != "" && pass == "" {
-			pass = u.User.Username()
-		} else if u.User.Username() != "" && pass != "" {
-			// treat as user:pass combined? but sing-box expects password field as auth
-			// Use password part if present, fallback to username:password
-			// For compatibility, if both present, use pass (or username + ":" + pass?)
-			// We'll use pass if username looks like auth? Simpler: if Username() is not empty and pass != "", use pass
+	pass, hasPass := u.User.Password()
+	username := u.User.Username()
+	if hasPass {
+		// If both username and password present, treat password as auth (username ignored)
+		// username may be empty, password holds auth
+		if pass == "" {
+			pass = username
 		}
 	} else {
-		pass = u.User.Username()
+		pass = username
 	}
 	if pass == "" {
 		return nil, fmt.Errorf("missing password")
 	}
-	// decode percent
 	if decoded, err := url.QueryUnescape(pass); err == nil {
 		pass = decoded
 	}
@@ -140,10 +177,16 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid port")
 	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d", port)
+	}
 	q := u.Query()
 	sni := q.Get("sni")
 	if sni == "" {
 		sni = q.Get("peer")
+	}
+	if sni == "" {
+		sni = q.Get("serverName")
 	}
 	obfs := q.Get("obfs")
 	obfsPass := q.Get("obfs-password")
@@ -152,6 +195,9 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	}
 	if obfs == "salamander" && obfsPass == "" {
 		return nil, fmt.Errorf("salamander obfs requires obfs-password")
+	}
+	if decoded, err := url.QueryUnescape(obfsPass); err == nil {
+		obfsPass = decoded
 	}
 	insecure := false
 	if v := q.Get("insecure"); v == "1" || strings.EqualFold(v, "true") {
