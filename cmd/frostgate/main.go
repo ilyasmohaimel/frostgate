@@ -16,6 +16,7 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/doctor"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
 	"github.com/ilyasmohaimel/frostgate/internal/report"
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/tui"
 )
 
@@ -34,6 +35,19 @@ func main() {
 }
 
 func run() int {
+	// Support subcommand: frostgate setup
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		home := setup.DefaultHomeDir()
+		// Allow custom HOME for testing via env
+		if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
+			home = h
+		}
+		if err := setup.RunInteractive(setup.Options{HomeDir: home}); err != nil {
+			fmt.Fprintln(os.Stderr, "setup:", err)
+			return 3
+		}
+		return 0
+	}
 	// Support subcommand: frostgate doctor
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
 		// allow --config after subcommand
@@ -63,10 +77,12 @@ func run() int {
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	verbose := flag.Bool("verbose", false, "verbose/debug output")
 	debug := flag.Bool("debug", false, "debug output (alias for --verbose)")
+	setupFlag := flag.Bool("setup", false, "run interactive setup wizard")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "frostgate %s — Network Route Sentinel\n\n", version)
-		fmt.Fprintf(os.Stderr, "Usage:\n  frostgate [flags]\n  frostgate doctor [--config path]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n  frostgate [flags]\n  frostgate setup\n  frostgate doctor [--config path]\n\n")
+		fmt.Fprintf(os.Stderr, "Commands:\n  setup   interactive setup wizard (recommended first run)\n  doctor  run diagnostics\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExit codes: 0 all up  1 mixed/degraded  2 all down  3 config/error\n")
@@ -81,6 +97,17 @@ func run() int {
 
 	if *versionFlag {
 		fmt.Printf("frostgate %s\n", version)
+		return 0
+	}
+	if *setupFlag {
+		home := setup.DefaultHomeDir()
+		if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
+			home = h
+		}
+		if err := setup.RunInteractive(setup.Options{HomeDir: home}); err != nil {
+			fmt.Fprintln(os.Stderr, "setup:", err)
+			return 3
+		}
 		return 0
 	}
 	if *doctorFlag {
