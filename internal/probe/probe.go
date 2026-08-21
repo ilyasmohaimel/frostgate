@@ -1,4 +1,3 @@
-// Package probe runs concurrent reachability/latency checks against endpoints.
 package probe
 
 import (
@@ -8,68 +7,134 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/health"
+	"github.com/ilyasmohaimel/frostgate/internal/metrics"
+	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
-// Status is the health classification of a probed endpoint.
-type Status string
+type Status = health.Status
 
 const (
-	StatusUp       Status = "up"
-	StatusDegraded Status = "degraded"
-	StatusDown     Status = "down"
+	StatusUp       = health.StatusUp
+	StatusDegraded = health.StatusDegraded
+	StatusDown     = health.StatusDown
 )
 
-// Result is the outcome of probing one endpoint.
 type Result struct {
-	Endpoint config.Endpoint `json:"endpoint"`
-	Latency  time.Duration   `json:"latency_ns"`
-	Status   Status          `json:"status"`
-	Err      error           `json:"-"`
-	ErrMsg   string          `json:"error,omitempty"`
+	Endpoint config.Endpoint  `json:"endpoint"`
+	Metrics  metrics.Metrics  `json:"metrics"`
+	Samples  []metrics.Sample `json:"samples,omitempty"`
+	Status   Status           `json:"status"`
+	Category string           `json:"category"`
+	Err      error            `json:"-"`
+	ErrMsg   string           `json:"error,omitempty"`
 }
 
-// OK reports whether the route is usable (up or degraded, not down).
 func (r Result) OK() bool { return r.Status != StatusDown }
 
-// httpClient is shared across probes; per-probe deadlines come from the
-// request context, so we deliberately leave Client.Timeout unset.
 var httpClient = &http.Client{
-	// Don't follow redirects — we're measuring the endpoint, not where it sends us.
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
 }
 
-// Run probes every endpoint concurrently and returns the results, ranked.
 func Run(ctx context.Context, cfg *config.Config) []Result {
 	results := make([]Result, len(cfg.Endpoints))
-	timeout := cfg.Defaults.Timeout.Duration
+	sem := semaphore.NewWeighted(32)
 
-	// errgroup manages the goroutines and lets us Wait() for all of them.
-	// We return nil from each goroutine on purpose: a single down endpoint
-	// must NOT cancel the context and abort the others.
 	g, ctx := errgroup.WithContext(ctx)
 	for i, ep := range cfg.Endpoints {
+		if err := sem.Acquire(ctx, 1); err != nil {
+			break
+		}
+		i, ep := i, ep
 		g.Go(func() error {
-			results[i] = Probe(ctx, ep, timeout)
+			defer sem.Release(1)
+			results[i] = ProbeEndpoint(ctx, cfg, ep)
 			return nil
 		})
 	}
 	_ = g.Wait()
-
 	Rank(results)
 	return results
 }
 
-// Probe runs the type-appropriate check for one endpoint and times it.
-func Probe(ctx context.Context, e config.Endpoint, timeout time.Duration) Result {
+func ProbeEndpoint(ctx context.Context, cfg *config.Config, e config.Endpoint) Result {
+	timeout := cfg.TimeoutFor(e)
+	samples := cfg.SamplesFor(e)
+	interval := cfg.SampleIntervalFor(e)
+
+	var s []metrics.Sample
+	for i := 0; i < samples; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				s = append(s, metrics.Sample{Success: false, Err: ctx.Err(), ErrCategory: categorizeError(ctx.Err())})
+				break
+			case <-time.After(interval):
+			}
+		}
+		sample := probeOnce(ctx, cfg, e, timeout)
+		s = append(s, sample)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	m := metrics.Compute(s)
+
+	th := health.Thresholds{
+		HealthyLatency:  cfg.HealthyLatencyFor(e),
+		MaxJitter:       cfg.MaxJitterFor(e),
+		MaxLossPct:      cfg.MaxLossFor(e),
+		DegradedLossPct: 50,
+	}
+	status := health.Classify(m, th)
+
+	// find representative error: last failed sample's error
+	var repErr error
+	var category string
+	var errMsg string
+	for i := len(s) - 1; i >= 0; i-- {
+		if !s[i].Success && s[i].Err != nil {
+			repErr = s[i].Err
+			category = s[i].ErrCategory
+			errMsg = s[i].Err.Error()
+			break
+		}
+	}
+	if repErr == nil && status == StatusDown && m.Succeeded == 0 && len(s) > 0 {
+		for _, sam := range s {
+			if sam.Err != nil {
+				repErr = sam.Err
+				category = sam.ErrCategory
+				errMsg = sam.Err.Error()
+				break
+			}
+		}
+	}
+
+	return Result{
+		Endpoint: e,
+		Metrics:  m,
+		Samples:  s,
+		Status:   status,
+		Category: category,
+		Err:      repErr,
+		ErrMsg:   errMsg,
+	}
+}
+
+// probeOnce runs a single sample
+func probeOnce(ctx context.Context, cfg *config.Config, e config.Endpoint, timeout time.Duration) metrics.Sample {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
 	start := time.Now()
 	var err error
 	switch e.Type {
@@ -79,24 +144,36 @@ func Probe(ctx context.Context, e config.Endpoint, timeout time.Duration) Result
 		err = probeTLS(ctx, e)
 	case config.ProbeHTTP:
 		err = probeHTTP(ctx, e)
+	case config.ProbeSingBox:
+		err = probeSingBox(ctx, cfg, e, timeout)
 	default:
 		err = fmt.Errorf("unsupported probe type %q", e.Type)
 	}
-	latency := time.Since(start)
-
-	res := Result{
-		Endpoint: e,
-		Latency:  latency,
-		Status:   Classify(err, latency, timeout),
-		Err:      err,
-	}
+	lat := time.Since(start)
 	if err != nil {
-		res.ErrMsg = err.Error()
+		return metrics.Sample{Success: false, Latency: lat, Err: err, ErrCategory: categorizeError(err)}
 	}
-	return res
+	return metrics.Sample{Success: true, Latency: lat, ErrCategory: ""}
 }
 
-// probeTCP measures the time to open a raw TCP connection.
+// legacy Probe for backwards compat and simple tests
+func Probe(ctx context.Context, e config.Endpoint, timeout time.Duration) Result {
+	cfg := &config.Config{
+		Defaults: config.Defaults{
+			Timeout:        config.Duration{Duration: timeout},
+			Samples:        1,
+			SampleInterval: config.Duration{Duration: 0},
+			HealthyLatency: config.Duration{Duration: 800 * 1e9},
+			MaxJitter:      config.Duration{Duration: 80 * 1e9},
+		},
+	}
+	cfg.Defaults.Samples = 1
+	// Ensure endpoint timeout not interfering
+	e.Timeout = config.Duration{}
+	e.Samples = 0
+	return ProbeEndpoint(ctx, cfg, e)
+}
+
 func probeTCP(ctx context.Context, e config.Endpoint) error {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", e.Addr())
@@ -106,7 +183,6 @@ func probeTCP(ctx context.Context, e config.Endpoint) error {
 	return conn.Close()
 }
 
-// probeTLS measures TCP connect plus a full TLS handshake.
 func probeTLS(ctx context.Context, e config.Endpoint) error {
 	d := &tls.Dialer{
 		Config: &tls.Config{
@@ -121,14 +197,16 @@ func probeTLS(ctx context.Context, e config.Endpoint) error {
 	return conn.Close()
 }
 
-// probeHTTP measures time to first response from an HTTPS GET.
 func probeHTTP(ctx context.Context, e config.Endpoint) error {
-	path := e.Path
-	if path == "" {
-		path = "/"
+	urlStr := e.EffectiveURL()
+	if urlStr == "" {
+		return fmt.Errorf("http probe missing url or host/port")
 	}
-	url := fmt.Sprintf("https://%s%s", e.Addr(), path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Ensure scheme
+	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
+		urlStr = "https://" + urlStr
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return err
 	}
@@ -143,20 +221,24 @@ func probeHTTP(ctx context.Context, e config.Endpoint) error {
 	return nil
 }
 
-// Classify turns a probe outcome into a Status.
-//
-// MAKE-IT-YOURS #2 (the health policy): this is where you decide what "down"
-// vs "degraded" vs "up" actually means. The default below is deliberately
-// simple — a working starting point you should tune to your reality:
-//   - Any error  -> down.
-//   - Succeeded but slow (>60% of the timeout budget) -> degraded.
-//   - Otherwise  -> up.
-// Things to consider making it yours:
-//   - Should a TLS cert error be "down" or its own "insecure" status?
-//   - Is a fixed 60% threshold right, or should "slow" be an absolute ms value
-//     you set per-endpoint?
-//   - In China a route at 400ms might still be your best option — does
-//     "degraded" mean "avoid" or just "warn"?
+func probeSingBox(ctx context.Context, cfg *config.Config, e config.Endpoint, timeout time.Duration) error {
+	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+	// Use a per-sample timeout context already applied; but singbox client Delay uses its own timeout param
+	// So we need to call Delay with timeout slightly less than context deadline to avoid double timeout?
+	// Use timeout for singbox delay param
+	d, err := client.Delay(ctx, e.Outbound, cfg.SingBox.TestURL, timeout)
+	if err != nil {
+		return err
+	}
+	if d == 0 {
+		return fmt.Errorf("proxy-test: zero delay")
+	}
+	// success; we already measured latency via probeOnce start timer, but we could also use d
+	_ = d
+	return nil
+}
+
+// Classify is deprecated; use health.Classify. Kept for tests.
 func Classify(err error, latency, timeout time.Duration) Status {
 	if err != nil {
 		return StatusDown
@@ -167,45 +249,45 @@ func Classify(err error, latency, timeout time.Duration) Status {
 	return StatusUp
 }
 
-// statusRank orders statuses best-to-worst for sorting.
-func statusRank(s Status) int {
-	switch s {
-	case StatusUp:
-		return 0
-	case StatusDegraded:
-		return 1
-	default:
-		return 2
-	}
-}
+func statusRank(s Status) int { return health.Rank(s) }
 
-// Rank sorts results in place from best route to worst.
-//
-// MAKE-IT-YOURS #3 (the ranking): this decides which route frostgate calls
-// "best right now". The default sorts by status, then by raw latency. But the
-// interesting product decisions are yours:
-//   - Should a fast Hysteria 2 backup outrank a slightly faster Reality primary,
-//     or do you prefer your primary unless it's clearly worse? (protocol weight)
-//   - Should you rank on jitter/stability once you sample multiple times, not a
-//     single-shot latency? (needs the v1 multi-sample probe)
-//   - Tie-breaking: alphabetical, config order, or region?
-// Edit less() to encode your preference.
 func Rank(results []Result) {
 	sort.SliceStable(results, func(i, j int) bool {
 		return less(results[i], results[j])
 	})
 }
 
-// less reports whether result a should rank above result b.
 func less(a, b Result) bool {
-	if statusRank(a.Status) != statusRank(b.Status) {
-		return statusRank(a.Status) < statusRank(b.Status)
+	ra := statusRank(a.Status)
+	rb := statusRank(b.Status)
+	if ra != rb {
+		return ra < rb
 	}
-	return a.Latency < b.Latency
+	// reliability: lower loss wins
+	if a.Metrics.LossPct != b.Metrics.LossPct {
+		return a.Metrics.LossPct < b.Metrics.LossPct
+	}
+	// priority: lower value wins (documented)
+	if a.Endpoint.Priority != b.Endpoint.Priority {
+		return a.Endpoint.Priority < b.Endpoint.Priority
+	}
+	// median latency
+	if a.Metrics.Median != b.Metrics.Median {
+		// if one has 0 median due to all failed, treat as large
+		if a.Metrics.Median == 0 && b.Metrics.Median != 0 {
+			return false
+		}
+		if b.Metrics.Median == 0 && a.Metrics.Median != 0 {
+			return true
+		}
+		return a.Metrics.Median < b.Metrics.Median
+	}
+	if a.Metrics.Jitter != b.Metrics.Jitter {
+		return a.Metrics.Jitter < b.Metrics.Jitter
+	}
+	return a.Endpoint.Name < b.Endpoint.Name
 }
 
-// Best returns the top-ranked usable route, or false if every route is down.
-// Call Rank first (Run already does).
 func Best(results []Result) (Result, bool) {
 	for _, r := range results {
 		if r.OK() {

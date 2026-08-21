@@ -1,32 +1,59 @@
 # frostgate example config
 #
-# Copy this to `frostgate.yaml` and edit with your real endpoints.
-# `frostgate.yaml` is gitignored so your real hostnames never get committed.
+# Copy to one of (first existing wins):
+#   $XDG_CONFIG_HOME/frostgate/config.yaml
+#   ~/.config/frostgate/config.yaml
+#   ./frostgate.yaml
+# and edit with your real endpoints. Private configs are gitignored.
 #
-# Each endpoint describes one route to probe. `type` decides how it's tested:
-#   tcp   - measure time to open a raw TCP connection
-#   tls   - open TCP + complete a TLS handshake (use `sni` to set the server name)
-#   http  - issue an HTTP(S) GET and measure time to first response
-#
-# In China these would point at your Tokyo VM's exposed ports.
+# Probe types:
+#   tcp     - raw TCP connect time
+#   tls     - TCP + TLS handshake (use sni)
+#   http    - HTTPS GET; use `url:` or host/port/path
+#   singbox - end-to-end via local sing-box outbound (recommended for proxy routes)
 
 defaults:
-  timeout: 5s        # per-probe deadline; a route slower than this is "down"
+  timeout: 5s
+  samples: 4
+  sample_interval: 150ms
+  healthy_latency: 800ms
+  max_jitter: 80ms
+
+singbox:
+  controller: http://127.0.0.1:9090
+  # secret: ""                  # or set FROSTGATE_SINGBOX_SECRET env
+  # secret_file: ~/.config/frostgate/controller-secret
+  test_url: https://www.gstatic.com/generate_204
 
 endpoints:
-  - name: tokyo-reality      # VLESS + XTLS-Reality (primary)
-    host: example.com        # the SNI/host sing-box fronts as
-    port: 443
-    type: tls
-    sni: example.com
-
-  - name: tokyo-hysteria     # Hysteria 2 (backup, QUIC/UDP)
-    host: 203.0.113.10       # raw IP of the Oracle Tokyo VM
-    port: 8443
-    type: tcp                # v0 reachability check; real H2 probe is on the roadmap
-
-  - name: cloudflare-204     # neutral baseline to sanity-check your own link
-    host: www.gstatic.com
-    port: 443
+  - name: direct-baseline
     type: http
-    path: /generate_204
+    url: https://www.gstatic.com/generate_204
+    priority: 100
+
+  - name: primary-reality
+    type: singbox
+    outbound: primary-reality
+    priority: 10
+
+  - name: backup-hysteria2
+    type: singbox
+    outbound: backup-hysteria2
+    priority: 20
+
+  - name: xhttp-fallback
+    type: singbox
+    outbound: xhttp-fallback
+    priority: 30
+
+  # Optional basic reachability diagnostics (layer 1):
+  # - name: server-tcp
+  #   type: tcp
+  #   host: example.com
+  #   port: 443
+
+  # - name: server-tls
+  #   type: tls
+  #   host: example.com
+  #   port: 443
+  #   sni: example.com

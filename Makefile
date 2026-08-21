@@ -1,24 +1,38 @@
 BINARY := frostgate
 PKG    := ./cmd/frostgate
+VERSION ?= dev
 
-.PHONY: build test vet run clean dist
+LDFLAGS := -ldflags "-X main.version=$(VERSION)"
+
+.PHONY: build test race vet fmt check run dist clean
 
 build: ## Build the binary for the host platform
-	go build -o $(BINARY) $(PKG)
+	go build $(LDFLAGS) -o $(BINARY) $(PKG)
 
-test: ## Run tests with the race detector
+test: ## Run tests
+	go test ./...
+
+race: ## Run tests with the race detector
 	go test -race ./...
 
 vet: ## Static analysis
 	go vet ./...
 
-run: ## Build and run against ./frostgate.yaml
-	go run $(PKG)
+fmt: ## Format code
+	gofmt -w .
 
-dist: ## Cross-compile static binaries for the homelab and the Tokyo VM
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/$(BINARY)-linux-amd64 $(PKG)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/$(BINARY)-linux-arm64 $(PKG)
+check: fmt vet test race ## fmt, vet, test, race, build
+	go build -o /tmp/frostgate-check $(PKG)
+	@test -z "$$(gofmt -l . | grep -v vendor)" || (echo "gofmt needed"; gofmt -l .; exit 1)
+
+run: ## Build and run
+	go run $(LDFLAGS) $(PKG)
+
+dist: ## Cross-compile static binaries (linux/amd64, linux/arm64)
+	mkdir -p dist
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-amd64 $(PKG)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-arm64 $(PKG)
 
 clean: ## Remove build artifacts
-	rm -f $(BINARY) $(BINARY).exe
+	rm -f $(BINARY) $(BINARY).exe /tmp/frostgate-check
 	rm -rf dist
