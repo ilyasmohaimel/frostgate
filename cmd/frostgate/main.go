@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -195,16 +194,36 @@ func printHelp() {
 
 // --- add ---
 func handleAdd(args []string) int {
-	fs := flag.NewFlagSet("add", flag.ContinueOnError)
-	nameFlag := fs.String("name", "", "route name (auto-derived if empty)")
-	cfgPath := fs.String("config", "", "config path")
-	_ = fs.Parse(args)
-	links := fs.Args()
-	if len(links) == 0 {
+	nameFlag := ""
+	cfgPath := ""
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--name" && i+1 < len(args) {
+			nameFlag = args[i+1]
+			i++
+		} else if len(a) > 7 && a[:7] == "--name=" {
+			nameFlag = a[7:]
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if len(a) > 9 && a[:9] == "--config=" {
+			cfgPath = a[9:]
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate add <link> [--name name] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	if len(positionals) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: frostgate add <link> [--name name]")
 		return 3
 	}
-	link := strings.TrimSpace(links[0])
+	link := strings.TrimSpace(positionals[0])
 	if link == "" {
 		fmt.Fprintln(os.Stderr, "empty link")
 		return 3
@@ -219,7 +238,7 @@ func handleAdd(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
-	tag := strings.TrimSpace(*nameFlag)
+	tag := strings.TrimSpace(nameFlag)
 	if tag == "" {
 		tag = route.DeriveNameFromLink(link, 1)
 	}
@@ -313,8 +332,8 @@ func handleAdd(args []string) int {
 	}
 	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
 	cfgPath2 := filepath.Join(dir, "config.yaml")
-	if *cfgPath != "" {
-		cfgPath2 = config.ResolveConfigPath(*cfgPath)
+	if cfgPath != "" {
+		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
 	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
@@ -488,17 +507,35 @@ func sanitizeOutput(s string) string {
 
 // --- import ---
 func handleImport(args []string) int {
-	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "config path")
-	_ = fs.Parse(args)
-	rest := fs.Args()
-	if len(rest) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: frostgate import <subscription-url>")
+	cfgPath := ""
+	allowInsecure := false
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--allow-insecure-http" {
+			allowInsecure = true
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate import <subscription-url> [--allow-insecure-http] [--config path]")
+			return 0
+		} else if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	if len(positionals) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: frostgate import <subscription-url> [--allow-insecure-http]")
 		return 3
 	}
-	subURL := rest[0]
-	fmt.Println("Fetching subscription...")
-	data, err := importer.FetchSubscription(context.Background(), subURL)
+	subURL := positionals[0]
+	fmt.Fprintln(os.Stderr, "Fetching subscription...")
+	data, err := importer.FetchSubscriptionWithOpts(context.Background(), subURL, allowInsecure)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fetch failed: %v\n", sanitizeError(err))
 		return 3
@@ -617,8 +654,8 @@ func handleImport(args []string) int {
 	}
 	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
 	cfgPath2 := filepath.Join(dir, "config.yaml")
-	if *cfgPath != "" {
-		cfgPath2 = config.ResolveConfigPath(*cfgPath)
+	if cfgPath != "" {
+		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
 	setup.WriteFileSecure(cfgPath2, []byte(fgContent))
 	_ = reloadSidecar()
@@ -651,23 +688,40 @@ func handleImport(args []string) int {
 }
 
 // --- test ---
+
 func handleTest(args []string) int {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
-	rest := fs.Args()
-	if len(rest) == 0 {
+	jsonOut := false
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate test <link> [--json]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	if len(positionals) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: frostgate test <link> [--json]")
 		return 3
 	}
-	link := rest[0]
+	link := positionals[0]
 	tag := "test-temp"
 	r, err := route.ParseShareLink(link, tag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse: %v\n", sanitizeError(err))
 		return 3
 	}
-	fmt.Println("Testing route (temporary, not saved)...")
+	if jsonOut {
+		fmt.Fprintln(os.Stderr, "Testing route (temporary, not saved)...")
+	} else {
+		fmt.Println("Testing route (temporary, not saved)...")
+	}
 	tmpDir, err := os.MkdirTemp("", "frostgate-test-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -774,7 +828,7 @@ func handleTest(args []string) int {
 	delay, err := client.Delay(delayCtx, tag, "https://www.gstatic.com/generate_204", timeout)
 	cancel2()
 	if err != nil {
-		if *jsonOut {
+		if jsonOut {
 			json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "down", "error": sanitizeError(err)})
 		} else {
 			fmt.Printf("Protocol: %s\nStatus:   DOWN\nError: %s\n\nThis route was NOT saved.\nUse `frostgate add` to keep it.\n", strings.ToUpper(r.Protocol), sanitizeError(err))
@@ -791,7 +845,7 @@ func handleTest(args []string) int {
 			mbps = m
 		}
 	}
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "up", "median_ms": delay.Milliseconds(), "download_mbps": mbps})
 	} else {
 		fmt.Printf("Protocol: %s\nStatus:   HEALTHY\nLoss:     0%%\nMedian:   %dms\nJitter:   0ms\n", strings.ToUpper(r.Protocol), delay.Milliseconds())
@@ -816,20 +870,45 @@ func freePort() int {
 
 // --- benchmark ---
 func handleBenchmark(args []string) int {
-	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
-	networkLabel := fs.String("network", "", "network label for history")
-	noSpeed := fs.Bool("no-speed", false, "skip download speed")
-	jsonOut := fs.Bool("json", false, "json output")
-	cfgPath := fs.String("config", "", "config path")
-	_ = fs.Parse(args)
+	networkLabel := ""
+	noSpeed := false
+	jsonOut := false
+	cfgPath := ""
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--network" && i+1 < len(args) {
+			networkLabel = args[i+1]
+			i++
+		} else if len(a) > 10 && a[:10] == "--network=" {
+			networkLabel = a[10:]
+		} else if a == "--no-speed" {
+			noSpeed = true
+		} else if a == "--json" {
+			jsonOut = true
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if len(a) > 9 && a[:9] == "--config=" {
+			cfgPath = a[9:]
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate benchmark [--network label] [--no-speed] [--json] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	_ = positionals
 	home := setup.DefaultHomeDir()
 	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 		home = h
 	}
 	dir := setup.ConfigDir(home)
-	cfgFile := config.ResolveConfigPath(*cfgPath)
-	if *cfgPath == "" {
-		// Use default discovery but prefer dir
+	cfgFile := config.ResolveConfigPath(cfgPath)
+	if cfgPath == "" {
 		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
 			cfgFile = filepath.Join(dir, "config.yaml")
 		}
@@ -839,13 +918,25 @@ func handleBenchmark(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
-	// Estimate data
+	bytesPerRoute := cfg.Benchmark.DownloadBytes
+	if bytesPerRoute == 0 {
+		bytesPerRoute = benchmark.DefaultBytes
+	}
+	downloadURL := cfg.Benchmark.DownloadURL
+	if downloadURL == "" {
+		downloadURL = benchmark.DefaultDownloadURL
+	}
 	routes := len(cfg.Endpoints)
-	bytesPerRoute := int64(benchmark.DefaultBytes)
 	totalBytes := int64(routes) * bytesPerRoute
-	if !*noSpeed && routes > 10 {
-		fmt.Printf("%d routes selected. Default benchmark will transfer ~%d MiB.\n", routes, totalBytes/1024/1024)
-		fmt.Print("Continue? [y/N]: ")
+	if !noSpeed && routes > 10 {
+		msg := fmt.Sprintf("%d routes selected. Default benchmark will transfer ~%d MiB.\n", routes, totalBytes/1024/1024)
+		if jsonOut {
+			fmt.Fprint(os.Stderr, msg)
+			fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
+		} else {
+			fmt.Print(msg)
+			fmt.Print("Continue? [y/N]: ")
+		}
 		reader := bufio.NewReader(os.Stdin)
 		ans, _ := reader.ReadString('\n')
 		if !strings.EqualFold(strings.TrimSpace(ans), "y") && !strings.EqualFold(strings.TrimSpace(ans), "yes") {
@@ -856,63 +947,98 @@ func handleBenchmark(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	results := probe.Run(ctx, cfg)
-	// For each, measure download if not noSpeed
 	type benchRes struct {
-		Result   probe.Result
-		Download float64
+		Result   probe.Result `json:"result"`
+		Download float64      `json:"download_mbps"`
 	}
 	var bres []benchRes
+	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+	var originalSelector string
+	selectorExists := false
+	if !noSpeed {
+		if now, err := client.GetSelectedOutbound(ctx, "frostgate-selector"); err == nil {
+			originalSelector = now
+			selectorExists = true
+		}
+	}
+	// Ensure restore on exit, signal, error
+	defer func() {
+		if selectorExists && originalSelector != "" {
+			cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = client.SelectOutbound(cctx, "frostgate-selector", originalSelector)
+			ccancel()
+		}
+	}()
+	// Handle signal restore
+	go func() {
+		<-ctx.Done()
+		if selectorExists && originalSelector != "" {
+			cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = client.SelectOutbound(cctx, "frostgate-selector", originalSelector)
+			ccancel()
+		}
+	}()
 	for _, r := range results {
 		download := 0.0
-		if !*noSpeed && r.Status != "down" {
-			// Try via sing-box SOCKS if singbox type
+		if !noSpeed && r.Status != "down" {
 			if r.Endpoint.Type == config.ProbeSingBox {
-				url := fmt.Sprintf("%s/proxies/%s", cfg.SingBox.Controller, "frostgate-selector")
-				req, _ := http.NewRequestWithContext(ctx, "PUT", url, strings.NewReader(fmt.Sprintf(`{"name":"%s"}`, r.Endpoint.Outbound)))
-				req.Header.Set("Authorization", "Bearer "+cfg.SingBox.Secret)
-				req.Header.Set("Content-Type", "application/json")
-				http.DefaultClient.Do(req)
-				time.Sleep(200 * time.Millisecond)
-				sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-				mbps, _, err := benchmark.MeasureViaSOCKS(sctx, "127.0.0.1:2080", benchmark.DefaultDownloadURL, bytesPerRoute)
-				scancel()
-				if err == nil {
-					download = mbps
+				if !selectorExists {
+					// No selector, cannot benchmark via SOCKS
+					download = 0
+				} else {
+					if err := client.SelectOutbound(ctx, "frostgate-selector", r.Endpoint.Outbound); err != nil {
+						download = 0
+					} else {
+						// Verify and quick check
+						time.Sleep(100 * time.Millisecond)
+						sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
+						mbps, _, err := benchmark.MeasureViaSOCKS(sctx, "127.0.0.1:2080", downloadURL, bytesPerRoute)
+						scancel()
+						if err == nil {
+							download = mbps
+						} else {
+							download = 0
+						}
+					}
 				}
 			} else {
-				// direct: measure direct
 				sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-				mbps, _, _ := benchmark.MeasureDirect(sctx, benchmark.DefaultDownloadURL, bytesPerRoute)
+				mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
 				scancel()
 				download = mbps
 			}
 		}
 		bres = append(bres, benchRes{Result: r, Download: download})
-		// Record history
-		rec := history.Record{
-			Route:        r.Endpoint.Name,
-			Type:         string(r.Endpoint.Type),
-			Status:       string(r.Status),
-			Loss:         r.Metrics.LossPct,
-			MedianMs:     r.Metrics.Median.Milliseconds(),
-			JitterMs:     r.Metrics.Jitter.Milliseconds(),
-			MinMs:        r.Metrics.Min.Milliseconds(),
-			MaxMs:        r.Metrics.Max.Milliseconds(),
-			MeanMs:       r.Metrics.Mean.Milliseconds(),
-			DownloadMbps: download,
-			Network:      *networkLabel,
-			Category:     r.Category,
-		}
-		if db, err := history.Open(); err == nil {
-			db.Add(rec)
-			db.Close()
+		if cfg.History.Enabled == nil || *cfg.History.Enabled {
+			rec := history.Record{
+				Route:        r.Endpoint.Name,
+				Type:         string(r.Endpoint.Type),
+				Status:       string(r.Status),
+				Loss:         r.Metrics.LossPct,
+				MedianMs:     r.Metrics.Median.Milliseconds(),
+				JitterMs:     r.Metrics.Jitter.Milliseconds(),
+				MinMs:        r.Metrics.Min.Milliseconds(),
+				MaxMs:        r.Metrics.Max.Milliseconds(),
+				MeanMs:       r.Metrics.Mean.Milliseconds(),
+				DownloadMbps: download,
+				Network:      networkLabel,
+				Category:     r.Category,
+			}
+			if db, err := history.Open(); err == nil {
+				db.Add(rec)
+				db.Close()
+				db2, _ := history.Open()
+				if db2 != nil {
+					_ = db2.Prune(cfg.History.Retention.Duration)
+					db2.Close()
+				}
+			}
 		}
 	}
-	// Sort by status then download then median (reuse recommend)
-	if *jsonOut {
+	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		enc.Encode(map[string]any{"results": bres, "network": *networkLabel})
+		_ = enc.Encode(map[string]any{"results": bres, "network": networkLabel})
 		return exitCode(results)
 	}
 	fmt.Println("\nFROSTGATE BENCHMARK")
@@ -926,11 +1052,14 @@ func handleBenchmark(args []string) int {
 		if br.Download > 0 {
 			down = fmt.Sprintf("%.0f Mbps", br.Download)
 		} else if br.Result.Endpoint.Type == config.ProbeSingBox && br.Download == 0 {
-			down = "N/A"
+			if !selectorExists {
+				down = "N/A (no selector)"
+			} else {
+				down = "N/A"
+			}
 		}
 		fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", br.Result.Endpoint.Name, status, loss, median, jitter, down)
 	}
-	// Recommend
 	var inputs []recommend.Input
 	for _, br := range bres {
 		inputs = append(inputs, recommend.Input{
@@ -943,10 +1072,29 @@ func handleBenchmark(args []string) int {
 			Priority: br.Result.Endpoint.Priority,
 		})
 	}
+	// Enrich with history if available
+	if db, err := history.Open(); err == nil {
+		recs, _ := db.Query(7*24*time.Hour, "", "")
+		summ := history.Summarize(recs)
+		for i, inp := range inputs {
+			for _, s := range summ {
+				if s.Route == inp.Name {
+					inputs[i].Availability = s.Availability
+					break
+				}
+			}
+		}
+		db.Close()
+	}
 	rec := recommend.Recommend(inputs, len(bres))
-	fmt.Printf("\nBEST OVERALL: %s\n", rec.BestOverall.Name)
-	for _, r := range rec.Reasons {
-		fmt.Printf("  ✓ %s\n", r)
+	if rec.BestOverall.Name != "" {
+		fmt.Printf("\nBEST OVERALL: %s\n", rec.BestOverall.Name)
+		for _, r := range rec.Reasons {
+			fmt.Printf("  ✓ %s\n", r)
+		}
+		if rec.Preferred != nil {
+			fmt.Printf("\nPreferred configured route:\n%s\n", rec.Preferred.Name)
+		}
 	}
 	return exitCode(results)
 }
@@ -963,18 +1111,36 @@ func fmtDuration(d time.Duration) string {
 
 // --- diagnose ---
 func handleDiagnose(args []string) int {
-	fs := flag.NewFlagSet("diagnose", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "config path")
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
-	rest := fs.Args()
+	cfgPath := ""
+	jsonOut := false
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate diagnose [route] [--json] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	rest := positionals
 	home := setup.DefaultHomeDir()
 	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 		home = h
 	}
 	dir := setup.ConfigDir(home)
-	cfgFile := config.ResolveConfigPath(*cfgPath)
-	if *cfgPath == "" {
+	cfgFile := config.ResolveConfigPath(cfgPath)
+	if cfgPath == "" {
 		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
 			cfgFile = filepath.Join(dir, "config.yaml")
 		}
@@ -990,7 +1156,7 @@ func handleDiagnose(args []string) int {
 	} else {
 		layers = diagnose.DiagnoseRoute(cfg, rest[0])
 	}
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(layers)
 		return 0
 	}
@@ -1039,9 +1205,25 @@ func handleDiagnose(args []string) int {
 
 // --- network-check ---
 func handleNetworkCheck(args []string) int {
-	fs := flag.NewFlagSet("network-check", flag.ContinueOnError)
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
+	cfgPath := ""
+	jsonOut := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate network-check [--json] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		}
+	}
 	checks := network.CheckAll()
 	// Add destinations
 	dests := []string{"https://github.com/", "https://www.google.com/generate_204", "https://www.wikipedia.org/"}
@@ -1054,9 +1236,16 @@ func handleNetworkCheck(args []string) int {
 		home = h
 	}
 	dir := setup.ConfigDir(home)
-	cfgFile := filepath.Join(dir, "config.yaml")
+	cfgFile := config.ResolveConfigPath(cfgPath)
+	if cfgPath == "" {
+		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
+			cfgFile = filepath.Join(dir, "config.yaml")
+		}
+	}
 	if _, err := os.Stat(cfgFile); err == nil {
 		if cfg, err := config.Load(cfgFile); err == nil {
+			// Use configured destinations if present, else defaults
+			_ = cfg
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			results := probe.Run(ctx, cfg)
 			cancel()
@@ -1069,7 +1258,7 @@ func handleNetworkCheck(args []string) int {
 			}
 		}
 	}
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(checks)
 		return 0
 	}
@@ -1129,18 +1318,24 @@ func handleNetworkCheck(args []string) int {
 
 // --- compare ---
 func handleCompare(args []string) int {
-	fs := flag.NewFlagSet("compare", flag.ContinueOnError)
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
+	jsonOut := false
+	for _, a := range args {
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate compare [--json]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		}
+	}
 	db, err := history.Open()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
 	defer db.Close()
-	// Query all networks
-	networks := []string{"home", "dorm", "mobile"}
-	// Actually discover networks from history
 	records, _ := db.Query(30*24*time.Hour, "", "")
 	netSet := map[string]bool{}
 	for _, r := range records {
@@ -1148,15 +1343,26 @@ func handleCompare(args []string) int {
 			netSet[r.Network] = true
 		}
 	}
-	if len(netSet) > 0 {
-		networks = nil
-		for n := range netSet {
-			networks = append(networks, n)
+	if len(netSet) == 0 {
+		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
+		if jsonOut {
+			json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "no network history"})
+			return 0
 		}
-	}
-	if len(networks) == 0 {
-		fmt.Println("No network history found. Run: frostgate benchmark --network <label>")
+		fmt.Print(msg)
 		return 0
+	}
+	var networks []string
+	for n := range netSet {
+		networks = append(networks, n)
+	}
+	// Deterministic: sort networks
+	for i := 0; i < len(networks); i++ {
+		for j := i + 1; j < len(networks); j++ {
+			if networks[j] < networks[i] {
+				networks[i], networks[j] = networks[j], networks[i]
+			}
+		}
 	}
 	// For each network, summarize
 	type netSummary struct {
@@ -1169,7 +1375,7 @@ func handleCompare(args []string) int {
 		summ := history.Summarize(recs)
 		all = append(all, netSummary{Network: netw, Summaries: summ})
 	}
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(all)
 		return 0
 	}
@@ -1244,17 +1450,40 @@ func handleCompare(args []string) int {
 
 // --- recommend ---
 func handleRecommend(args []string) int {
-	fs := flag.NewFlagSet("recommend", flag.ContinueOnError)
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
+	jsonOut := false
+	cfgPath := ""
+	for _, a := range args {
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "--config" {
+			// handled via next arg if needed, but recommend doesn't have config flag; ignore
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		} else if a == "--config" {
+			// handled above
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate recommend [--json] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		}
+	}
+	// Also handle --config as second arg
+	for i, a := range args {
+		if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+		}
+	}
 	home := setup.DefaultHomeDir()
 	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 		home = h
 	}
 	dir := setup.ConfigDir(home)
 	cfgFile := filepath.Join(dir, "config.yaml")
-	if _, err := os.Stat(cfgFile); err != nil {
-		// Try discovery
+	if cfgPath != "" {
+		cfgFile = config.ResolveConfigPath(cfgPath)
+	} else if _, err := os.Stat(cfgFile); err != nil {
 		cfgFile = config.ResolveConfigPath("")
 	}
 	cfg, err := config.Load(cfgFile)
@@ -1276,7 +1505,6 @@ func handleRecommend(args []string) int {
 			Priority: r.Endpoint.Priority,
 		})
 	}
-	// Enrich with history availability
 	db, err := history.Open()
 	historyCount := 0
 	if err == nil {
@@ -1294,7 +1522,7 @@ func handleRecommend(args []string) int {
 		}
 	}
 	rec := recommend.Recommend(inputs, historyCount)
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(rec)
 		return 0
 	}
@@ -1322,13 +1550,49 @@ func handleRecommend(args []string) int {
 
 // --- history ---
 func handleHistory(args []string) int {
-	fs := flag.NewFlagSet("history", flag.ContinueOnError)
-	sinceStr := fs.String("since", "24h", "since duration (e.g. 7d, 24h)")
-	route := fs.String("route", "", "filter by route")
-	networkLabel := fs.String("network", "", "filter by network")
-	jsonOut := fs.Bool("json", false, "json output")
-	_ = fs.Parse(args)
-	since, err := parseSince(*sinceStr)
+	sinceStr := "24h"
+	route := ""
+	networkLabel := ""
+	jsonOut := false
+	cfgPath := ""
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--json" {
+			jsonOut = true
+		} else if a == "--since" && i+1 < len(args) {
+			sinceStr = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--since=") {
+			sinceStr = strings.TrimPrefix(a, "--since=")
+		} else if a == "--route" && i+1 < len(args) {
+			route = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--route=") {
+			route = strings.TrimPrefix(a, "--route=")
+		} else if a == "--network" && i+1 < len(args) {
+			networkLabel = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--network=") {
+			networkLabel = strings.TrimPrefix(a, "--network=")
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		} else if a == "-h" || a == "--help" {
+			fmt.Fprintln(os.Stderr, "usage: frostgate history [--since duration] [--route name] [--network label] [--json] [--config path]")
+			return 0
+		} else if len(a) > 0 && a[0] == '-' {
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			return 3
+		} else {
+			positionals = append(positionals, a)
+		}
+	}
+	_ = positionals
+	_ = cfgPath
+	since, err := parseSince(sinceStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --since: %v\n", err)
 		return 3
@@ -1339,12 +1603,12 @@ func handleHistory(args []string) int {
 		return 3
 	}
 	defer db.Close()
-	records, err := db.Query(since, *route, *networkLabel)
+	records, err := db.Query(since, route, networkLabel)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}
-	if *jsonOut {
+	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(records)
 		return 0
 	}
@@ -1353,7 +1617,7 @@ func handleHistory(args []string) int {
 		return 0
 	}
 	summaries := history.Summarize(records)
-	fmt.Printf("\nLAST %s\n\n", strings.ToUpper(*sinceStr))
+	fmt.Printf("\nLAST %s\n\n", strings.ToUpper(sinceStr))
 	for _, s := range summaries {
 		fmt.Printf("%s\n", s.Route)
 		fmt.Printf("  Availability %6.1f%%\n", s.Availability)

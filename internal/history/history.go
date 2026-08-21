@@ -162,7 +162,6 @@ type Summary struct {
 }
 
 func Summarize(records []Record) []Summary {
-	// Group by route
 	groups := map[string][]Record{}
 	for _, r := range records {
 		groups[r.Route] = append(groups[r.Route], r)
@@ -172,25 +171,28 @@ func Summarize(records []Record) []Summary {
 		if len(recs) == 0 {
 			continue
 		}
+		// Sort by timestamp for trend
+		for i := 0; i < len(recs); i++ {
+			for j := i + 1; j < len(recs); j++ {
+				if recs[j].Timestamp.Before(recs[i].Timestamp) {
+					recs[i], recs[j] = recs[j], recs[i]
+				}
+			}
+		}
 		up := 0
-		var sumMedian, sumJitter, sumDownload int64
+		var sumJitter, sumDownload int64
 		var sumDownloadCount int
 		failures := 0
+		var medians []int64
 		for _, r := range recs {
-			if r.Status == "up" || r.Status == "degraded" {
-				// degraded counts as usable but not fully up? For availability we count up+degraded as available?
-				// Use status != down
-				if r.Status != "down" {
-					up++
-				} else {
-					failures++
-				}
-			} else if r.Status == "down" {
-				failures++
-			} else {
+			if r.Status != "down" {
 				up++
+			} else {
+				failures++
 			}
-			sumMedian += r.MedianMs
+			if r.Status != "down" && r.MedianMs > 0 {
+				medians = append(medians, r.MedianMs)
+			}
 			sumJitter += r.JitterMs
 			if r.DownloadMbps > 0 {
 				sumDownload += int64(r.DownloadMbps * 100)
@@ -198,13 +200,30 @@ func Summarize(records []Record) []Summary {
 			}
 		}
 		avail := float64(up) / float64(len(recs)) * 100
-		median := time.Duration(sumMedian/int64(len(recs))) * time.Millisecond
-		jitter := time.Duration(sumJitter/int64(len(recs))) * time.Millisecond
+		median := time.Duration(0)
+		if len(medians) > 0 {
+			for i := 0; i < len(medians); i++ {
+				for j := i + 1; j < len(medians); j++ {
+					if medians[j] < medians[i] {
+						medians[i], medians[j] = medians[j], medians[i]
+					}
+				}
+			}
+			mid := len(medians) / 2
+			if len(medians)%2 == 1 {
+				median = time.Duration(medians[mid]) * time.Millisecond
+			} else {
+				median = time.Duration((medians[mid-1]+medians[mid])/2) * time.Millisecond
+			}
+		}
+		jitter := time.Duration(0)
+		if len(recs) > 0 {
+			jitter = time.Duration(sumJitter/int64(len(recs))) * time.Millisecond
+		}
 		avgDownload := 0.0
 		if sumDownloadCount > 0 {
 			avgDownload = float64(sumDownload) / float64(sumDownloadCount) / 100
 		}
-		// Simple trend: compare first half vs second half median
 		trend := "stable"
 		if len(recs) >= 4 {
 			mid := len(recs) / 2

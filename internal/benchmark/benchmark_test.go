@@ -67,7 +67,7 @@ func TestMeasureDirectWithBytesParam(t *testing.T) {
 		if r.URL.Query().Get("bytes") == "" {
 			t.Error("bytes param missing")
 		}
-		w.Write([]byte("x"))
+		w.Write(make([]byte, 123))
 	}))
 	defer srv.Close()
 	ctx := context.Background()

@@ -1,9 +1,11 @@
 package singbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -76,6 +78,111 @@ func (c *Client) CheckOutbound(ctx context.Context, tag string) error {
 	}
 	if _, ok := proxies[tag]; !ok {
 		return fmt.Errorf("outbound-not-found: %q not in controller proxies", tag)
+	}
+	return nil
+}
+
+func (c *Client) GetProxy(ctx context.Context, name string) (map[string]json.RawMessage, error) {
+	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.authHeader(req)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("singbox controller unreachable: %w", categorizeErr(err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("singbox-api: unauthorized (bad secret)")
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("outbound-not-found: %q", name)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("singbox-api: unexpected status %d", resp.StatusCode)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("singbox-api: malformed proxy response: %w", err)
+	}
+	return raw, nil
+}
+
+type selectorState struct {
+	Name string   `json:"name"`
+	Type string   `json:"type"`
+	Now  string   `json:"now"`
+	All  []string `json:"all"`
+}
+
+func (c *Client) GetSelectedOutbound(ctx context.Context, selector string) (string, error) {
+	if selector == "" {
+		selector = "frostgate-selector"
+	}
+	m, err := c.GetProxy(ctx, selector)
+	if err != nil {
+		return "", err
+	}
+	var st selectorState
+	// The response is directly the selector object, not wrapped
+	raw, ok := m["now"]
+	if !ok {
+		// Try to decode full object
+		b, _ := json.Marshal(m)
+		if err := json.Unmarshal(b, &st); err != nil {
+			return "", fmt.Errorf("singbox-api: missing now field")
+		}
+		if st.Now == "" {
+			return "", fmt.Errorf("singbox-api: selector %q has no selection", selector)
+		}
+		return st.Now, nil
+	}
+	var now string
+	if err := json.Unmarshal(raw, &now); err != nil {
+		return "", err
+	}
+	if now == "" {
+		return "", fmt.Errorf("singbox-api: selector %q empty", selector)
+	}
+	return now, nil
+}
+
+func (c *Client) SelectOutbound(ctx context.Context, selector, target string) error {
+	if selector == "" {
+		selector = "frostgate-selector"
+	}
+	body, _ := json.Marshal(map[string]string{"name": target})
+	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(selector))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.authHeader(req)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("singbox controller unreachable: %w", categorizeErr(err))
+	}
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("singbox-api: unauthorized (bad secret)")
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("outbound-not-found: selector %q or target %q", selector, target)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		var m map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&m)
+		return fmt.Errorf("singbox-api: selector switch failed status %d", resp.StatusCode)
+	}
+	now, err := c.GetSelectedOutbound(ctx, selector)
+	if err != nil {
+		return fmt.Errorf("singbox-api: verify selector failed: %w", err)
+	}
+	if now != target {
+		return fmt.Errorf("singbox-api: selector refuses to switch: wanted %q got %q", target, now)
 	}
 	return nil
 }

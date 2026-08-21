@@ -15,18 +15,31 @@ import (
 const DefaultDownloadURL = "https://speed.cloudflare.com/__down?bytes=8000000"
 const DefaultBytes = 8 * 1024 * 1024
 
-func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float64, time.Duration, error) {
-	if downloadURL == "" {
-		downloadURL = DefaultDownloadURL
+func buildDownloadURL(raw string, bytes int64) (string, error) {
+	if raw == "" {
+		raw = DefaultDownloadURL
 	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	if q.Get("bytes") == "" && bytes > 0 {
+		q.Set("bytes", fmt.Sprintf("%d", bytes))
+		u.RawQuery = q.Encode()
+	}
+	return u.String(), nil
+}
+
+func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float64, time.Duration, error) {
 	if bytes == 0 {
 		bytes = DefaultBytes
 	}
-	// Ensure URL has bytes param
-	if !hasBytesParam(downloadURL) {
-		downloadURL = fmt.Sprintf("%s?bytes=%d", downloadURL, bytes)
+	u, err := buildDownloadURL(downloadURL, bytes)
+	if err != nil {
+		return 0, 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -36,10 +49,19 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if err != nil {
 		return 0, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
+	}
 	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, bytes+1024*1024))
 	if err != nil {
 		return 0, 0, err
+	}
+	if bytes > 0 && n < bytes/2 {
+		return 0, 0, fmt.Errorf("short body: got %d bytes want %d", n, bytes)
+	}
+	if ctx.Err() != nil {
+		return 0, 0, ctx.Err()
 	}
 	elapsed := time.Since(start)
 	if elapsed == 0 {
@@ -50,24 +72,16 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 }
 
 func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes int64) (float64, time.Duration, error) {
-	if downloadURL == "" {
-		downloadURL = DefaultDownloadURL
+	if socksAddr == "" {
+		return 0, 0, fmt.Errorf("empty socks address")
 	}
 	if bytes == 0 {
 		bytes = DefaultBytes
 	}
-	if !hasBytesParam(downloadURL) {
-		// try to add bytes param if not present and using cloudflare
-		if u, err := url.Parse(downloadURL); err == nil {
-			q := u.Query()
-			if q.Get("bytes") == "" {
-				q.Set("bytes", fmt.Sprintf("%d", bytes))
-				u.RawQuery = q.Encode()
-				downloadURL = u.String()
-			}
-		}
+	u, err := buildDownloadURL(downloadURL, bytes)
+	if err != nil {
+		return 0, 0, err
 	}
-	// Create SOCKS dialer
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
 		return 0, 0, fmt.Errorf("socks5: %w", err)
@@ -82,7 +96,7 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 		Transport: transport,
 		Timeout:   30 * time.Second,
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -91,10 +105,19 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if err != nil {
 		return 0, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
+	}
 	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, bytes+2*1024*1024))
 	if err != nil {
 		return 0, 0, err
+	}
+	if bytes > 0 && n < bytes/2 {
+		return 0, 0, fmt.Errorf("short body: got %d want %d", n, bytes)
+	}
+	if ctx.Err() != nil {
+		return 0, 0, ctx.Err()
 	}
 	elapsed := time.Since(start)
 	if elapsed == 0 {

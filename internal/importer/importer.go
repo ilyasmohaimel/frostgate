@@ -26,6 +26,10 @@ type Skipped struct {
 }
 
 func FetchSubscription(ctx context.Context, subURL string) ([]byte, error) {
+	return FetchSubscriptionWithOpts(ctx, subURL, false)
+}
+
+func FetchSubscriptionWithOpts(ctx context.Context, subURL string, allowInsecure bool) ([]byte, error) {
 	if subURL == "" {
 		return nil, fmt.Errorf("empty url")
 	}
@@ -36,8 +40,8 @@ func FetchSubscription(ctx context.Context, subURL string) ([]byte, error) {
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return nil, fmt.Errorf("unsupported scheme %q (want https)", u.Scheme)
 	}
-	if u.Scheme == "http" {
-		// HTTP allowed but warn: user should prefer https
+	if u.Scheme == "http" && !allowInsecure {
+		return nil, fmt.Errorf("http subscription requires --allow-insecure-http (use https)")
 	}
 	if strings.EqualFold(u.Scheme, "file") || strings.EqualFold(u.Scheme, "data") || strings.EqualFold(u.Scheme, "javascript") {
 		return nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
@@ -49,11 +53,18 @@ func FetchSubscription(ctx context.Context, subURL string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "frostgate/0.4.0")
+	origIsHTTPS := u.Scheme == "https"
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
+			}
+			if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
+				return fmt.Errorf("unsupported redirect scheme %q", req.URL.Scheme)
+			}
+			if origIsHTTPS && req.URL.Scheme == "http" && !allowInsecure {
+				return fmt.Errorf("https to http downgrade blocked (use --allow-insecure-http)")
 			}
 			return nil
 		},

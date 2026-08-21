@@ -72,29 +72,48 @@ install_via_go() {
     exit 1
   fi
   if [ "$VERSION" = "latest" ]; then
-    GOSUMDB=off GOPROXY=direct go install "github.com/$REPO/cmd/frostgate@latest" || go install "github.com/$REPO/cmd/frostgate@latest"
+    go install "github.com/$REPO/cmd/frostgate@latest"
   else
     go install "github.com/$REPO/cmd/frostgate@${VERSION}"
   fi
   GOBIN="$(go env GOBIN 2>/dev/null || true)"
   GOPATH_BIN="$(go env GOPATH 2>/dev/null || echo "$HOME/go")/bin"
+  src=""
   if [ -n "$GOBIN" ] && [ -x "$GOBIN/$BINARY" ]; then
+    src="$GOBIN/$BINARY"
     echo "installed via go to $GOBIN/$BINARY" >&2
-    # also copy to INSTALL_DIR if different
-    if [ "$GOBIN/$BINARY" != "$INSTALL_DIR/$BINARY" ]; then
-      mkdir -p "$INSTALL_DIR"
-      cp "$GOBIN/$BINARY" "$INSTALL_DIR/$BINARY" 2>/dev/null || true
-      echo "copied to $INSTALL_DIR/$BINARY" >&2
-    fi
   elif [ -x "$GOPATH_BIN/$BINARY" ]; then
+    src="$GOPATH_BIN/$BINARY"
     echo "installed via go to $GOPATH_BIN/$BINARY" >&2
-    if [ "$GOPATH_BIN/$BINARY" != "$INSTALL_DIR/$BINARY" ]; then
-      mkdir -p "$INSTALL_DIR"
-      cp "$GOPATH_BIN/$BINARY" "$INSTALL_DIR/$BINARY" 2>/dev/null || true
-      echo "copied to $INSTALL_DIR/$BINARY" >&2
-    fi
   else
     echo "installed via go (check GOPATH/bin)" >&2
+    return 0
+  fi
+  if [ "$src" != "$INSTALL_DIR/$BINARY" ]; then
+    mkdir -p "$INSTALL_DIR"
+    tmp_go="$(mktemp "${INSTALL_DIR}/.${BINARY}.go.XXXXXX")"
+    trap 'rm -f "$tmp_go"' EXIT
+    if cp "$src" "$tmp_go" 2>/dev/null; then
+      chmod +x "$tmp_go"
+      if "$tmp_go" --version >/dev/null 2>&1; then
+        mv -f "$tmp_go" "$INSTALL_DIR/$BINARY"
+        trap - EXIT
+        echo "copied to $INSTALL_DIR/$BINARY" >&2
+      else
+        echo "go binary verification failed" >&2
+        rm -f "$tmp_go"
+        trap - EXIT
+        return 1
+      fi
+    else
+      echo "copy to $INSTALL_DIR failed" >&2
+      trap - EXIT
+      return 1
+    fi
+  fi
+  if [ -x "$INSTALL_DIR/$BINARY" ] && ! "$INSTALL_DIR/$BINARY" --version >/dev/null 2>&1; then
+    echo "installed binary failed version check" >&2
+    return 1
   fi
 }
 
@@ -102,20 +121,19 @@ verify_checksum() {
   bin_file="$1"
   sums_file="$2"
   expected_name="$3"
-  # Try to extract line for this binary
   if [ ! -f "$sums_file" ]; then
-    echo "SHA256SUMS not available — skipping verification (check https://github.com/$REPO/releases)" >&2
-    return 0
+    echo "SHA256SUMS not available — failing closed (no verification)" >&2
+    return 1
   fi
   line="$(grep -E " $expected_name\$|\\*$expected_name\$" "$sums_file" 2>/dev/null | head -n1 || true)"
   if [ -z "$line" ]; then
-    echo "no checksum entry for $expected_name in SHA256SUMS — skipping verify" >&2
-    return 0
+    echo "no checksum entry for $expected_name in SHA256SUMS — failing closed" >&2
+    return 1
   fi
   expected="$(printf "%s" "$line" | awk '{print $1}')"
   if [ -z "$expected" ]; then
-    echo "cannot parse checksum" >&2
-    return 0
+    echo "cannot parse checksum — failing closed" >&2
+    return 1
   fi
   actual=""
   if command -v sha256sum >/dev/null 2>&1; then
@@ -125,8 +143,8 @@ verify_checksum() {
   elif command -v openssl >/dev/null 2>&1; then
     actual="$(openssl dgst -sha256 "$bin_file" | awk '{print $NF}')"
   else
-    echo "no sha256sum/shasum/openssl found — skipping verification" >&2
-    return 0
+    echo "no sha256sum/shasum/openssl found — failing closed" >&2
+    return 1
   fi
   if [ "$actual" = "$expected" ]; then
     echo "checksum verified: $expected_name" >&2
@@ -213,14 +231,9 @@ install_via_binary() {
     echo "downloaded file looks like HTML, not a binary" >&2
     return 1
   fi
-  # Verify checksum if sums available
-  if [ -s "$tmp_sums" ]; then
-    if ! verify_checksum "$tmp" "$tmp_sums" "$bin_name"; then
-      echo "checksum verification failed — existing installation kept intact" >&2
-      return 1
-    fi
-  else
-    echo "SHA256SUMS not downloaded — continuing without verification (download from $sums_url to verify manually)" >&2
+  if ! verify_checksum "$tmp" "$tmp_sums" "$bin_name"; then
+    echo "checksum verification failed — existing installation kept intact" >&2
+    return 1
   fi
   chmod +x "$tmp"
   # Atomic move — existing binary stays intact until verify passes

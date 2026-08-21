@@ -85,9 +85,6 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 		fp = "chrome"
 	}
 	flow := q.Get("flow")
-	if flow != "" && flow != "xtls-rprx-vision" {
-		// allow vision only; other flows are uncommon but accept with warning
-	}
 	spx := q.Get("spx")
 	if spx == "" {
 		spx = q.Get("spiderX")
@@ -95,30 +92,26 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	security := q.Get("security")
 	if security == "" {
 		security = q.Get("type")
-	}
-	// Only require REALITY fields when security=reality
-	isReality := strings.EqualFold(security, "reality") || pbk != "" || sid != ""
-	if isReality {
-		if pbk == "" {
-			return nil, fmt.Errorf("missing pbk (REALITY public key) for reality")
-		}
-		if sni == "" {
-			return nil, fmt.Errorf("missing sni/serverName for reality")
-		}
-	} else {
-		if sni == "" {
-			// For non-reality, sni may still be required for TLS; allow empty? Require for TLS
-			// Don't enforce strictly; let it be empty
+		// type may be tcp etc, not security, so fallback to empty; we already validated transport separately
+		if security == "tcp" || security == "raw" {
+			security = ""
 		}
 	}
-	// Validate transport where applicable
 	transport := q.Get("type")
-	if transport != "" {
-		switch transport {
-		case "tcp", "ws", "grpc", "http", "quic", "kcp":
-		default:
-			return nil, fmt.Errorf("unsupported VLESS transport %q", transport)
-		}
+	if transport != "" && transport != "tcp" && transport != "raw" {
+		return nil, fmt.Errorf("unsupported VLESS transport %q", transport)
+	}
+	if flow != "" && flow != "xtls-rprx-vision" {
+		return nil, fmt.Errorf("unsupported VLESS flow %q", flow)
+	}
+	if pbk == "" {
+		return nil, fmt.Errorf("missing pbk (REALITY public key)")
+	}
+	if sni == "" {
+		return nil, fmt.Errorf("missing sni/serverName for reality")
+	}
+	if security != "" && !strings.EqualFold(security, "reality") {
+		return nil, fmt.Errorf("non-REALITY VLESS is not currently supported: security=%q", security)
 	}
 	// Fragment may contain name but not needed
 	return &VLESSOutbound{
@@ -204,6 +197,12 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 		insecure = true
 	}
 	pin := q.Get("pinSHA256")
+	if pin != "" {
+		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256: certificate pinning is not currently supported")
+	}
+	if q.Get("pinSHA256") != "" || q.Get("pin") != "" {
+		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256")
+	}
 	return &Hysteria2Outbound{
 		Tag:          tag,
 		Server:       host,

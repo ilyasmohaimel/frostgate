@@ -21,15 +21,15 @@ type ImportedRoute struct {
 }
 
 func FingerprintVLESS(v *setup.VLESSOutbound) string {
-	canonical := fmt.Sprintf("vless:%s:%d:%s:%s:%s:%s", v.Server, v.ServerPort, v.UUID, v.SNI, v.PBK, v.SID)
+	canonical := fmt.Sprintf("vless:%s:%d:%s:reality:%s:%s:%s:%s:%s:%s", v.Server, v.ServerPort, v.UUID, v.SNI, v.PBK, v.SID, v.FP, v.Flow, v.SpiderX)
 	h := sha256.Sum256([]byte(canonical))
-	return fmt.Sprintf("%x", h[:8])
+	return fmt.Sprintf("%x", h[:])
 }
 
 func FingerprintHysteria(h *setup.Hysteria2Outbound) string {
-	canonical := fmt.Sprintf("hysteria2:%s:%d:%s:%s", h.Server, h.ServerPort, h.Password, h.ObfsPassword)
+	canonical := fmt.Sprintf("hysteria2:%s:%d:%s:%s:%s:%t:%s", h.Server, h.ServerPort, h.Password, h.ObfsPassword, h.SNI, h.Insecure, h.PinSHA256)
 	hash := sha256.Sum256([]byte(canonical))
-	return fmt.Sprintf("%x", hash[:8])
+	return fmt.Sprintf("%x", hash[:])
 }
 
 func ParseShareLink(link, tag string) (*ImportedRoute, error) {
