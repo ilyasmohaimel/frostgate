@@ -216,8 +216,8 @@ func FetchDoHAnswers(ctx context.Context, client *http.Client, dohBase, host str
 }
 
 // CheckDNSVsDoH compares system resolver answers with DoH answers for host.
-// DIFFER is only a signal (CDNs legitimately differ); it is NOT evidence of
-// DNS poisoning on its own.
+// DIFFER is a signal, not proof of DNS poisoning. CDNs and regional resolvers
+// can return different addresses.
 func CheckDNSVsDoH(host, dohBase string) Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
@@ -236,7 +236,7 @@ func CheckDNSVsDoH(host, dohBase string) Check {
 	case "MATCH":
 		return Check{Name: "DNS vs DoH", Status: "PASS", Detail: fmt.Sprintf("MATCH (%s)", host)}
 	case "DIFFER":
-		return Check{Name: "DNS vs DoH", Status: "WARN", Detail: fmt.Sprintf("DIFFER for %s (signal only — CDNs can legitimately differ)", host)}
+		return Check{Name: "DNS vs DoH", Status: "WARN", Detail: fmt.Sprintf("DIFFER for %s (signal only - CDNs can return different addresses)", host)}
 	default:
 		return Check{Name: "DNS vs DoH", Status: "UNAVAILABLE", Detail: "no comparable answers"}
 	}

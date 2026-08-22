@@ -65,8 +65,9 @@ func TestCheckDNSVsDoHDiffer(t *testing.T) {
 	systemLookup = func(host string) ([]string, error) { return []string{"203.0.113.52"}, nil }
 	defer func() { systemLookup = old }()
 	c := CheckDNSVsDoH("example.com", srv.URL)
-	if c.Status != "WARN" || c.Detail[:6] != "DIFFER" {
-		t.Errorf("want WARN DIFFER got %+v", c)
+	want := "DIFFER for example.com (signal only - CDNs can return different addresses)"
+	if c.Status != "WARN" || c.Detail != want {
+		t.Errorf("want WARN %q got %+v", want, c)
 	}
 }
 
