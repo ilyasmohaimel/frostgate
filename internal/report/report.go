@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
+	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 )
@@ -170,39 +171,34 @@ func diagnosis(results []probe.Result) string {
 		}
 	}
 	directUp := direct != nil && direct.OK()
+	proxyCount := 0
+	proxyUp := 0
+	proxyDown := 0
 	allDown := true
-	anyUp := false
 	for _, r := range results {
 		if r.OK() {
 			allDown = false
-			anyUp = true
-			break
+		}
+		if r.Endpoint.Type != config.ProbeSingBox {
+			continue
+		}
+		proxyCount++
+		if r.OK() {
+			proxyUp++
+		} else {
+			proxyDown++
 		}
 	}
 	// If direct is present, use it for diagnosis
 	if direct != nil {
-		if !directUp && allDown {
+		if !directUp && proxyCount > 0 && proxyDown == proxyCount {
 			return "hint: direct baseline + all proxies down; local internet/DNS may be down"
 		}
-		if directUp && allDown {
+		if directUp && proxyCount > 0 && proxyDown == proxyCount {
 			return "hint: direct works but all proxy routes fail; proxy/VPS or control path likely issue"
 		}
-		if directUp {
-			// check if TCP reachable but proxy fails? We don't have separate server reachability vs proxy health in same result currently.
-			// Generic: some proxies down
-			hasDown := false
-			for _, r := range results {
-				if r.Endpoint.Name == direct.Endpoint.Name {
-					continue
-				}
-				if !r.OK() {
-					hasDown = true
-					break
-				}
-			}
-			if hasDown && anyUp {
-				return "hint: direct OK, some proxy routes degraded; check those transports"
-			}
+		if directUp && proxyDown > 0 && proxyUp > 0 {
+			return "hint: direct OK, some proxy routes failed; check those transports"
 		}
 	} else {
 		if allDown {

@@ -60,7 +60,7 @@ func run() int {
 			if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 				home = h
 			}
-			if err := setup.RunInteractive(setup.Options{HomeDir: home}); err != nil {
+			if err := runInteractiveSetup(home); err != nil {
 				fmt.Fprintln(os.Stderr, "setup:", err)
 				return 3
 			}
@@ -130,7 +130,7 @@ func run() int {
 		if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 			home = h
 		}
-		if err := setup.RunInteractive(setup.Options{HomeDir: home}); err != nil {
+		if err := runInteractiveSetup(home); err != nil {
 			fmt.Fprintln(os.Stderr, "setup:", err)
 			return 3
 		}
@@ -184,6 +184,22 @@ func run() int {
 	_ = rec.Record(history.FromProbeResults(res, nil, ""))
 	emit(res, *jsonOut, *verbose)
 	return exitCode(res)
+}
+
+func runInteractiveSetup(home string) error {
+	return setup.RunInteractive(setup.Options{
+		HomeDir: home,
+		AddRoute: func(dir, link, tag string) error {
+			result, err := addManagedRoute(dir, filepath.Join(dir, "config.yaml"), strings.TrimSpace(link), tag, nil)
+			if err != nil {
+				return err
+			}
+			if result.AlreadyExists {
+				fmt.Printf("Route already exists: %s\n", result.Tag)
+			}
+			return nil
+		},
+	})
 }
 
 func printHelp() {
@@ -243,7 +259,6 @@ func handleAdd(args []string) int {
 		fmt.Fprintln(os.Stderr, "empty link")
 		return 3
 	}
-	fmt.Println("Importing route...")
 	home := setup.DefaultHomeDir()
 	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 		home = h
@@ -254,86 +269,24 @@ func handleAdd(args []string) int {
 		return 3
 	}
 	tag := strings.TrimSpace(nameFlag)
-	if tag != "" {
-		if err := route.ValidateName(tag); err != nil {
-			fmt.Fprintf(os.Stderr, "invalid route name %q: %v\n", tag, sanitizeError(err))
-			return 3
-		}
-	} else {
+	if tag == "" {
 		tag = route.SanitizeName(route.DeriveNameFromLink(link, 1))
-	}
-	r, err := route.ParseShareLink(link, tag)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse failed: %v\n", sanitizeError(err))
-		return 3
-	}
-	displayProto := r.Protocol
-	if r.Protocol == "vless" {
-		displayProto = "VLESS + REALITY + Vision"
-		if r.VLESS != nil && r.VLESS.PBK == "" {
-			displayProto = "VLESS"
-		}
-	} else if r.Protocol == "hysteria2" {
-		displayProto = "Hysteria2"
-	}
-	fmt.Printf("parsed %s\n", displayProto)
-	mg, err := managedconfig.Load(dir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "load managed config:", sanitizeError(err))
-		return 3
-	}
-	for _, v := range mg.VLESS {
-		if v.Tag == tag || route.FingerprintVLESS(v) == r.Fingerprint {
-			fmt.Printf("Route already exists: %s\n", v.Tag)
-			return 0
-		}
-	}
-	for _, h := range mg.Hysteria {
-		if h.Tag == tag || route.FingerprintHysteria(h) == r.Fingerprint {
-			fmt.Printf("Route already exists: %s\n", h.Tag)
-			return 0
-		}
-	}
-	if r.VLESS != nil {
-		mg.AddVLESS(r.VLESS)
-	} else if r.Hysteria != nil {
-		mg.AddHysteria(r.Hysteria)
 	}
 	cfgPath2 := filepath.Join(dir, "config.yaml")
 	if cfgPath != "" {
 		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
-	controller := config.DefaultSingBoxController
-	if existing, loadErr := config.Load(cfgPath2); loadErr == nil {
-		controller = existing.SingBox.Controller
-	}
-	if mg.Secret == "" {
-		mg.Secret, err = setup.GenerateSecret()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, sanitizeError(err))
-			return 3
-		}
-	}
-	runner := managedconfig.DefaultSidecarRunner(controller, mg.Secret)
-	if err := mg.SaveTransaction(runner); err != nil {
+	fmt.Println("Importing route...")
+	result, err := addManagedRoute(dir, cfgPath2, link, tag, nil)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
+	}
+	if result.AlreadyExists {
+		fmt.Printf("Route already exists: %s\n", result.Tag)
+		return 0
 	}
 	fmt.Println("sing-box config valid")
-	secretFile := filepath.Join(dir, "controller-secret")
-	var vlessTags []string
-	for _, v := range mg.VLESS {
-		vlessTags = append(vlessTags, v.Tag)
-	}
-	var hystTags []string
-	for _, h := range mg.Hysteria {
-		hystTags = append(hystTags, h.Tag)
-	}
-	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", controller, secretFile)
-	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		return 3
-	}
 	fmt.Println("sidecar reloaded and verified")
 	fmt.Println("Testing new route...")
 	cfg, err := config.Load(cfgPath2)
@@ -420,7 +373,10 @@ func handleImport(args []string) int {
 		home = h
 	}
 	dir := setup.ConfigDir(home)
-	setup.EnsureConfigDir(dir)
+	if err := setup.EnsureConfigDir(dir); err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
 	// Deduplicate via fingerprint against existing and within subscription
 	mg, err := managedconfig.Load(dir)
 	if err != nil {
@@ -486,33 +442,11 @@ func handleImport(args []string) int {
 	if cfgPath != "" {
 		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
-	controller := config.DefaultSingBoxController
-	if existing, loadErr := config.Load(cfgPath2); loadErr == nil {
-		controller = existing.SingBox.Controller
+	tags := make([]string, 0, len(toAdd))
+	for _, imported := range toAdd {
+		tags = append(tags, imported.Tag)
 	}
-	if mg.Secret == "" {
-		mg.Secret, err = setup.GenerateSecret()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, sanitizeError(err))
-			return 3
-		}
-	}
-	runner := managedconfig.DefaultSidecarRunner(controller, mg.Secret)
-	if err := mg.SaveTransaction(runner); err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		return 3
-	}
-	secretFile := filepath.Join(dir, "controller-secret")
-	var vlessTags []string
-	for _, v := range mg.VLESS {
-		vlessTags = append(vlessTags, v.Tag)
-	}
-	var hystTags []string
-	for _, h := range mg.Hysteria {
-		hystTags = append(hystTags, h.Tag)
-	}
-	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", controller, secretFile)
-	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
+	if err := commitManagedRoutes(mg, cfgPath2, tags, nil); err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}

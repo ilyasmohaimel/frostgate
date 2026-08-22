@@ -49,11 +49,6 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if uuid == "" {
 		return nil, fmt.Errorf("missing UUID")
 	}
-	if _, err := url.QueryUnescape(uuid); err == nil {
-		if decoded, e2 := url.QueryUnescape(uuid); e2 == nil {
-			_ = decoded
-		}
-	}
 	host := u.Hostname()
 	portStr := u.Port()
 	if host == "" || portStr == "" {
@@ -117,16 +112,17 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	}
 	// Fragment may contain name but not needed
 	return &VLESSOutbound{
-		Tag:        tag,
-		Server:     host,
-		ServerPort: port,
-		UUID:       uuid,
-		Flow:       flow,
-		SNI:        sni,
-		FP:         fp,
-		PBK:        pbk,
-		SID:        sid,
-		SpiderX:    spx,
+		Tag:            tag,
+		Server:         host,
+		ServerPort:     port,
+		UUID:           uuid,
+		Flow:           flow,
+		SNI:            sni,
+		FP:             fp,
+		PBK:            pbk,
+		SID:            sid,
+		SpiderX:        spx,
+		PacketEncoding: q.Get("packet_encoding"),
 	}, nil
 }
 
@@ -202,7 +198,7 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if pin != "" {
 		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256: certificate pinning is not currently supported")
 	}
-	if q.Get("pinSHA256") != "" || q.Get("pin") != "" {
+	if q.Get("pin") != "" {
 		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256")
 	}
 	return &Hysteria2Outbound{
@@ -210,6 +206,7 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 		Server:       host,
 		ServerPort:   port,
 		Password:     pass,
+		ObfsType:     obfs,
 		ObfsPassword: obfsPass,
 		SNI:          sni,
 		Insecure:     insecure,

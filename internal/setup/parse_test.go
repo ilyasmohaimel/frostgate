@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseVLESSValid(t *testing.T) {
-	link := "vless://11111111-1111-1111-1111-111111111111@203.0.113.10:443?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd1234ef561234&flow=xtls-rprx-vision"
+	link := "vless://11111111-1111-1111-1111-111111111111@203.0.113.10:443?encryption=none&security=reality&sni=example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd1234ef561234&flow=xtls-rprx-vision&spx=%2Fedge&packet_encoding=packetaddr"
 	v, err := ParseVLESSShareLink(link, "test-reality")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -22,6 +22,12 @@ func TestParseVLESSValid(t *testing.T) {
 	}
 	if v.PBK != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
 		t.Errorf("pbk %q", v.PBK)
+	}
+	if v.Flow != "xtls-rprx-vision" {
+		t.Errorf("flow %q", v.Flow)
+	}
+	if v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" {
+		t.Errorf("extended VLESS fields = %+v", v)
 	}
 }
 
@@ -78,6 +84,9 @@ func TestParseHysteria2Valid(t *testing.T) {
 	}
 	if h.ObfsPassword != "test-obfs-456" {
 		t.Errorf("obfs %q", h.ObfsPassword)
+	}
+	if h.ObfsType != "salamander" {
+		t.Errorf("obfs type %q", h.ObfsType)
 	}
 	if !h.Insecure {
 		t.Error("insecure should be true")

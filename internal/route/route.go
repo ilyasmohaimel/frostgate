@@ -2,20 +2,20 @@ package route
 
 import (
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
+	"github.com/ilyasmohaimel/frostgate/internal/routename"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
 var (
-	ErrRouteNameEmpty   = errors.New("route name is empty")
-	ErrRouteNameTooLong = errors.New("route name too long")
-	ErrRouteNameControl = errors.New("route name contains control characters")
-	ErrRouteNameSlash   = errors.New("route name contains slash")
-	ErrRouteNameInvalid = errors.New("route name contains invalid characters")
+	ErrRouteNameEmpty   = routename.ErrEmpty
+	ErrRouteNameTooLong = routename.ErrTooLong
+	ErrRouteNameControl = routename.ErrControl
+	ErrRouteNameSlash   = routename.ErrSlash
+	ErrRouteNameInvalid = routename.ErrInvalid
 )
 
 type ImportedRoute struct {

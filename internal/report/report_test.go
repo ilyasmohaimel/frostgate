@@ -182,6 +182,65 @@ func TestTableDownCase(t *testing.T) {
 	}
 }
 
+func TestDiagnosisDirectUpAllProxiesDown(t *testing.T) {
+	results := []probe.Result{
+		mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0),
+		mkResult("proxy-a", config.ProbeSingBox, probe.StatusDown, 0, 100),
+		mkResult("proxy-b", config.ProbeSingBox, probe.StatusDown, 0, 100),
+	}
+	want := "hint: direct works but all proxy routes fail; proxy/VPS or control path likely issue"
+	if got := diagnosis(results); got != want {
+		t.Fatalf("diagnosis = %q, want %q", got, want)
+	}
+}
+
+func TestDiagnosisDirectUpMixedProxyHealth(t *testing.T) {
+	results := []probe.Result{
+		mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0),
+		mkResult("proxy-up", config.ProbeSingBox, probe.StatusUp, 100*time.Millisecond, 0),
+		mkResult("proxy-down", config.ProbeSingBox, probe.StatusDown, 0, 100),
+	}
+	want := "hint: direct OK, some proxy routes failed; check those transports"
+	if got := diagnosis(results); got != want {
+		t.Fatalf("diagnosis = %q, want %q", got, want)
+	}
+}
+
+func TestDiagnosisDirectDownAllProxiesDown(t *testing.T) {
+	results := []probe.Result{
+		mkResult("direct", config.ProbeHTTP, probe.StatusDown, 0, 100),
+		mkResult("proxy-a", config.ProbeSingBox, probe.StatusDown, 0, 100),
+	}
+	want := "hint: direct baseline + all proxies down; local internet/DNS may be down"
+	if got := diagnosis(results); got != want {
+		t.Fatalf("diagnosis = %q, want %q", got, want)
+	}
+}
+
+func TestDiagnosisMissingDirectAllProxiesDown(t *testing.T) {
+	results := []probe.Result{
+		mkResult("proxy-a", config.ProbeSingBox, probe.StatusDown, 0, 100),
+		mkResult("proxy-b", config.ProbeSingBox, probe.StatusDown, 0, 100),
+	}
+	want := "hint: all routes down; check internet and proxy config"
+	if got := diagnosis(results); got != want {
+		t.Fatalf("diagnosis = %q, want %q", got, want)
+	}
+}
+
+func TestDiagnosisDirectOnlyAndEmpty(t *testing.T) {
+	for name, results := range map[string][]probe.Result{
+		"direct only": {mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0)},
+		"empty":       nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := diagnosis(results); got != "" {
+				t.Fatalf("diagnosis = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestJSONNoSecretInError(t *testing.T) {
 	secret := "fixture-secret-token"
 	results := []probe.Result{

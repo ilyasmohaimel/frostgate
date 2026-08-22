@@ -4,9 +4,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/ilyasmohaimel/frostgate/internal/config"
 )
 
 func GenerateSecret() (string, error) {
@@ -94,10 +98,6 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			"flow":        v.Flow,
 			"tls":         tlsCfg,
 		}
-		if v.Flow == "" {
-			// omit flow if empty? but keep as is; sing-box allows empty
-		}
-		// packet_encoding xudp is common for VLESS
 		if v.PacketEncoding != "" {
 			ob["packet_encoding"] = v.PacketEncoding
 		} else {
@@ -133,10 +133,6 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 				"type":     obfsType,
 				"password": h.ObfsPassword,
 			}
-		}
-		if h.PinSHA256 != "" {
-			// sing-box uses certificate pinning via tls config? Keep as is
-			// Not critical for setup
 		}
 		outbounds = append(outbounds, ob)
 	}
@@ -175,26 +171,62 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 	return json.MarshalIndent(cfg, "", "  ")
 }
 
-func GenerateFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string) string {
-	// Build endpoints
-	out := "defaults:\n  timeout: 5s\n  samples: 4\n  sample_interval: 150ms\n  healthy_latency: 800ms\n  max_jitter: 80ms\n\nsingbox:\n  controller: " + controller + "\n"
-	if secretFile != "" {
-		out += "  secret_file: " + secretFile + "\n"
+// BuildFrostgateConfig creates the initial Frostgate config for setup flows.
+// Later route additions preserve the user's existing YAML instead of replacing
+// it with this initial template.
+func BuildFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string) config.Config {
+	if testURL == "" {
+		testURL = config.DefaultTestURL
 	}
-	out += "  test_url: " + testURL + "\n"
-	out += "  benchmark_proxy: 127.0.0.1:2080\n\nendpoints:\n"
-	// direct baseline always
-	out += "  - name: direct\n    type: http\n    url: " + testURL + "\n    expected_status: 204\n    priority: 100\n"
+	if controller == "" {
+		controller = config.DefaultSingBoxController
+	}
+	cfg := config.Config{
+		Defaults: config.Defaults{
+			Timeout:        config.Duration{Duration: 5 * time.Second},
+			Samples:        4,
+			SampleInterval: config.Duration{Duration: 150 * time.Millisecond},
+			HealthyLatency: config.Duration{Duration: 800 * time.Millisecond},
+			MaxJitter:      config.Duration{Duration: 80 * time.Millisecond},
+		},
+		SingBox: config.SingBoxConfig{
+			Controller:     controller,
+			SecretFile:     secretFile,
+			TestURL:        testURL,
+			BenchmarkProxy: "127.0.0.1:2080",
+		},
+		Endpoints: []config.Endpoint{{
+			Name:     "direct",
+			Type:     config.ProbeHTTP,
+			URL:      testURL,
+			Priority: 100,
+		}},
+	}
+	if testURL == config.DefaultTestURL {
+		cfg.Endpoints[0].ExpectedStatus = 204
+	}
 	priority := 10
-	for _, tag := range vlessTags {
-		out += fmt.Sprintf("  - name: %s\n    type: singbox\n    outbound: %s\n    priority: %d\n", tag, tag, priority)
+	for _, tag := range append(append([]string{}, vlessTags...), hysteriaTags...) {
+		cfg.Endpoints = append(cfg.Endpoints, config.Endpoint{
+			Name: tag, Type: config.ProbeSingBox, Outbound: tag, Priority: priority,
+		})
 		priority += 10
 	}
-	for _, tag := range hysteriaTags {
-		out += fmt.Sprintf("  - name: %s\n    type: singbox\n    outbound: %s\n    priority: %d\n", tag, tag, priority)
-		priority += 10
+	return cfg
+}
+
+func MarshalFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string) ([]byte, error) {
+	return yaml.Marshal(BuildFrostgateConfig(vlessTags, hysteriaTags, testURL, controller, secretFile))
+}
+
+// GenerateFrostgateConfig is retained for callers that need the initial
+// config template as text.
+func GenerateFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string) string {
+	data, err := MarshalFrostgateConfig(vlessTags, hysteriaTags, testURL, controller, secretFile)
+	if err != nil {
+		return ""
 	}
-	return out
+	return string(data)
 }
 
 func WriteFileSecure(path string, data []byte) error {

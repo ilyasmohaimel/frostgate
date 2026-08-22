@@ -248,7 +248,7 @@ systemctl --user status frostgate-singbox.service --no-pager
 
 - Share URLs, subscription URLs, controller secrets, UUIDs, REALITY material, and Hysteria passwords are credentials.
 - Frostgate stores route credentials only in private local configuration files with mode `0600`.
-- Errors, JSON output, history, TUI output, tests, and process arguments use the same redaction rules.
+- Frostgate redacts errors, JSON output, history, TUI output, and test data before printing or storing them. Share links and subscription URLs passed on the command line may remain in shell history or the local process list while Frostgate runs.
 - Temporary `frostgate test` configurations use a private temporary directory and are removed on exit.
 
 ## Limitations

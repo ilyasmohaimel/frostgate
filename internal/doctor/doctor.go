@@ -154,8 +154,9 @@ func Run(cfgPath string, verbose bool) []Check {
 		} else {
 			out = append(out, Check{Name: "Controller", Status: "SKIP", Detail: "no singbox endpoints"})
 		}
-		// sidecar service state
-		if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", "frostgate-singbox.service")); err == nil {
+		// The setup-generated service lives beside the active XDG config home.
+		servicePath := filepath.Join(filepath.Dir(filepath.Dir(resolved)), "systemd", "user", "frostgate-singbox.service")
+		if _, err := os.Stat(servicePath); err == nil {
 			status := getSystemdStatus("frostgate-singbox.service")
 			if strings.Contains(status, "active (running)") {
 				out = append(out, Check{Name: "Sidecar service", Status: "PASS", Detail: "frostgate-singbox active"})
@@ -239,22 +240,8 @@ func Format(checks []Check) string {
 	var b strings.Builder
 	b.WriteString("Frostgate Doctor\n\n")
 	for _, c := range checks {
-		status := c.Status
-		switch status {
-		case "PASS":
-			status = "\033[32mPASS\033[0m"
-		case "FAIL":
-			status = "\033[31mFAIL\033[0m"
-		case "WARN":
-			status = "\033[33mWARN\033[0m"
-		case "SKIP":
-			status = "\033[90mSKIP\033[0m"
-		}
-		// strip ANSI if not tty? keep simple
 		b.WriteString(fmt.Sprintf("%-20s %s  %s\n", c.Name, c.Status, c.Detail))
-		_ = status
 	}
-	// Actually print without colors for simpler; reformat
 	return b.String()
 }
 

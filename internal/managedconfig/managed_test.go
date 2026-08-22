@@ -365,3 +365,25 @@ func TestSaveTransactionRollbackOnControllerMissing(t *testing.T) {
 		t.Fatal("expected error when controller missing outbound")
 	}
 }
+
+func TestSaveTransactionWithConfigRejectsInvalidCandidateBeforeMutation(t *testing.T) {
+	d := tempDir(t)
+	configPath := filepath.Join(d, "config.yaml")
+	originalSing := []byte("original-config")
+	originalConfig := []byte("endpoints: []\n")
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), originalSing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, originalConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Managed{Dir: d}
+	if err := m.SaveTransactionWithConfig(&SidecarRunner{}, configPath, []byte("endpoints: [")); err == nil {
+		t.Fatal("invalid config candidate was accepted")
+	}
+	gotSing, _ := os.ReadFile(filepath.Join(d, "sing-box.json"))
+	gotConfig, _ := os.ReadFile(configPath)
+	if string(gotSing) != string(originalSing) || string(gotConfig) != string(originalConfig) {
+		t.Fatal("invalid config candidate mutated files")
+	}
+}

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
@@ -384,31 +386,53 @@ func (m *Managed) ProxyTags() []string {
 func (m *Managed) AddVLESS(v *setup.VLESSOutbound)        { m.VLESS = append(m.VLESS, v) }
 func (m *Managed) AddHysteria(h *setup.Hysteria2Outbound) { m.Hysteria = append(m.Hysteria, h) }
 
-// SaveTransaction performs a transactional write: snapshot current files,
-// write the candidate atomically, validate it, restart the sidecar and verify
-// the controller exposes the expected outbounds. On any failure after mutation
-// it restores the previous files.
+// SaveTransaction updates only the managed sing-box files. Callers that also
+// change Frostgate's config.yaml should use SaveTransactionWithConfig so both
+// files are rolled back together.
 func (m *Managed) SaveTransaction(runner *SidecarRunner) error {
-	dir := m.Dir
-	files := []string{"sing-box.json", "controller-secret", "config.yaml"}
-	snapDir, err := os.MkdirTemp("", "frostgate-snap-*")
-	if err != nil {
-		return fmt.Errorf("snapshot: %w", err)
-	}
-	defer os.RemoveAll(snapDir)
-	for _, f := range files {
-		if data, err := os.ReadFile(filepath.Join(dir, f)); err == nil {
-			if err := os.WriteFile(filepath.Join(snapDir, f), data, 0o600); err != nil {
-				return fmt.Errorf("snapshot %s: %w", f, err)
-			}
-		}
-	}
+	return m.saveTransaction(runner, "", nil)
+}
 
+// SaveTransactionWithConfig atomically installs the managed sing-box candidate
+// and a validated Frostgate configuration. If the sidecar cannot accept the
+// candidate, both files are restored.
+func (m *Managed) SaveTransactionWithConfig(runner *SidecarRunner, configPath string, configData []byte) error {
+	if configPath == "" {
+		return fmt.Errorf("config path is required")
+	}
+	if len(configData) == 0 {
+		return fmt.Errorf("config candidate is empty")
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(configData, &doc); err != nil {
+		return fmt.Errorf("config candidate is not valid YAML: %w", err)
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("config candidate must be a YAML mapping")
+	}
+	return m.saveTransaction(runner, configPath, configData)
+}
+
+type transactionFile struct {
+	path      string
+	candidate []byte
+	install   bool
+}
+
+type fileSnapshot struct {
+	path   string
+	data   []byte
+	exists bool
+}
+
+func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, configData []byte) error {
+	if err := os.MkdirAll(m.Dir, 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
 	candidate, err := m.Generate()
 	if err != nil {
 		return fmt.Errorf("generate: %w", err)
 	}
-	// Validate candidate: JSON valid (always) + injected validator (sing-box).
 	if !json.Valid(candidate) {
 		return fmt.Errorf("candidate is not valid JSON")
 	}
@@ -418,34 +442,37 @@ func (m *Managed) SaveTransaction(runner *SidecarRunner) error {
 		}
 	}
 
-	// Atomically install candidate.
-	tmp, err := os.CreateTemp(dir, "frostgate-cand-*")
-	if err != nil {
-		return fmt.Errorf("candidate temp: %w", err)
+	files := []transactionFile{
+		{path: filepath.Join(m.Dir, "sing-box.json"), candidate: candidate, install: true},
+		{path: filepath.Join(m.Dir, "controller-secret"), candidate: []byte(m.Secret + "\n"), install: m.Secret != ""},
 	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(candidate); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write candidate: %w", err)
+	if configPath != "" {
+		files = append(files, transactionFile{path: configPath, candidate: configData, install: true})
 	}
-	tmp.Close()
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("chmod candidate: %w", err)
+
+	snapshots := make([]fileSnapshot, 0, len(files))
+	for _, f := range files {
+		s := fileSnapshot{path: f.path}
+		if data, readErr := os.ReadFile(f.path); readErr == nil {
+			s.data = data
+			s.exists = true
+		} else if !os.IsNotExist(readErr) {
+			return fmt.Errorf("snapshot %s: %w", f.path, readErr)
+		}
+		snapshots = append(snapshots, s)
 	}
-	if err := os.Rename(tmpPath, filepath.Join(dir, "sing-box.json")); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("install candidate: %w", err)
-	}
-	if m.Secret != "" {
-		if err := os.WriteFile(filepath.Join(dir, "controller-secret"), []byte(m.Secret+"\n"), 0o600); err != nil {
-			rollbackFiles(dir, snapDir, files)
-			return fmt.Errorf("write secret: %w", err)
+
+	for _, f := range files {
+		if !f.install {
+			continue
+		}
+		if err := writeFileAtomic(f.path, f.candidate, 0o600); err != nil {
+			rollbackSnapshots(snapshots)
+			return fmt.Errorf("install %s: %w", f.path, err)
 		}
 	}
 	rollback := func(err error) error {
-		rollbackFiles(dir, snapDir, files)
+		rollbackSnapshots(snapshots)
 		if runner != nil && runner.Restart != nil {
 			_ = runner.Restart()
 		}
@@ -486,13 +513,35 @@ func (m *Managed) SaveTransaction(runner *SidecarRunner) error {
 	return nil
 }
 
-func rollbackFiles(dir, snapDir string, files []string) {
-	for _, f := range files {
-		snap := filepath.Join(snapDir, f)
-		if data, err := os.ReadFile(snap); err == nil {
-			_ = os.WriteFile(filepath.Join(dir, f), data, 0o600)
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".frostgate-cand-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func rollbackSnapshots(snapshots []fileSnapshot) {
+	for _, snapshot := range snapshots {
+		if snapshot.exists {
+			_ = writeFileAtomic(snapshot.path, snapshot.data, 0o600)
 		} else {
-			_ = os.Remove(filepath.Join(dir, f))
+			_ = os.Remove(snapshot.path)
 		}
 	}
 }

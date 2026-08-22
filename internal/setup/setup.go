@@ -3,7 +3,6 @@ package setup
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/routename"
 )
 
 type Options struct {
@@ -20,6 +22,9 @@ type Options struct {
 	Stdin   *bufio.Reader
 	Stdout  *os.File
 	Stderr  *os.File
+	// AddRoute lets the application layer apply its managed-config transaction
+	// when setup adds a route to an existing configuration.
+	AddRoute func(dir, link, name string) error
 }
 
 func DefaultHomeDir() string {
@@ -44,13 +49,6 @@ func RunInteractive(opts Options) error {
 	if opts.Stdin == nil {
 		opts.Stdin = bufio.NewReader(os.Stdin)
 	}
-	// Use os.Stdout/ Stderr if not set
-	out := os.Stdout
-	if opts.Stdout != nil {
-		out = opts.Stdout
-	}
-	_ = out
-
 	dir := ConfigDir(opts.HomeDir)
 	fmt.Printf("\nFrostgate setup\n\n")
 	fmt.Printf("Config directory: %s\n", dir)
@@ -72,21 +70,24 @@ func RunInteractive(opts Options) error {
 		case "a":
 			return addRouteFlow(opts, dir)
 		case "r":
-			// fall through to full setup but will backup
 			fmt.Println("Reconfiguring; existing config will be backed up")
-			backupExisting(dir)
+			if err := backupExisting(dir); err != nil {
+				return err
+			}
 		case "x":
 			confirm := prompt(opts.Stdin, "Type YES to reset and delete existing config: ")
 			if confirm != "YES" {
 				fmt.Println("Cancelled")
 				return nil
 			}
-			backupExisting(dir)
-			// remove
-			os.Remove(existingConfig)
-			os.Remove(existingSingBox)
-			// keep secret? regenerate? For reset, remove secret too to regenerate
-			os.Remove(existingSecret)
+			if err := backupExisting(dir); err != nil {
+				return err
+			}
+			for _, path := range []string{existingConfig, existingSingBox, existingSecret} {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("remove existing setup: %w", err)
+				}
+			}
 			fmt.Println("Existing config removed")
 		default:
 			fmt.Println("Cancelled; no changes made")
@@ -107,12 +108,13 @@ func RunInteractive(opts Options) error {
 		fmt.Println("Frostgate uses sing-box as the protocol engine (no proxy protocols are reimplemented in Frostgate).")
 		install := prompt(opts.Stdin, "Install sing-box now? [Y/n]: ")
 		if !isNo(install) {
-			if err := tryInstallSingBox(opts); err != nil {
-				fmt.Printf("Automatic install failed: %v\n", err)
+			var installErr error
+			sbPath, installErr = tryInstallSingBox(opts)
+			if installErr != nil {
+				fmt.Printf("Automatic install failed: %v\n", installErr)
 				fmt.Println("Please install sing-box manually: https://sing-box.sagernet.org/installation/")
-				return err
+				return installErr
 			}
-			sbPath, _ = exec.LookPath("sing-box")
 		} else {
 			fmt.Println("Continuing without sing-box. Only direct checks will work until it is installed.")
 		}
@@ -133,14 +135,14 @@ func RunInteractive(opts Options) error {
 	}
 	switch choice {
 	case "1":
-		return importFlow(opts, dir)
+		return importFlow(opts, dir, sbPath)
 	case "2":
 		return existingControllerFlow(opts, dir)
 	case "3":
 		return directOnlyFlow(opts, dir)
 	default:
 		fmt.Println("Invalid choice, defaulting to import")
-		return importFlow(opts, dir)
+		return importFlow(opts, dir, sbPath)
 	}
 }
 
@@ -155,24 +157,32 @@ func isNo(s string) bool {
 	return s == "n" || s == "no"
 }
 
-func backupExisting(dir string) {
+func backupExisting(dir string) error {
 	ts := time.Now().Format("20060102T150405")
 	backupDir := filepath.Join(dir, "backup-"+ts)
-	os.MkdirAll(backupDir, 0o700)
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return fmt.Errorf("create backup: %w", err)
+	}
 	for _, name := range []string{"config.yaml", "sing-box.json", "controller-secret"} {
 		src := filepath.Join(dir, name)
-		if _, err := os.Stat(src); err == nil {
-			data, _ := os.ReadFile(src)
-			os.WriteFile(filepath.Join(backupDir, name), data, 0o600)
+		data, err := os.ReadFile(src)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read %s for backup: %w", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(backupDir, name), data, 0o600); err != nil {
+			return fmt.Errorf("write %s backup: %w", name, err)
 		}
 	}
 	fmt.Printf("Backup saved to %s\n", backupDir)
+	return nil
 }
 
-func tryInstallSingBox(opts Options) error {
+func tryInstallSingBox(opts Options) (string, error) {
 	switch runtime.GOOS {
 	case "linux":
-		// Prefer pacman on Arch, otherwise advise
 		if _, err := exec.LookPath("pacman"); err == nil {
 			fmt.Println("Attempting: sudo pacman -S --noconfirm sing-box")
 			cmd := exec.Command("sudo", "pacman", "-S", "--noconfirm", "sing-box")
@@ -180,59 +190,81 @@ func tryInstallSingBox(opts Options) error {
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
-				return err
+				return "", err
 			}
-			return nil
+			path, err := exec.LookPath("sing-box")
+			if err != nil {
+				return "", fmt.Errorf("sing-box was installed but is not in PATH: %w", err)
+			}
+			return path, nil
 		}
-		fmt.Println("No pacman found. Downloading static binary from GitHub...")
-		// fallback: download from GitHub releases
-		// Use latest version 1.13.19 as known stable
-		url := "https://github.com/SagerNet/sing-box/releases/download/v1.13.19/sing-box-1.13.19-linux-amd64.tar.gz"
-		tmpDir, _ := os.MkdirTemp("", "sing-box-install")
+		asset, err := SingBoxAssetFor(runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return "", err
+		}
+		url, err := SingBoxReleaseURL(runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return "", err
+		}
+		fmt.Println("No pacman found. Downloading a verified static binary from GitHub...")
+		tmpDir, err := os.MkdirTemp("", "sing-box-install-")
+		if err != nil {
+			return "", fmt.Errorf("create temporary directory: %w", err)
+		}
 		defer os.RemoveAll(tmpDir)
 		fmt.Printf("Downloading %s ...\n", url)
-		// try curl/wget
+		archive := filepath.Join(tmpDir, asset.Name)
 		var cmd *exec.Cmd
 		if _, err := exec.LookPath("curl"); err == nil {
-			cmd = exec.Command("curl", "-fL", url, "-o", filepath.Join(tmpDir, "sing-box.tar.gz"))
+			cmd = exec.Command("curl", "-fL", url, "-o", archive)
 		} else if _, err := exec.LookPath("wget"); err == nil {
-			cmd = exec.Command("wget", "-qO", filepath.Join(tmpDir, "sing-box.tar.gz"), url)
+			cmd = exec.Command("wget", "-qO", archive, url)
 		} else {
-			return fmt.Errorf("neither curl nor wget found")
+			return "", fmt.Errorf("neither curl nor wget found")
 		}
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			return err
+			return "", err
 		}
-		// extract
-		ex := exec.Command("tar", "xzf", filepath.Join(tmpDir, "sing-box.tar.gz"), "-C", tmpDir)
+		if err := VerifySHA256(archive, asset.SHA256); err != nil {
+			return "", fmt.Errorf("download verification failed: %w", err)
+		}
+		ex := exec.Command("tar", "xzf", archive, "-C", tmpDir)
 		if err := ex.Run(); err != nil {
-			return err
+			return "", err
 		}
-		// find binary
-		bin := filepath.Join(tmpDir, "sing-box-1.13.19-linux-amd64", "sing-box")
+		bin := filepath.Join(tmpDir, strings.TrimSuffix(asset.Name, ".tar.gz"), "sing-box")
 		if _, err := os.Stat(bin); err != nil {
-			// try find
 			out, _ := exec.Command("find", tmpDir, "-name", "sing-box", "-type", "f").Output()
 			bin = strings.TrimSpace(string(out))
 			if bin == "" {
-				return fmt.Errorf("sing-box binary not found in archive")
+				return "", fmt.Errorf("sing-box binary not found in verified archive")
 			}
 		}
+		if err := exec.Command(bin, "version").Run(); err != nil {
+			return "", fmt.Errorf("downloaded sing-box failed version check: %w", err)
+		}
 		installDir := filepath.Join(opts.HomeDir, ".local", "bin")
-		os.MkdirAll(installDir, 0o755)
+		if err := os.MkdirAll(installDir, 0o755); err != nil {
+			return "", fmt.Errorf("create install directory: %w", err)
+		}
 		dest := filepath.Join(installDir, "sing-box")
-		data, _ := os.ReadFile(bin)
-		os.WriteFile(dest, data, 0o755)
+		data, err := os.ReadFile(bin)
+		if err != nil {
+			return "", fmt.Errorf("read downloaded binary: %w", err)
+		}
+		if err := writeFileAtomic(dest, data, 0o755); err != nil {
+			return "", fmt.Errorf("install sing-box: %w", err)
+		}
 		fmt.Printf("Installed sing-box to %s\n", dest)
 		// check PATH
 		if !isInPath(installDir) {
 			fmt.Printf("NOTE: %s not in PATH. Add: export PATH=\"$HOME/.local/bin:$PATH\"\n", installDir)
 		}
-		return nil
+		return dest, nil
 	default:
-		return fmt.Errorf("automatic install not supported on %s; see https://sing-box.sagernet.org/installation/", runtime.GOOS)
+		return "", fmt.Errorf("automatic install not supported on %s; see https://sing-box.sagernet.org/installation/", runtime.GOOS)
 	}
 }
 
@@ -264,7 +296,7 @@ func getSingBoxVersion(path string) string {
 	return s
 }
 
-func importFlow(opts Options, dir string) error {
+func importFlow(opts Options, dir, singBoxPath string) error {
 	var vlessOut []*VLESSOutbound
 	var hystOut []*Hysteria2Outbound
 
@@ -290,10 +322,9 @@ func importFlow(opts Options, dir string) error {
 			fmt.Println("Name required")
 			continue
 		}
-		// sanitize tag
-		tag = strings.TrimSpace(tag)
-		if strings.Contains(tag, " ") {
-			tag = strings.ReplaceAll(tag, " ", "-")
+		if err := routename.Validate(tag); err != nil {
+			fmt.Printf("Invalid route name: %v\n", err)
+			continue
 		}
 		linkLower := strings.ToLower(strings.TrimSpace(link))
 		if strings.HasPrefix(linkLower, "vless://") {
@@ -318,9 +349,7 @@ func importFlow(opts Options, dir string) error {
 		}
 		more := prompt(opts.Stdin, "Add another route? [y/N]: ")
 		if !strings.EqualFold(more, "y") && !strings.EqualFold(more, "yes") {
-			// continue to allow empty finish? Actually break if they said N and have at least one
 			if more == "" {
-				// treat empty as no more if they already added at least one
 				break
 			}
 			if isNo(more) {
@@ -366,15 +395,15 @@ func importFlow(opts Options, dir string) error {
 	if err != nil {
 		return err
 	}
-	singBoxPath := filepath.Join(dir, "sing-box.json")
-	if err := WriteFileSecure(singBoxPath, singBoxData); err != nil {
+	singBoxConfigPath := filepath.Join(dir, "sing-box.json")
+	if err := WriteFileSecure(singBoxConfigPath, singBoxData); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s (0600)\n", singBoxPath)
+	fmt.Printf("wrote %s (0600)\n", singBoxConfigPath)
 
 	// Validate sing-box
-	if sbPath, err := exec.LookPath("sing-box"); err == nil {
-		cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
+	if singBoxPath != "" {
+		cmd := exec.Command(singBoxPath, "check", "-c", singBoxConfigPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			fmt.Printf("sing-box check failed: %s\n", string(out))
 			return fmt.Errorf("sing-box check failed")
@@ -393,30 +422,28 @@ func importFlow(opts Options, dir string) error {
 	}
 	controller := "http://127.0.0.1:9090"
 	secretFileForConfig := secretFile
-	fgContent := GenerateFrostgateConfig(vlessTags, hystTags, testURL, controller, secretFileForConfig)
-	// If addDirect false, remove direct endpoint from generated content? GenerateFrostgateConfig always adds direct, so we need to handle
+	fgConfig := BuildFrostgateConfig(vlessTags, hystTags, testURL, controller, secretFileForConfig)
 	if !addDirect {
-		// remove direct block
-		// simple: replace direct endpoint lines
-		fgContent = strings.Replace(fgContent, "  - name: direct\n    type: http\n    url: https://www.gstatic.com/generate_204\n    priority: 100\n", "", 1)
-		if !strings.Contains(fgContent, "endpoints:") || strings.TrimSpace(fgContent) == "" {
-			// ensure at least one endpoint, add direct back if no other
-			if len(vlessTags)+len(hystTags) == 0 {
-				fgContent += "  - name: direct\n    type: http\n    url: https://www.gstatic.com/generate_204\n    priority: 100\n"
-			}
+		fgConfig.Endpoints = fgConfig.Endpoints[1:]
+		if len(fgConfig.Endpoints) == 0 {
+			return fmt.Errorf("at least one route or direct baseline is required")
 		}
 	}
+	fgContent, err := yaml.Marshal(fgConfig)
+	if err != nil {
+		return fmt.Errorf("encode Frostgate config: %w", err)
+	}
 	fgPath := filepath.Join(dir, "config.yaml")
-	if err := WriteFileSecure(fgPath, []byte(fgContent)); err != nil {
+	if err := WriteFileSecure(fgPath, fgContent); err != nil {
 		return err
 	}
 	fmt.Printf("wrote %s (0600)\n", fgPath)
 
 	// Sidecar service
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS == "linux" && singBoxPath != "" {
 		offer := prompt(opts.Stdin, "Install systemd user service for sing-box sidecar? [Y/n]: ")
 		if !isNo(offer) {
-			if err := installSystemdService(dir); err != nil {
+			if err := installSystemdService(dir, singBoxPath); err != nil {
 				fmt.Printf("Failed to install service: %v\n", err)
 			} else {
 				fmt.Println("systemd service installed and started")
@@ -426,7 +453,7 @@ func importFlow(opts Options, dir string) error {
 
 	// Validate
 	fmt.Println("\nValidating...")
-	if err := runValidation(dir); err != nil {
+	if err := runValidation(dir, singBoxPath); err != nil {
 		fmt.Printf("Validation failed: %v\n", err)
 		return err
 	}
@@ -442,7 +469,7 @@ func importFlow(opts Options, dir string) error {
 	if addDirect {
 		fmt.Printf("  direct\n")
 	}
-	fmt.Println("\nsing-box: run `sing-box run -c ~/.config/frostgate/sing-box.json` if no service was installed")
+	fmt.Printf("\nsing-box: run `sing-box run -c %s` if no service was installed\n", singBoxConfigPath)
 	fmt.Println("Controller: loopback only")
 	fmt.Printf("Config: %s\n", fgPath)
 	fmt.Println("\nTry:")
@@ -465,7 +492,9 @@ func existingControllerFlow(opts Options, dir string) error {
 		save := prompt(opts.Stdin, "Save secret to controller-secret file? [Y/n]: ")
 		if !isNo(save) {
 			secretFile = filepath.Join(dir, "controller-secret")
-			WriteSecretFile(secretFile, secret)
+			if err := WriteSecretFile(secretFile, secret); err != nil {
+				return err
+			}
 			secret = "" // use file
 		}
 	}
@@ -475,121 +504,58 @@ func existingControllerFlow(opts Options, dir string) error {
 	var tags []string
 	for _, t := range strings.FieldsFunc(tagsStr, func(r rune) bool { return r == ',' || r == ' ' }) {
 		if t != "" {
+			if err := routename.Validate(t); err != nil {
+				return fmt.Errorf("invalid route name %q: %w", t, err)
+			}
 			tags = append(tags, t)
 		}
 	}
 	if len(tags) == 0 {
 		return fmt.Errorf("no tags provided")
 	}
-	testURL := "https://www.gstatic.com/generate_204"
-	// generate Frostgate config only (no sing-box.json)
-	if secretFile != "" {
-		secret = "" // will use file
+	testURL := config.DefaultTestURL
+	fgConfig := BuildFrostgateConfig(tags, nil, testURL, controller, secretFile)
+	if secretFile == "" && secret != "" {
+		fgConfig.SingBox.Secret = secret
 	}
-	fgContent := GenerateFrostgateConfig(nil, nil, testURL, controller, secretFile)
-	// Actually need to add endpoints for each tag
-	// Replace generated direct + tags appropriately
-	// For existing controller, we don't know which are vless vs hysteria, just create generic
-	fgContent = "defaults:\n  timeout: 5s\n  samples: 4\n  sample_interval: 150ms\n  healthy_latency: 800ms\n  max_jitter: 80ms\n\nsingbox:\n  controller: " + controller + "\n"
-	if secretFile != "" {
-		fgContent += "  secret_file: " + secretFile + "\n"
-	} else if secret != "" {
-		fgContent += "  secret: " + secret + "\n"
-	}
-	fgContent += "  test_url: " + testURL + "\n\nendpoints:\n"
-	fgContent += "  - name: direct\n    type: http\n    url: " + testURL + "\n    priority: 100\n"
-	for i, tag := range tags {
-		fgContent += fmt.Sprintf("  - name: %s\n    type: singbox\n    outbound: %s\n    priority: %d\n", tag, tag, 10+i*10)
+	fgContent, err := yaml.Marshal(fgConfig)
+	if err != nil {
+		return fmt.Errorf("encode Frostgate config: %w", err)
 	}
 	fgPath := filepath.Join(dir, "config.yaml")
-	EnsureConfigDir(dir)
-	WriteFileSecure(fgPath, []byte(fgContent))
+	if err := EnsureConfigDir(dir); err != nil {
+		return err
+	}
+	if err := WriteFileSecure(fgPath, fgContent); err != nil {
+		return err
+	}
 	fmt.Printf("wrote %s\n", fgPath)
 	return runValidation(dir)
 }
 
 func directOnlyFlow(opts Options, dir string) error {
-	testURL := "https://www.gstatic.com/generate_204"
+	testURL := config.DefaultTestURL
 	custom := prompt(opts.Stdin, fmt.Sprintf("Test URL [%s]: ", testURL))
 	if custom != "" {
 		testURL = custom
 	}
-	content := fmt.Sprintf("defaults:\n  timeout: 5s\n  samples: 4\n  sample_interval: 150ms\n  healthy_latency: 800ms\n  max_jitter: 80ms\n\nsingbox:\n  controller: http://127.0.0.1:9090\n  test_url: %s\n\nendpoints:\n  - name: direct\n    type: http\n    url: %s\n    priority: 100\n", testURL, testURL)
-	EnsureConfigDir(dir)
+	content, err := MarshalFrostgateConfig(nil, nil, testURL, config.DefaultSingBoxController, "")
+	if err != nil {
+		return fmt.Errorf("encode Frostgate config: %w", err)
+	}
+	if err := EnsureConfigDir(dir); err != nil {
+		return err
+	}
 	fgPath := filepath.Join(dir, "config.yaml")
-	WriteFileSecure(fgPath, []byte(content))
+	if err := WriteFileSecure(fgPath, content); err != nil {
+		return err
+	}
 	fmt.Printf("wrote %s (direct only)\n", fgPath)
 	return runValidation(dir)
 }
 
 func addRouteFlow(opts Options, dir string) error {
-	// Load existing sing-box.json and config.yaml, append new route
 	fmt.Println("Add route to existing setup")
-	// For simplicity, run importFlow but preserve existing
-	// Backup already done in caller
-	// We will just run importFlow which will prompt for new routes and regenerate with existing+new
-	// To preserve existing, we need to read existing sing-box.json
-	// Simpler: just run importFlow fresh and it will generate new config with new routes + direct
-	// But we risk losing existing routes if user only adds one new
-	// For now, run importFlow and it will add new routes to existing dir (overwrites but includes new)
-	// We could load existing outbounds and merge
-	singBoxPath := filepath.Join(dir, "sing-box.json")
-	var existingVless []*VLESSOutbound
-	var existingHyst []*Hysteria2Outbound
-	if data, err := os.ReadFile(singBoxPath); err == nil {
-		var cfg map[string]any
-		if jsonErr := json.Unmarshal(data, &cfg); jsonErr == nil {
-			if outbounds, ok := cfg["outbounds"].([]any); ok {
-				for _, ob := range outbounds {
-					if m, ok := ob.(map[string]any); ok {
-						if t, _ := m["type"].(string); t == "vless" {
-							// reconstruct minimal
-							tag, _ := m["tag"].(string)
-							server, _ := m["server"].(string)
-							portF, _ := m["server_port"].(float64)
-							uuid, _ := m["uuid"].(string)
-							// try to extract tls
-							sni := ""
-							pbk := ""
-							sid := ""
-							fp := "chrome"
-							if tlsRaw, ok := m["tls"].(map[string]any); ok {
-								sni, _ = tlsRaw["server_name"].(string)
-								if utls, ok := tlsRaw["utls"].(map[string]any); ok {
-									fp, _ = utls["fingerprint"].(string)
-								}
-								if reality, ok := tlsRaw["reality"].(map[string]any); ok {
-									pbk, _ = reality["public_key"].(string)
-									sid, _ = reality["short_id"].(string)
-								}
-							}
-							existingVless = append(existingVless, &VLESSOutbound{Tag: tag, Server: server, ServerPort: int(portF), UUID: uuid, SNI: sni, PBK: pbk, SID: sid, FP: fp})
-						} else if t == "hysteria2" {
-							tag, _ := m["tag"].(string)
-							server, _ := m["server"].(string)
-							portF, _ := m["server_port"].(float64)
-							pass, _ := m["password"].(string)
-							obfsPass := ""
-							if obfs, ok := m["obfs"].(map[string]any); ok {
-								obfsPass, _ = obfs["password"].(string)
-							}
-							sni := ""
-							if tlsRaw, ok := m["tls"].(map[string]any); ok {
-								sni, _ = tlsRaw["server_name"].(string)
-							}
-							existingHyst = append(existingHyst, &Hysteria2Outbound{Tag: tag, Server: server, ServerPort: int(portF), Password: pass, ObfsPassword: obfsPass, SNI: sni})
-						}
-					}
-				}
-			}
-		}
-	}
-	// Now run import for new route, but we will merge existing after
-	var vlessOut []*VLESSOutbound
-	var hystOut []*Hysteria2Outbound
-	vlessOut = append(vlessOut, existingVless...)
-	hystOut = append(hystOut, existingHyst...)
-	// Prompt for new link
 	link := prompt(opts.Stdin, "Paste new share link (vless:// or hysteria2://): ")
 	if link == "" {
 		fmt.Println("No link provided")
@@ -599,104 +565,34 @@ func addRouteFlow(opts Options, dir string) error {
 	if tag == "" {
 		return fmt.Errorf("name required")
 	}
-	linkLower := strings.ToLower(strings.TrimSpace(link))
-	if strings.HasPrefix(linkLower, "vless://") {
-		v, err := ParseVLESSShareLink(link, tag)
-		if err != nil {
-			return err
-		}
-		vlessOut = append(vlessOut, v)
-	} else if strings.HasPrefix(linkLower, "hysteria2://") || strings.HasPrefix(linkLower, "hy2://") {
-		h, err := ParseHysteria2ShareLink(link, tag)
-		if err != nil {
-			return err
-		}
-		hystOut = append(hystOut, h)
-	} else {
-		return fmt.Errorf("unsupported link")
+	if err := routename.Validate(tag); err != nil {
+		return fmt.Errorf("invalid route name %q: %w", tag, err)
 	}
-	// Regenerate
-	secretFile := filepath.Join(dir, "controller-secret")
-	secret := ""
-	if data, err := os.ReadFile(secretFile); err == nil {
-		secret = strings.TrimSpace(string(data))
-	} else {
-		s, _ := GenerateSecret()
-		secret = s
-		WriteSecretFile(secretFile, secret)
+	if opts.AddRoute == nil {
+		return fmt.Errorf("existing setup route management is unavailable")
 	}
-	singBoxData, err := GenerateSingBoxConfig(secret, vlessOut, hystOut, dir)
-	if err != nil {
+	if err := opts.AddRoute(dir, link, tag); err != nil {
 		return err
 	}
-	if err := WriteFileSecure(singBoxPath, singBoxData); err != nil {
-		return err
-	}
-	// Regenerate Frostgate config
-	var vlessTags []string
-	for _, v := range vlessOut {
-		vlessTags = append(vlessTags, v.Tag)
-	}
-	var hystTags []string
-	for _, h := range hystOut {
-		hystTags = append(hystTags, h.Tag)
-	}
-	fgContent := GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
-	fgPath := filepath.Join(dir, "config.yaml")
-	WriteFileSecure(fgPath, []byte(fgContent))
 	fmt.Printf("added route: %s\n", tag)
-	return runValidation(dir)
-}
-
-func installSystemdService(dir string) error {
-	// systemd user dir is $XDG_CONFIG_HOME/systemd/user or ~/.config/systemd/user
-	// dir is like $XDG_CONFIG_HOME/frostgate or ~/.config/frostgate, so parent is config home
-	serviceDir := filepath.Join(filepath.Dir(dir), "systemd", "user")
-	if _, err := os.Stat(serviceDir); err != nil {
-		// fallback to ~/.config/systemd/user
-		home, _ := os.UserHomeDir()
-		serviceDir = filepath.Join(home, ".config", "systemd", "user")
-	}
-	os.MkdirAll(serviceDir, 0o755)
-	servicePath := filepath.Join(serviceDir, "frostgate-singbox.service")
-	content := `[Unit]
-Description=Frostgate sing-box sidecar (Clash API for end-to-end route tests)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/sing-box run -c %h/.config/frostgate/sing-box.json
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.config/frostgate
-
-[Install]
-WantedBy=default.target
-`
-	if err := os.WriteFile(servicePath, []byte(content), 0o644); err != nil {
-		return err
-	}
-	// daemon-reload and enable
-	exec.Command("systemctl", "--user", "daemon-reload").Run()
-	exec.Command("systemctl", "--user", "enable", "--now", "frostgate-singbox.service").Run()
-	// validate started
-	time.Sleep(1 * time.Second)
-	out, _ := exec.Command("systemctl", "--user", "is-active", "frostgate-singbox.service").Output()
-	if strings.TrimSpace(string(out)) != "active" {
-		return fmt.Errorf("service not active: %s", string(out))
-	}
 	return nil
 }
 
-func runValidation(dir string) error {
-	// sing-box check
-	sbPath, err := exec.LookPath("sing-box")
-	if err == nil {
+func installSystemdService(dir, binaryPath string) error {
+	serviceDir := filepath.Join(filepath.Dir(dir), "systemd", "user")
+	servicePath := filepath.Join(serviceDir, "frostgate-singbox.service")
+	return InstallSystemdService(servicePath, binaryPath, dir, nil)
+}
+
+func runValidation(dir string, knownSingBoxPath ...string) error {
+	sbPath := ""
+	if len(knownSingBoxPath) > 0 {
+		sbPath = knownSingBoxPath[0]
+	}
+	if sbPath == "" {
+		sbPath, _ = exec.LookPath("sing-box")
+	}
+	if sbPath != "" {
 		singBoxPath := filepath.Join(dir, "sing-box.json")
 		if _, err := os.Stat(singBoxPath); err == nil {
 			cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
@@ -706,7 +602,6 @@ func runValidation(dir string) error {
 			}
 		}
 	}
-	// frostgate --check
 	fgPath := filepath.Join(dir, "config.yaml")
 	cfg, err := config.Load(fgPath)
 	if err != nil {
@@ -714,10 +609,6 @@ func runValidation(dir string) error {
 		return err
 	}
 	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))
-	// frostgate --doctor via internal doctor
-	// Use doctor.Run
-	// Import doctor
-	// To avoid import cycle, we will just call frostgate binary if available
 	if _, err := exec.LookPath("frostgate"); err == nil {
 		cmd := exec.Command("frostgate", "--check", "--config", fgPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -727,4 +618,24 @@ func runValidation(dir string) error {
 		}
 	}
 	return nil
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".frostgate-install-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }

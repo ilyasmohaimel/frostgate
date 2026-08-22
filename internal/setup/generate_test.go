@@ -1,11 +1,19 @@
 package setup
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/probe"
 )
 
 func TestGenerateSecret(t *testing.T) {
@@ -115,6 +123,66 @@ func TestGenerateFrostgateConfig(t *testing.T) {
 	// Ensure direct baseline present
 	if !strings.Contains(content, "direct") {
 		t.Error("direct baseline missing")
+	}
+}
+
+func TestBuildFrostgateConfigDirectStatusPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		url  string
+		want int
+	}{
+		{"default generate_204", "https://www.gstatic.com/generate_204", 204},
+		{"custom URL", "https://example.com/health", 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := MarshalFrostgateConfig(nil, nil, tt.url, "http://127.0.0.1:9090", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			endpoint := doc["endpoints"].([]any)[0].(map[string]any)
+			if got, _ := endpoint["expected_status"].(int); got != tt.want {
+				t.Fatalf("expected_status = %d, want %d in %s", got, tt.want, data)
+			}
+		})
+	}
+}
+
+func TestGeneratedCustomDirectUsesGenericHTTPStatusPolicy(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			cfg := BuildFrostgateConfig(nil, nil, server.URL, "http://127.0.0.1:9090", "")
+			if cfg.Endpoints[0].ExpectedStatus != 0 {
+				t.Fatalf("custom endpoint unexpectedly requires %d", cfg.Endpoints[0].ExpectedStatus)
+			}
+			result := probe.ProbeEndpoint(context.Background(), &cfg, cfg.Endpoints[0])
+			if gotUp := result.OK(); gotUp != (status == http.StatusOK) {
+				t.Fatalf("status %d result = %+v", status, result)
+			}
+		})
+	}
+}
+
+func TestGeneratedDefaultDirectRequires204(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	cfg := BuildFrostgateConfig(nil, nil, config.DefaultTestURL, "http://127.0.0.1:9090", "")
+	if cfg.Endpoints[0].ExpectedStatus != http.StatusNoContent {
+		t.Fatalf("default expected status = %d", cfg.Endpoints[0].ExpectedStatus)
+	}
+	cfg.Endpoints[0].URL = server.URL
+	if result := probe.ProbeEndpoint(context.Background(), &cfg, cfg.Endpoints[0]); result.OK() {
+		t.Fatalf("generated direct baseline accepted 200: %+v", result)
 	}
 }
 
