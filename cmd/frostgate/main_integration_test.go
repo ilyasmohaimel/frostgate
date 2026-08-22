@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,8 +21,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ilyasmohaimel/frostgate/internal/benchmark"
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/history"
+	"github.com/ilyasmohaimel/frostgate/internal/metrics"
+	"github.com/ilyasmohaimel/frostgate/internal/probe"
 )
 
 var integrationBinary string
@@ -268,10 +272,151 @@ func TestUnknownRootCommandsFail(t *testing.T) {
 	}
 }
 
-func TestHistoryDoesNotAcceptConfigFlag(t *testing.T) {
+func TestUnknownCommandRedactsShareURL(t *testing.T) {
+	link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&pbk=SUPER_SECRET_TOKEN_8F3A"
+	stdout, stderr, code := runCLI(t, nil, link)
+	if code != 3 || len(stdout) != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if leaked := findSecret(string(stderr), "11111111-1111-4111-8111-111111111111", "SUPER_SECRET_TOKEN_8F3A"); leaked != "" {
+		t.Fatalf("unknown command leaked %q: %s", leaked, stderr)
+	}
+	if !strings.Contains(string(stderr), "unknown command") || !strings.Contains(string(stderr), "REDACTED") {
+		t.Fatalf("unknown command was not usefully redacted: %q", stderr)
+	}
+}
+
+func TestDoctorRejectsMalformedArguments(t *testing.T) {
+	for _, args := range [][]string{{"doctor", "--wat"}, {"doctor", "--config"}, {"doctor", "unexpected-positional"}} {
+		stdout, stderr, code := runCLI(t, nil, args...)
+		if code != 3 || len(stdout) != 0 || len(stderr) == 0 {
+			t.Fatalf("%v: code=%d stdout=%q stderr=%q", args, code, stdout, stderr)
+		}
+	}
+	stdout, stderr, code := runCLI(t, nil, "doctor", "--help")
+	if code != 0 || !strings.Contains(string(stdout), "usage: frostgate doctor") || len(stderr) != 0 {
+		t.Fatalf("doctor --help: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestEmitRedactsVerboseAndJSONErrors(t *testing.T) {
+	secret := "SUPER_SECRET_TOKEN_8F3A"
+	raw := "request failed vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&pbk=fixture-key#route " +
+		"hysteria2://fixture-hysteria-password@203.0.113.20:443?obfs-password=fixture-obfs " +
+		"https://example.com/sub?token=" + secret + " Bearer fixture-bearer-token"
+	result := probe.Result{
+		Endpoint: config.Endpoint{Name: "route", Type: config.ProbeSingBox},
+		Status:   probe.StatusDown,
+		Err:      errors.New(raw),
+		ErrMsg:   raw,
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
+	outR, outW, errOutR, errOutW, err := openOutputCapture()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = outW, errOutW
+	emit([]probe.Result{result}, false, true)
+	_ = outW.Close()
+	_ = errOutW.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	humanOut, _ := io.ReadAll(outR)
+	humanErr, _ := io.ReadAll(errOutR)
+	if leaked := findSecret(string(humanOut)+string(humanErr), secret, "11111111-1111-4111-8111-111111111111", "fixture-hysteria-password", "fixture-obfs", "fixture-bearer-token"); leaked != "" {
+		t.Fatalf("verbose output leaked %q: stdout=%q stderr=%q", leaked, humanOut, humanErr)
+	}
+
+	outR, outW, errOutR, errOutW, err = openOutputCapture()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout, os.Stderr = outW, errOutW
+	emit([]probe.Result{result}, true, true)
+	_ = outW.Close()
+	_ = errOutW.Close()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	jsonOut, _ := io.ReadAll(outR)
+	jsonErr, _ := io.ReadAll(errOutR)
+	if leaked := findSecret(string(jsonOut)+string(jsonErr), secret, "11111111-1111-4111-8111-111111111111", "fixture-hysteria-password", "fixture-obfs", "fixture-bearer-token"); leaked != "" {
+		t.Fatalf("JSON output leaked %q: stdout=%q stderr=%q", leaked, jsonOut, jsonErr)
+	}
+	if !bytes.Contains(jsonOut, []byte("REDACTED")) {
+		t.Fatalf("JSON error was not useful and redacted: %s", jsonOut)
+	}
+}
+
+func TestBenchmarkRestoreFailureInvalidatesThroughput(t *testing.T) {
+	results := []benchmark.RouteThroughput{{Route: "proxy-out", DownloadMbps: 87.5}}
+	invalidateBenchmarkThroughput(results, errors.New("restore selector \"frostgate-selector\": refused"))
+	if results[0].DownloadMbps != 0 || results[0].NAReason != "selector restoration failed" {
+		t.Fatalf("restore failure must not be reported as throughput: %+v", results[0])
+	}
+}
+
+func openOutputCapture() (*os.File, *os.File, *os.File, *os.File, error) {
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		_ = outR.Close()
+		_ = outW.Close()
+		return nil, nil, nil, nil, err
+	}
+	return outR, outW, errR, errW, nil
+}
+
+func findSecret(value string, secrets ...string) string {
+	for _, secret := range secrets {
+		if strings.Contains(value, secret) {
+			return secret
+		}
+	}
+	return ""
+}
+
+func TestHistoryAcceptsConfigFlag(t *testing.T) {
 	stdout, stderr, code := runCLI(t, nil, "history", "--config", "fixture.yaml")
-	if code != 3 || len(stdout) != 0 || !strings.Contains(string(stderr), `unknown flag "--config"`) {
-		t.Fatalf("history accepted ignored config flag: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	if code != 0 || !strings.Contains(string(stdout), "No history") || len(stderr) != 0 {
+		t.Fatalf("history config flag failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestRecommendHistoryIsScopedToExplicitConfigProfile(t *testing.T) {
+	f := newCLIFixture(t)
+	profileA := filepath.Join(f.home, "profiles", "a", "config.yaml")
+	profileB := filepath.Join(f.home, "profiles", "b", "config.yaml")
+	for _, path := range []string{profileA, profileB} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("endpoints: []\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := history.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		if err := db.Add(history.Record{Route: "same-name", Status: "up", MedianMs: 20, Profile: historyProfileForConfig(profileB)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	cfg := &config.Config{History: config.HistoryConfig{Enabled: &enabled}}
+	results := []probe.Result{{Endpoint: config.Endpoint{Name: "same-name", Type: config.ProbeSingBox}, Status: probe.StatusUp, Metrics: metrics.Metrics{Median: 100 * time.Millisecond}}}
+	fromA := recommendFromResults(cfg, results, profileA)
+	fromB := recommendFromResults(cfg, results, profileB)
+	if fromA.BestOverall.HistoryCount != 0 || fromA.Confidence != "low" {
+		t.Fatalf("profile A borrowed profile B history: %+v", fromA)
+	}
+	if fromB.BestOverall.HistoryCount != 12 || fromB.Confidence != "medium" {
+		t.Fatalf("profile B did not see its history: %+v", fromB)
 	}
 }
 
@@ -296,7 +441,7 @@ func TestCustomConfigKeepsManagedSidecarsIsolated(t *testing.T) {
 	if err := os.WriteFile(customConfig, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	customSidecar := []byte(`{"outbounds":[{"type":"hysteria2","tag":"custom-hysteria","server":"203.0.113.20","server_port":443,"password":"fixture-password","tls":{"enabled":true,"server_name":"example.com"}}]}`)
+	customSidecar := []byte(`{"outbounds":[{"type":"selector","tag":"frostgate-selector","outbounds":["custom-hysteria"],"default":"custom-hysteria"},{"type":"hysteria2","tag":"custom-hysteria","server":"203.0.113.20","server_port":443,"password":"fixture-password","tls":{"enabled":true,"server_name":"example.com"}}]}`)
 	if err := os.WriteFile(filepath.Join(customDir, "sing-box.json"), customSidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -470,6 +615,29 @@ func TestActualCLIJSONContracts(t *testing.T) {
 			stdout, _, _ := runCLI(t, env, args...)
 			requireJSON(t, stdout)
 		})
+	}
+}
+
+func TestReadmeDemoAssetsExist(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"README.md", "assets/frostgate-demo.gif", "docs/frostgate-demo.tape", "docs/frostgate-demo-env.sh", "docs/demo-bin/bash"} {
+		info, err := os.Stat(filepath.Join(root, path))
+		if err != nil || info.Size() == 0 {
+			t.Fatalf("README demo asset %s missing or empty: info=%v err=%v", path, info, err)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(root, "docs/demo-bin/bash")); err != nil || info.Mode()&0o111 == 0 {
+		t.Fatalf("README demo shell wrapper is not executable: info=%v err=%v", info, err)
+	}
+	readme, err := os.ReadFile(filepath.Join(root, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(readme, []byte("assets/frostgate-demo.gif")) {
+		t.Fatal("README does not reference the generated demo GIF")
 	}
 }
 

@@ -102,7 +102,7 @@ func Table(results []probe.Result) string {
 			}
 			out += bestStyle.Render("Best proxy: "+b.Endpoint.Name) + fmt.Sprintf(" (%s)", median)
 		} else {
-			out += dimStyle.Render("Best proxy: none configured")
+			out += dimStyle.Render("Best proxy: none usable")
 		}
 		diag := diagnosis(results)
 		if diag != "" {

@@ -296,6 +296,124 @@ func TestRoundTripPreservesExtraConfig(t *testing.T) {
 	}
 }
 
+func TestGenerateMutatesOnlySelectorOwnedObjects(t *testing.T) {
+	d := tempDir(t)
+	raw := []byte(`{
+  "log": {"level":"debug", "timestamp":true},
+  "dns": {"servers":[{"tag":"custom-dns","address":"https://example.com/dns-query"}]},
+  "experimental": {"custom_flag":{"keep":true},"cache_file":{"enabled":true,"path":"/tmp/cache.db"},"clash_api":{"external_controller":"127.0.0.1:9090","secret":"fixture-secret"}},
+  "inbounds": [
+    {"type":"mixed","tag":"frostgate-mixed","listen":"127.0.0.1","listen_port":23456},
+    {"type":"tun","tag":"custom-inbound","mtu":1400}
+  ],
+  "route": {"rules":[
+    {"inbound":"custom-inbound","outbound":"custom-vless"},
+    {"inbound":"frostgate-mixed","outbound":"frostgate-selector"}
+  ],"final":"direct"},
+  "outbounds": [
+    {"type":"direct","tag":"direct"},
+    {"type":"selector","tag":"frostgate-selector","outbounds":["managed-vless"],"default":"managed-vless"},
+    {"type":"vless","tag":"managed-vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"managed.example","reality":{"enabled":true,"public_key":"managed-key","short_id":"abcd"}}},
+    {"type":"vless","tag":"custom-vless","server":"198.51.100.10","server_port":443,"uuid":"22222222-2222-4222-8222-222222222222","flow":"custom-flow","tls":{"enabled":true,"server_name":"custom.example","reality":{"enabled":true,"public_key":"custom-key","short_id":"cafe"}}},
+    {"type":"hysteria2","tag":"custom-hysteria","server":"198.51.100.20","server_port":8443,"password":"custom-password","obfs":{"type":"salamander","password":"custom-obfs"},"tls":{"enabled":true,"server_name":"hy.example","insecure":true}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var before map[string]any
+	if err := json.Unmarshal(raw, &before); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Secret != "fixture-secret" {
+		t.Fatalf("managed controller secret was not preserved: %q", m.Secret)
+	}
+	if len(m.VLESS) != 1 || m.VLESS[0].Tag != "managed-vless" {
+		t.Fatalf("ownership detection included unrelated outbounds: %+v", m.VLESS)
+	}
+	if addr, ok := m.BenchmarkProxy(); !ok || addr != "127.0.0.1:23456" {
+		t.Fatalf("managed listener was not retained: %q %t", addr, ok)
+	}
+	m.AddVLESS(&setup.VLESSOutbound{Tag: "managed-new", Server: "203.0.113.11", ServerPort: 443, UUID: "33333333-3333-4333-8333-333333333333", SNI: "new.example", PBK: "new-key", SID: "beef", FP: "chrome"})
+	generated, err := m.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(generated, &after); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"log", "dns", "experimental"} {
+		if canonicalValue(t, before[key]) != canonicalValue(t, after[key]) {
+			t.Fatalf("custom top-level %s changed:\nwant %s\ngot  %s", key, canonicalValue(t, before[key]), canonicalValue(t, after[key]))
+		}
+	}
+	for _, tag := range []string{"custom-vless", "custom-hysteria"} {
+		if canonicalValue(t, outboundByTag(t, before, tag)) != canonicalValue(t, outboundByTag(t, after, tag)) {
+			t.Fatalf("unowned outbound %s changed", tag)
+		}
+	}
+	if canonicalValue(t, inboundByTag(t, before, "custom-inbound")) != canonicalValue(t, inboundByTag(t, after, "custom-inbound")) {
+		t.Fatal("custom inbound changed")
+	}
+	if canonicalValue(t, routeRuleForInbound(t, before, "custom-inbound")) != canonicalValue(t, routeRuleForInbound(t, after, "custom-inbound")) {
+		t.Fatal("custom route rule changed")
+	}
+	if got, ok := (&Managed{Raw: after}).BenchmarkProxy(); !ok || got != "127.0.0.1:23456" {
+		t.Fatalf("generated listener changed: %q %t", got, ok)
+	}
+	if outboundByTag(t, after, "managed-new") == nil {
+		t.Fatal("new managed outbound missing")
+	}
+}
+
+func canonicalValue(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func outboundByTag(t *testing.T, doc map[string]any, tag string) map[string]any {
+	t.Helper()
+	for _, raw := range doc["outbounds"].([]any) {
+		outbound := raw.(map[string]any)
+		if outbound["tag"] == tag {
+			return outbound
+		}
+	}
+	return nil
+}
+
+func inboundByTag(t *testing.T, doc map[string]any, tag string) map[string]any {
+	t.Helper()
+	for _, raw := range doc["inbounds"].([]any) {
+		inbound := raw.(map[string]any)
+		if inbound["tag"] == tag {
+			return inbound
+		}
+	}
+	return nil
+}
+
+func routeRuleForInbound(t *testing.T, doc map[string]any, tag string) map[string]any {
+	t.Helper()
+	route := doc["route"].(map[string]any)
+	for _, raw := range route["rules"].([]any) {
+		rule := raw.(map[string]any)
+		if rule["inbound"] == tag {
+			return rule
+		}
+	}
+	return nil
+}
+
 func TestSaveTransactionSuccess(t *testing.T) {
 	d := tempDir(t)
 	m := &Managed{Dir: d, VLESS: []*setup.VLESSOutbound{{Tag: "v1", Server: "203.0.113.11", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}}}

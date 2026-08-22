@@ -405,7 +405,11 @@ func expandPath(p string) string {
 // address suitable for the Frostgate-managed benchmark listener. Public, LAN
 // and wildcard addresses are rejected.
 func IsLoopbackHost(h string) bool {
-	return h == "127.0.0.1" || h == "::1" || h == "localhost"
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateBenchmarkProxy(addr string) error {
@@ -414,7 +418,7 @@ func validateBenchmarkProxy(addr string) error {
 		return fmt.Errorf("singbox.benchmark_proxy must be host:port: %q", addr)
 	}
 	if !IsLoopbackHost(host) {
-		return fmt.Errorf("singbox.benchmark_proxy must be a loopback address (127.0.0.1/::1/localhost), got %q", host)
+		return fmt.Errorf("singbox.benchmark_proxy must be a loopback address, got %q", host)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {

@@ -53,27 +53,49 @@ func systemdQuote(s string) string {
 }
 
 func InstallSystemdService(servicePath, binaryPath, configDir string, runner SystemdRunner) error {
-	if runner == nil {
-		runner = execSystemdRunner{}
+	return InstallSystemdServiceNamed(servicePath, "frostgate-singbox.service", binaryPath, configDir, runner)
+}
+
+func ServiceUnitPath(service string) string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".config")
 	}
+	return filepath.Join(base, "systemd", "user", service)
+}
+
+// WriteSystemdUnit writes a profile-scoped unit without starting it. The
+// transaction installs the candidate config before the runner starts it.
+func WriteSystemdUnit(servicePath, binaryPath, configDir string) error {
 	if err := os.MkdirAll(filepath.Dir(servicePath), 0o755); err != nil {
 		return fmt.Errorf("create systemd user directory: %w", err)
 	}
 	if err := os.WriteFile(servicePath, []byte(BuildSystemdUnit(binaryPath, configDir)), 0o644); err != nil {
 		return fmt.Errorf("write systemd unit: %w", err)
 	}
+	return nil
+}
+
+func InstallSystemdServiceNamed(servicePath, service, binaryPath, configDir string, runner SystemdRunner) error {
+	if runner == nil {
+		runner = execSystemdRunner{}
+	}
+	if err := WriteSystemdUnit(servicePath, binaryPath, configDir); err != nil {
+		return err
+	}
 	if err := runner.Run("systemctl", "--user", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemd daemon-reload: %w", err)
 	}
-	if err := runner.Run("systemctl", "--user", "enable", "--now", "frostgate-singbox.service"); err != nil {
-		return fmt.Errorf("enable frostgate-singbox.service: %w", err)
+	if err := runner.Run("systemctl", "--user", "enable", "--now", service); err != nil {
+		return fmt.Errorf("enable %s: %w", service, err)
 	}
-	out, err := runner.Output("systemctl", "--user", "is-active", "frostgate-singbox.service")
+	out, err := runner.Output("systemctl", "--user", "is-active", service)
 	if err != nil {
-		return fmt.Errorf("check frostgate-singbox.service: %w", err)
+		return fmt.Errorf("check %s: %w", service, err)
 	}
 	if strings.TrimSpace(string(out)) != "active" {
-		return fmt.Errorf("frostgate-singbox.service is not active: %s", strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s is not active: %s", service, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

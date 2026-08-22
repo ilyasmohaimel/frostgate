@@ -105,15 +105,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.probeCmd(), m.tickCmd())
 	case resultsMsg:
 		m.probing = false
+		m.lastRefresh = msg.completed
+		if m.lastRefresh.IsZero() {
+			m.lastRefresh = time.Now()
+		}
 		if msg.err != nil {
 			m.err = msg.err
 		} else {
 			m.results = msg.results
 			m.err = nil
-			m.lastRefresh = msg.completed
-			if m.lastRefresh.IsZero() {
-				m.lastRefresh = time.Now()
-			}
 			if m.onSnapshot != nil {
 				m.onSnapshot(msg.results)
 			}
@@ -139,7 +139,7 @@ func (m Model) View() string {
 	}
 	b += "\n"
 	if m.err != nil {
-		b += lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render(fmt.Sprintf("error: %v", m.err)) + "\n\n"
+		b += lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("error: "+redact.Error(m.err)) + "\n\n"
 	}
 	if len(m.results) == 0 {
 		b += subStyle.Render("probing...") + "\n"

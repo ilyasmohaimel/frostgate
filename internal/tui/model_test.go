@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -62,6 +63,15 @@ func TestModelHandlesResultsMsg(t *testing.T) {
 	}
 }
 
+func TestModelRedactsProbeErrors(t *testing.T) {
+	m := New(&config.Config{}, time.Second, false, nil)
+	m.err = errors.New("request failed https://example.com/check?token=SUPER_SECRET_TOKEN_8F3A bearer SECRET_BEARER")
+	view := m.View()
+	if containsStr(view, "SUPER_SECRET_TOKEN_8F3A") || containsStr(view, "SECRET_BEARER") || !containsStr(view, "[redacted]") {
+		t.Fatalf("TUI error was not redacted: %s", view)
+	}
+}
+
 func TestModelCoalescesRefreshesWhileProbeIsInFlight(t *testing.T) {
 	m := New(&config.Config{}, time.Second, false, nil)
 	// New begins with the initial probe in flight. Ticks and repeated manual
@@ -82,6 +92,19 @@ func TestModelCoalescesRefreshesWhileProbeIsInFlight(t *testing.T) {
 	}
 	if view := model.View(); !containsStr(view, "Last refresh: 03:04:05") {
 		t.Fatalf("view must use completed refresh time:\n%s", view)
+	}
+}
+
+func TestModelRecordsCompletionTimeAfterProbeError(t *testing.T) {
+	m := New(&config.Config{}, time.Second, false, nil)
+	completed := time.Date(2026, 1, 2, 4, 5, 6, 0, time.UTC)
+	updated, _ := m.Update(resultsMsg{err: errors.New("probe failed"), completed: completed})
+	model := updated.(Model)
+	if !model.lastRefresh.Equal(completed) {
+		t.Fatalf("last refresh = %s, want %s", model.lastRefresh, completed)
+	}
+	if view := model.View(); !containsStr(view, "Last refresh: 04:05:06") {
+		t.Fatalf("view must show completion time after an error:\n%s", view)
 	}
 }
 

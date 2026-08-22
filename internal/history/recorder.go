@@ -39,20 +39,29 @@ type Recorder struct {
 	enabled       bool
 	retention     time.Duration
 	watchInterval time.Duration
+	profile       string
 	db            *DB
 	lastWrite     time.Time
 	lastPrune     time.Time
+	prune         func(*DB, time.Duration) error
 }
 
 // NewRecorder builds a Recorder from resolved config values.
 func NewRecorder(enabled bool, retention, watchInterval time.Duration) *Recorder {
+	return NewRecorderForProfile(enabled, retention, watchInterval, DefaultProfile)
+}
+
+func NewRecorderForProfile(enabled bool, retention, watchInterval time.Duration, profile string) *Recorder {
 	if retention <= 0 {
 		retention = 90 * 24 * time.Hour
 	}
 	if watchInterval <= 0 {
 		watchInterval = 5 * time.Minute
 	}
-	return &Recorder{enabled: enabled, retention: retention, watchInterval: watchInterval}
+	if profile == "" {
+		profile = DefaultProfile
+	}
+	return &Recorder{enabled: enabled, retention: retention, watchInterval: watchInterval, profile: profile, prune: func(db *DB, retention time.Duration) error { return db.Prune(retention) }}
 }
 
 // Enabled reports whether history recording is active.
@@ -99,13 +108,18 @@ func (r *Recorder) write(recs []Record, throttled bool) (bool, error) {
 		r.lastPrune = time.Time{}
 	}
 	for _, rec := range recs {
+		if rec.Profile == "" {
+			rec.Profile = r.profile
+		}
 		if err := r.db.Add(rec); err != nil {
 			return false, err
 		}
 	}
 	r.lastWrite = now
 	if r.lastPrune.IsZero() || now.Sub(r.lastPrune) >= r.watchInterval {
-		_ = r.db.Prune(r.retention)
+		if err := r.prune(r.db, r.retention); err != nil {
+			return false, err
+		}
 		r.lastPrune = now
 	}
 	return true, nil
@@ -126,7 +140,11 @@ func (r *Recorder) Close() error {
 
 // FromProbeResults converts probe results into history records. downloadFor
 // may be nil; route names come straight from endpoints (never secrets).
-func FromProbeResults(results []probe.Result, downloadFor func(name string) float64, networkLabel string) []Record {
+func FromProbeResults(results []probe.Result, downloadFor func(name string) float64, networkLabel string, profile ...string) []Record {
+	profileID := ""
+	if len(profile) > 0 {
+		profileID = profile[0]
+	}
 	out := make([]Record, 0, len(results))
 	for _, res := range results {
 		var dl float64
@@ -146,6 +164,7 @@ func FromProbeResults(results []probe.Result, downloadFor func(name string) floa
 			DownloadMbps: dl,
 			Network:      networkLabel,
 			Category:     res.Category,
+			Profile:      profileID,
 		})
 	}
 	return out

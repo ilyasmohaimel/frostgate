@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +14,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
@@ -233,5 +237,338 @@ func TestInteractiveSetupAddRollsBackBothConfigs(t *testing.T) {
 	}
 	if restarts != 2 {
 		t.Fatalf("sidecar was not restarted after rollback: %d calls", restarts)
+	}
+}
+
+func TestDirectOnlyAddBootstrapsCompleteManagedSidecar(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	direct, err := yaml.Marshal(setup.BuildDirectOnlyConfig(config.DefaultTestURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, direct, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var candidate map[string]any
+	enabled := 0
+	runner := &managedconfig.SidecarRunner{
+		Validator:    func(data []byte) error { return json.Unmarshal(data, &candidate) },
+		DaemonReload: func() error { return nil },
+		Restart:      func() error { return nil },
+		IsActive:     func() (bool, error) { return true, nil },
+		ControllerReady: func(expected []string) (bool, error) {
+			if len(expected) != 1 || expected[0] != "first-route" {
+				t.Fatalf("controller expectations = %v", expected)
+			}
+			return true, nil
+		},
+		Enable: func() error { enabled++; return nil },
+	}
+	if _, err := addManagedRoute(dir, configPath, "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&type=tcp&sni=example.com&fp=chrome&pbk=fixture-key&sid=abcd&flow=xtls-rprx-vision", "first-route", runner); err != nil {
+		t.Fatalf("add first managed route: %v", err)
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SingBox.Controller == "" || loaded.SingBox.BenchmarkProxy == "" || loaded.SingBox.SecretFile == "" {
+		t.Fatalf("direct-only upgrade did not configure managed sidecar: %+v", loaded.SingBox)
+	}
+	if info, err := os.Stat(loaded.SingBox.SecretFile); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("controller secret permissions = %v, %v", info, err)
+	}
+	if candidate["experimental"] == nil || candidate["inbounds"] == nil || candidate["route"] == nil {
+		t.Fatalf("managed sidecar is incomplete: %v", candidate)
+	}
+	managed, err := managedconfig.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr, ok := managed.BenchmarkProxy(); !ok || addr != loaded.SingBox.BenchmarkProxy {
+		t.Fatalf("managed benchmark listener = %q, %t; config=%q", addr, ok, loaded.SingBox.BenchmarkProxy)
+	}
+	if len(managed.VLESS) != 1 || managed.VLESS[0].Tag != "first-route" {
+		t.Fatalf("managed proxy missing: %+v", managed.VLESS)
+	}
+	if enabled != 1 {
+		t.Fatalf("direct-only upgrade did not enable the managed sidecar: %d", enabled)
+	}
+}
+
+func TestCustomProfileAddUsesOnlyItsOwnServiceAndFiles(t *testing.T) {
+	oldFind, oldWrite, oldRunner := findSingBox, writeSystemdUnit, newSidecarRunner
+	t.Cleanup(func() { findSingBox, writeSystemdUnit, newSidecarRunner = oldFind, oldWrite, oldRunner })
+
+	root := t.TempDir()
+	defaultDir := filepath.Join(root, "default")
+	customDir := filepath.Join(root, "profiles", "custom")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultSidecar := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	if err := os.WriteFile(filepath.Join(defaultDir, "sing-box.json"), defaultSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(customDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	customConfig := filepath.Join(customDir, "config.yaml")
+	direct, err := yaml.Marshal(setup.BuildDirectOnlyConfig(config.DefaultTestURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(customConfig, direct, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := profile.ForPath(customConfig, false)
+	var unitPath, unitBinary, unitDir, runnerService string
+	findSingBox = func(string) (string, error) { return "/opt/bin/sing-box", nil }
+	writeSystemdUnit = func(path, binary, dir string) error {
+		unitPath, unitBinary, unitDir = path, binary, dir
+		return nil
+	}
+	newSidecarRunner = func(controller, secret, service string) *managedconfig.SidecarRunner {
+		runnerService = service
+		return &managedconfig.SidecarRunner{
+			Validator:    func([]byte) error { return nil },
+			DaemonReload: func() error { return nil },
+			Restart:      func() error { return nil },
+			IsActive:     func() (bool, error) { return true, nil },
+			ControllerReady: func([]string) (bool, error) {
+				return true, nil
+			},
+		}
+	}
+	if _, err := addManagedRoute(customDir, customConfig, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com&obfs=salamander&obfs-password=fixture-obfs", "custom-route", nil); err != nil {
+		t.Fatal(err)
+	}
+	if runnerService != identity.Service || runnerService == "frostgate-singbox.service" {
+		t.Fatalf("custom profile used wrong service: %q", runnerService)
+	}
+	if unitBinary != "/opt/bin/sing-box" || unitDir != customDir || filepath.Base(unitPath) != identity.Service {
+		t.Fatalf("custom service unit = path:%q binary:%q dir:%q", unitPath, unitBinary, unitDir)
+	}
+	if got, err := os.ReadFile(filepath.Join(defaultDir, "sing-box.json")); err != nil || !bytes.Equal(got, defaultSidecar) {
+		t.Fatalf("custom profile changed default sidecar: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(customDir, "controller-secret")); err != nil {
+		t.Fatalf("custom controller secret missing: %v", err)
+	}
+	if other := profile.ForPath(filepath.Join(root, "profiles", "other", "config.yaml"), false); other.Service == identity.Service || other.ControllerAddr == identity.ControllerAddr || other.BenchmarkAddr == identity.BenchmarkAddr {
+		t.Fatalf("custom identities collide: %+v %+v", identity, other)
+	}
+}
+
+func TestCustomProfileRollbackDoesNotTouchDefaultProfile(t *testing.T) {
+	root := t.TempDir()
+	defaultDir := filepath.Join(root, "default")
+	customDir := filepath.Join(root, "profiles", "rollback")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultSidecar := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	if err := os.WriteFile(filepath.Join(defaultDir, "sing-box.json"), defaultSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(customDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(customDir, "config.yaml")
+	direct, err := yaml.Marshal(setup.BuildDirectOnlyConfig(config.DefaultTestURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, direct, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &managedconfig.SidecarRunner{
+		Validator:    func([]byte) error { return nil },
+		DaemonReload: func() error { return nil },
+		Restart:      func() error { return errors.New("restart rejected") },
+	}
+	if _, err := addManagedRoute(customDir, configPath, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com", "rollback-route", runner); err == nil {
+		t.Fatal("expected custom profile transaction failure")
+	}
+	if got, err := os.ReadFile(filepath.Join(defaultDir, "sing-box.json")); err != nil || !bytes.Equal(got, defaultSidecar) {
+		t.Fatalf("custom rollback changed default sidecar: %q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, direct) {
+		t.Fatalf("custom config was not restored: %q err=%v", got, err)
+	}
+	for _, name := range []string{"sing-box.json", "controller-secret"} {
+		if _, err := os.Stat(filepath.Join(customDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("rollback left custom %s: %v", name, err)
+		}
+	}
+}
+
+func TestFailedFirstRouteBootstrapRemovesNewProfileUnit(t *testing.T) {
+	oldFind, oldWrite, oldRunner := findSingBox, writeSystemdUnit, newSidecarRunner
+	t.Cleanup(func() { findSingBox, writeSystemdUnit, newSidecarRunner = oldFind, oldWrite, oldRunner })
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	dir := filepath.Join(root, "profile")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	direct, err := yaml.Marshal(setup.BuildDirectOnlyConfig(config.DefaultTestURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, direct, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := profile.ForPath(configPath, false)
+	findSingBox = func(string) (string, error) { return "/opt/bin/sing-box", nil }
+	writeSystemdUnit = setup.WriteSystemdUnit
+	newSidecarRunner = func(string, string, string) *managedconfig.SidecarRunner {
+		return &managedconfig.SidecarRunner{Validator: func([]byte) error { return nil }, Restart: func() error { return errors.New("restart rejected") }}
+	}
+	if _, err := addManagedRoute(dir, configPath, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com", "first-route", nil); err == nil {
+		t.Fatal("expected bootstrap failure")
+	}
+	if _, err := os.Stat(setup.ServiceUnitPath(identity.Service)); !os.IsNotExist(err) {
+		t.Fatalf("failed bootstrap left profile unit: %v", err)
+	}
+}
+
+func TestExistingCustomProfileCanUpdateWhileItsOwnListenersAreActive(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	identity := profile.ForPath(configPath, false)
+	controllerHost, controllerPort, err := net.SplitHostPort(identity.ControllerAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	benchmarkHost, benchmarkPort, err := net.SplitHostPort(identity.BenchmarkAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecar := fmt.Sprintf(`{"experimental":{"clash_api":{"external_controller":%q,"secret":"fixture-secret"}},"inbounds":[{"type":"mixed","tag":"frostgate-mixed","listen":%q,"listen_port":%s}],"route":{"rules":[{"inbound":"frostgate-mixed","outbound":"frostgate-selector"}]},"outbounds":[{"type":"direct","tag":"direct"},{"type":"selector","tag":"frostgate-selector","outbounds":["existing"],"default":"existing"},{"type":"vless","tag":"existing","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd"}}}]}`, identity.ControllerAddr, benchmarkHost, benchmarkPort)
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), []byte(sidecar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "controller-secret"), []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configData := fmt.Sprintf(`singbox:
+  controller: http://%s
+  secret_file: %s
+  benchmark_proxy: %s
+endpoints:
+  - name: direct
+    type: http
+    url: https://www.gstatic.com/generate_204
+    expected_status: 204
+  - name: existing
+    type: singbox
+    outbound: existing
+`, identity.ControllerAddr, filepath.Join(dir, "controller-secret"), identity.BenchmarkAddr)
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controllerListener, err := net.Listen("tcp", net.JoinHostPort(controllerHost, controllerPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controllerListener.Close()
+	benchmarkListener, err := net.Listen("tcp", net.JoinHostPort(benchmarkHost, benchmarkPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer benchmarkListener.Close()
+	runner := &managedconfig.SidecarRunner{Validator: func([]byte) error { return nil }, Restart: func() error { return nil }, IsActive: func() (bool, error) { return true, nil }, ControllerReady: func([]string) (bool, error) { return true, nil }}
+	if _, err := addManagedRoute(dir, configPath, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com", "new-route", runner); err != nil {
+		t.Fatalf("update custom profile with its own listeners active: %v", err)
+	}
+}
+
+func TestCustomLegacyBenchmarkMigrationUsesProfileBindings(t *testing.T) {
+	root := t.TempDir()
+	defaultDir := filepath.Join(root, "default")
+	customDir := filepath.Join(root, "profile")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultSidecar := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	if err := os.WriteFile(filepath.Join(defaultDir, "sing-box.json"), defaultSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(customDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(customDir, "config.yaml")
+	legacy := []byte(`{"experimental":{"clash_api":{"external_controller":"127.0.0.1:9090","secret":"fixture-secret"}},"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"},{"type":"vless","tag":"legacy-route","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd"}}}]}`)
+	if err := os.WriteFile(filepath.Join(customDir, "sing-box.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "controller-secret"), []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configData := []byte(`singbox:
+  controller: http://127.0.0.1:9090
+  secret_file: ` + filepath.Join(customDir, "controller-secret") + `
+endpoints:
+  - name: direct
+    type: http
+    url: https://www.gstatic.com/generate_204
+    expected_status: 204
+  - name: legacy-route
+    type: singbox
+    outbound: legacy-route
+`)
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &managedconfig.SidecarRunner{Validator: func([]byte) error { return nil }, Restart: func() error { return nil }, IsActive: func() (bool, error) { return true, nil }, ControllerReady: func([]string) (bool, error) { return true, nil }}
+	addr, reason := benchmarkProxyAddrWithRunner(cfg, configPath, customDir, runner)
+	identity := profile.ForPath(configPath, false)
+	if reason != "" || addr != identity.BenchmarkAddr {
+		t.Fatalf("custom legacy migration = addr:%q reason:%q want:%q", addr, reason, identity.BenchmarkAddr)
+	}
+	updated, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.SingBox.Controller != "http://"+identity.ControllerAddr || updated.SingBox.BenchmarkProxy != identity.BenchmarkAddr {
+		t.Fatalf("custom profile bindings not persisted: %+v", updated.SingBox)
+	}
+	if got, err := os.ReadFile(filepath.Join(defaultDir, "sing-box.json")); err != nil || !bytes.Equal(got, defaultSidecar) {
+		t.Fatalf("custom migration changed default sidecar: %q err=%v", got, err)
+	}
+}
+
+func TestAddDoesNotBootstrapOverExternalController(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configData := []byte(`singbox:
+  controller: http://127.0.0.1:9999
+endpoints:
+  - name: direct
+    type: http
+    url: https://www.gstatic.com/generate_204
+    expected_status: 204
+  - name: external-route
+    type: singbox
+    outbound: external-route
+`)
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &managedconfig.SidecarRunner{Validator: func([]byte) error { t.Fatal("external controller must not be bootstrapped"); return nil }}
+	if _, err := addManagedRoute(dir, configPath, "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&type=tcp&sni=example.com&pbk=fixture-key", "new-route", runner); err == nil || !strings.Contains(err.Error(), "existing external controller") {
+		t.Fatalf("external controller bootstrap error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sing-box.json")); !os.IsNotExist(err) {
+		t.Fatalf("external controller unexpectedly gained a managed sidecar: %v", err)
+	}
+	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, configData) {
+		t.Fatalf("external config changed: %q err=%v", got, err)
 	}
 }

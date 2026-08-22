@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -237,6 +238,47 @@ func TestSingBoxProbeMissingOutbound(t *testing.T) {
 	}
 	if r.Category != "outbound-not-found" && r.Category != "singbox-api" {
 		t.Logf("category=%q err=%v", r.Category, r.Err)
+	}
+}
+
+func TestSingBoxProbeUsesControllerReturnedDelay(t *testing.T) {
+	var delays = []int{100, 400, 700}
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxies/route/delay" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		delay := delays[calls]
+		calls++
+		// The handler intentionally responds immediately. Metrics must reflect
+		// this value, not the local controller request wall time.
+		fmt.Fprintf(w, `{"delay":%d}`, delay)
+	}))
+	defer srv.Close()
+	cfg := &config.Config{
+		Defaults: config.Defaults{
+			Timeout:        config.Duration{Duration: time.Second},
+			Samples:        3,
+			SampleInterval: config.Duration{Duration: time.Millisecond},
+			HealthyLatency: config.Duration{Duration: 2 * time.Second},
+			MaxJitter:      config.Duration{Duration: time.Second},
+		},
+		SingBox:   config.SingBoxConfig{Controller: srv.URL, TestURL: "https://example.com/generate_204"},
+		Endpoints: []config.Endpoint{{Name: "route", Type: config.ProbeSingBox, Outbound: "route"}},
+	}
+	result := ProbeEndpoint(context.Background(), cfg, cfg.Endpoints[0])
+	if calls != 3 {
+		t.Fatalf("delay requests = %d, want 3", calls)
+	}
+	if got, want := result.Samples[0].Latency, 100*time.Millisecond; got != want {
+		t.Fatalf("first sample latency = %v, want controller delay %v", got, want)
+	}
+	if got, want := result.Metrics.Median, 400*time.Millisecond; got != want {
+		t.Fatalf("median = %v, want %v", got, want)
+	}
+	if got, want := result.Metrics.Jitter, 300*time.Millisecond; got != want {
+		t.Fatalf("jitter = %v, want %v", got, want)
 	}
 }
 

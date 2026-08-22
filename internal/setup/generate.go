@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -258,6 +259,6 @@ func WriteFileSecure(path string, data []byte) error {
 }
 
 func IsLoopbackController(controller string) bool {
-	// controller is like http://127.0.0.1:9090
-	return controller == "http://127.0.0.1:9090" || controller == "http://localhost:9090" || controller == "http://[::1]:9090"
+	u, err := url.Parse(controller)
+	return err == nil && u.Hostname() != "" && config.IsLoopbackHost(u.Hostname())
 }

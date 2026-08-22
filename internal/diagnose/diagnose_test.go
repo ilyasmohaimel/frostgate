@@ -143,7 +143,7 @@ func TestVLESSDeadServerFailsTCP(t *testing.T) {
 		t.Fatalf("closed port must FAIL measured TCP: %+v", tcp)
 	}
 	e2e := findLayer(layers, "End-to-end vless-a")
-	wantHint := "server may be reachable, but REALITY/auth failed; check PBK, SID, or filtering"
+	wantHint := "check UUID, REALITY public key, short ID, SNI, server, or filtering"
 	if e2e == nil || e2e.Hint != wantHint {
 		t.Fatalf("end-to-end failure hint: %+v", e2e)
 	}
@@ -164,6 +164,20 @@ func TestHysteriaHonestWording(t *testing.T) {
 	e2e := findLayer(layers, "End-to-end Hysteria2 hy2-b")
 	if e2e == nil || e2e.Status != "PASS" || !strings.Contains(e2e.Detail, "End-to-end Hysteria2: PASS") {
 		t.Fatalf("hysteria end-to-end: %+v", e2e)
+	}
+}
+
+func TestGenericSingBoxRouteUsesGenericFailureHint(t *testing.T) {
+	ctrl := httptest.NewServer(newFakeCtrl(map[string]int{}).handler())
+	defer ctrl.Close()
+	cfg := testCfg(t, ctrl.URL, config.Endpoint{Name: "external-route", Type: config.ProbeSingBox, Outbound: "external-route"})
+	layers := DiagnoseRoute(cfg, "external-route", Options{})
+	e2e := findLayer(layers, "End-to-end external-route")
+	if e2e == nil || e2e.Hint != "check the controller route configuration and upstream connectivity" {
+		t.Fatalf("generic route got protocol-specific hint: %+v", e2e)
+	}
+	if strings.Contains(e2e.Hint, "REALITY") || strings.Contains(e2e.Hint, "PBK") {
+		t.Fatalf("generic route hint leaked VLESS-specific advice: %+v", e2e)
 	}
 }
 

@@ -161,6 +161,7 @@ func probeOnce(ctx context.Context, cfg *config.Config, e config.Endpoint, timeo
 	defer cancel()
 	start := time.Now()
 	var err error
+	var latency time.Duration
 	switch e.Type {
 	case config.ProbeTCP:
 		err = probeTCP(ctx, e)
@@ -169,15 +170,17 @@ func probeOnce(ctx context.Context, cfg *config.Config, e config.Endpoint, timeo
 	case config.ProbeHTTP:
 		err = probeHTTP(ctx, e, e.ExpectedStatus)
 	case config.ProbeSingBox:
-		err = probeSingBox(ctx, cfg, e, timeout)
+		latency, err = probeSingBox(ctx, cfg, e, timeout)
 	default:
 		err = fmt.Errorf("unsupported probe type %q", e.Type)
 	}
-	lat := time.Since(start)
-	if err != nil {
-		return metrics.Sample{Success: false, Latency: lat, Err: err, ErrCategory: categorizeError(err)}
+	if latency == 0 {
+		latency = time.Since(start)
 	}
-	return metrics.Sample{Success: true, Latency: lat, ErrCategory: ""}
+	if err != nil {
+		return metrics.Sample{Success: false, Latency: latency, Err: err, ErrCategory: categorizeError(err)}
+	}
+	return metrics.Sample{Success: true, Latency: latency, ErrCategory: ""}
 }
 
 // legacy Probe for backwards compat and simple tests
@@ -252,21 +255,18 @@ func probeHTTP(ctx context.Context, e config.Endpoint, expectedStatus int) error
 	return nil
 }
 
-func probeSingBox(ctx context.Context, cfg *config.Config, e config.Endpoint, timeout time.Duration) error {
+func probeSingBox(ctx context.Context, cfg *config.Config, e config.Endpoint, timeout time.Duration) (time.Duration, error) {
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	// Use a per-sample timeout context already applied; but singbox client Delay uses its own timeout param
-	// So we need to call Delay with timeout slightly less than context deadline to avoid double timeout?
-	// Use timeout for singbox delay param
 	d, err := client.Delay(ctx, e.Outbound, cfg.SingBox.TestURL, timeout)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if d == 0 {
-		return fmt.Errorf("proxy-test: zero delay")
+		return 0, fmt.Errorf("proxy-test: zero delay")
 	}
-	// success; we already measured latency via probeOnce start timer, but we could also use d
-	_ = d
-	return nil
+	// The controller reports the end-to-end route delay. The local Clash API
+	// request duration only measures the controller round trip, not the proxy.
+	return d, nil
 }
 
 // Classify is deprecated; use health.Classify. Kept for tests.

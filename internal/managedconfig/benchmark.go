@@ -53,7 +53,7 @@ func (m *Managed) IsLegacyManagedBenchmarkConfig(controller string, configuredOu
 		return false
 	}
 	managed := map[string]bool{}
-	for _, tag := range m.ProxyTags() {
+	for _, tag := range m.legacyProxyTags() {
 		managed[tag] = true
 	}
 	if len(managed) != len(configuredOutbounds) {
@@ -84,6 +84,7 @@ func EnsureBenchmarkProxy(dir, controller string, configuredOutbounds []string, 
 	if runner == nil {
 		return "", false, fmt.Errorf("managed benchmark migration requires a sidecar runner")
 	}
+	m.AdoptLegacyRoutes()
 	if err := m.SaveTransaction(runner); err != nil {
 		return "", false, fmt.Errorf("managed benchmark migration: %w", err)
 	}
@@ -96,6 +97,45 @@ func EnsureBenchmarkProxy(dir, controller string, configuredOutbounds []string, 
 		return "", false, fmt.Errorf("migrated managed config has no benchmark listener")
 	}
 	return addr, true, nil
+}
+
+func (m *Managed) legacyProxyTags() []string {
+	var tags []string
+	for _, raw := range rawOutbounds(m.Raw) {
+		outbound, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName := inboundString(outbound, "type")
+		if typeName == "vless" || typeName == "hysteria2" {
+			tags = append(tags, inboundString(outbound, "tag"))
+		}
+	}
+	return tags
+}
+
+// AdoptLegacyRoutes marks a sidecar that has already passed
+// IsLegacyManagedBenchmarkConfig as Frostgate-owned before it is regenerated.
+// Callers must not use it for an arbitrary external configuration.
+func (m *Managed) AdoptLegacyRoutes() {
+	if m.managedTags == nil {
+		m.managedTags = map[string]bool{}
+	}
+	for _, raw := range rawOutbounds(m.Raw) {
+		outbound, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag := inboundString(outbound, "tag")
+		switch inboundString(outbound, "type") {
+		case "vless":
+			m.managedTags[tag] = true
+			m.VLESS = append(m.VLESS, parseVLESS(outbound, tag))
+		case "hysteria2":
+			m.managedTags[tag] = true
+			m.Hysteria = append(m.Hysteria, parseHysteria(outbound, tag))
+		}
+	}
 }
 
 func (m *Managed) routesInboundToSelector(tag string) bool {

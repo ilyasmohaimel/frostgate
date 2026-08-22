@@ -7,13 +7,7 @@ Set Theme "Dracula"
 Set TypingSpeed 35ms
 
 Hide
-Type "source docs/frostgate-demo-env.sh"
-Enter
-Sleep 3s
 Show
-Type "clear"
-Enter
-Sleep 1s
 
 Type "frostgate --version"
 Enter

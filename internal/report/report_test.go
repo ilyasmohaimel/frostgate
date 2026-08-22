@@ -152,6 +152,17 @@ func TestTableNoProxyConfigured(t *testing.T) {
 	}
 }
 
+func TestTableProxyRoutesAllDownAreNoneUsable(t *testing.T) {
+	results := []probe.Result{
+		mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0),
+		{Endpoint: config.Endpoint{Name: "proxy", Type: config.ProbeSingBox}, Status: probe.StatusDown, Metrics: metrics.Metrics{Attempted: 1, Failed: 1, LossPct: 100}},
+	}
+	s := Table(results)
+	if !strings.Contains(s, "Best proxy: none usable") || strings.Contains(s, "none configured") {
+		t.Fatalf("all-down proxies reported incorrectly: %q", s)
+	}
+}
+
 func TestTableContainsBest(t *testing.T) {
 	results := []probe.Result{
 		mkResult("fast", config.ProbeTCP, probe.StatusUp, 50*time.Millisecond, 0),

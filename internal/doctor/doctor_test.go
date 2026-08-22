@@ -34,3 +34,29 @@ func TestPrivateFileCheckRejectsAllGroupWorldPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestRunForProfileDoesNotDiscoverAnotherProfilesBenchmarkListener(t *testing.T) {
+	root := t.TempDir()
+	defaultDir := filepath.Join(root, "default")
+	customDir := filepath.Join(root, "custom")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(customDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultDir, "sing-box.json"), []byte(`{"inbounds":[{"type":"mixed","tag":"frostgate-benchmark","listen":"127.0.0.1","listen_port":2080}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(customDir, "config.yaml")
+	configData := "singbox:\n  controller: http://127.0.0.1:9090\nendpoints:\n  - name: route\n    type: singbox\n    outbound: route\n"
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checks := RunForProfile(configPath, customDir, false)
+	for _, check := range checks {
+		if check.Name == "Benchmark proxy" && check.Status == "PASS" {
+			t.Fatalf("custom profile borrowed benchmark listener: %#v", check)
+		}
+	}
+}

@@ -61,17 +61,31 @@ func run() int {
 				home = h
 			}
 			if err := runInteractiveSetup(home); err != nil {
-				fmt.Fprintln(os.Stderr, "setup:", err)
+				fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
 				return 3
 			}
 			return 0
 		case "doctor":
 			fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
 			cfgPath := fs.String("config", "", "path to config file")
 			verbose := fs.Bool("verbose", false, "verbose output")
-			_ = fs.Parse(os.Args[2:])
-			path := config.ResolveConfigPath(*cfgPath)
-			checks := doctor.Run(path, *verbose)
+			printDoctorUsage := func() { fmt.Fprintln(os.Stdout, "usage: frostgate doctor [--config path] [--verbose]") }
+			fs.Usage = func() {}
+			if err := fs.Parse(os.Args[2:]); err != nil {
+				if err == flag.ErrHelp {
+					printDoctorUsage()
+					return 0
+				}
+				fmt.Fprintln(os.Stderr, sanitizeError(err))
+				return 3
+			}
+			if fs.NArg() != 0 {
+				fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(fs.Arg(0)))
+				return 3
+			}
+			path, managedDir := commandPaths(*cfgPath)
+			checks := doctor.RunForProfile(path, managedDir, *verbose)
 			fmt.Print(doctor.FormatColor(checks))
 			for _, c := range checks {
 				if c.Status == "FAIL" {
@@ -103,7 +117,7 @@ func run() int {
 			printHelp()
 			return 0
 		default:
-			fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
+			fmt.Fprintf(os.Stderr, "unknown command %q\n", sanitizeOutput(os.Args[1]))
 			return 3
 		}
 	}
@@ -122,7 +136,7 @@ func run() int {
 	flag.Usage = func() { printHelp() }
 	flag.Parse()
 	if args := flag.Args(); len(args) > 0 {
-		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", sanitizeOutput(args[0]))
 		return 3
 	}
 	if *verbose || *debug {
@@ -138,14 +152,14 @@ func run() int {
 			home = h
 		}
 		if err := runInteractiveSetup(home); err != nil {
-			fmt.Fprintln(os.Stderr, "setup:", err)
+			fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
 			return 3
 		}
 		return 0
 	}
 	if *doctorFlag {
-		path := config.ResolveConfigPath(*cfgPath)
-		checks := doctor.Run(path, *verbose)
+		path, managedDir := commandPaths(*cfgPath)
+		checks := doctor.RunForProfile(path, managedDir, *verbose)
 		fmt.Print(doctor.FormatColor(checks))
 		for _, c := range checks {
 			if c.Status == "FAIL" {
@@ -154,10 +168,10 @@ func run() int {
 		}
 		return 0
 	}
-	resolved := config.ResolveConfigPath(*cfgPath)
+	resolved, managedDir := commandPaths(*cfgPath)
 	if *checkFlag {
 		if _, err := config.Load(resolved); err != nil {
-			fmt.Fprintf(os.Stderr, "config check FAIL: %v\n", err)
+			fmt.Fprintf(os.Stderr, "config check FAIL: %s\n", sanitizeError(err))
 			if *verbose {
 				fmt.Fprintf(os.Stderr, "path: %s\n", resolved)
 			}
@@ -168,7 +182,7 @@ func run() int {
 	}
 	cfg, err := config.Load(resolved)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "frostgate:", err)
+		fmt.Fprintln(os.Stderr, "frostgate:", sanitizeError(err))
 		if *verbose {
 			fmt.Fprintf(os.Stderr, "config path: %s\n", resolved)
 		}
@@ -180,15 +194,19 @@ func run() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if *watch {
+		profileID := historyProfileForPaths(resolved, managedDir)
 		if *jsonOut {
-			return watchJSON(ctx, cfg, *interval, *verbose)
+			return watchJSON(ctx, cfg, profileID, *interval, *verbose)
 		}
-		return watchTUI(ctx, cfg, *interval, *verbose)
+		return watchTUI(ctx, cfg, profileID, *interval, *verbose)
 	}
 	res := probe.Run(ctx, cfg)
-	rec := newRecorder(cfg)
+	profileID := historyProfileForPaths(resolved, managedDir)
+	rec := newRecorder(cfg, profileID)
 	defer rec.Close()
-	_ = rec.Record(history.FromProbeResults(res, nil, ""))
+	if err := rec.Record(history.FromProbeResults(res, nil, "", profileID)); err != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+	}
 	emit(res, *jsonOut, *verbose)
 	return exitCode(res)
 }
@@ -251,7 +269,7 @@ func handleAdd(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate add <link> [--name name] [--config path]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
@@ -268,7 +286,7 @@ func handleAdd(args []string) int {
 	}
 	cfgPath2, dir := commandPaths(cfgPath)
 	if err := setup.EnsureConfigDir(dir); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	tag := strings.TrimSpace(nameFlag)
@@ -341,7 +359,7 @@ func handleImport(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate import <subscription-url> [--allow-insecure-http] [--config path]")
 			return 0
 		} else if strings.HasPrefix(a, "-") {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
@@ -362,7 +380,7 @@ func handleImport(args []string) int {
 	if len(res.Links) == 0 {
 		fmt.Fprintln(os.Stderr, "no usable routes found")
 		for _, s := range res.Skipped {
-			fmt.Fprintf(os.Stderr, "skip: %s\n", s.Reason)
+			fmt.Fprintf(os.Stderr, "skip: %s\n", sanitizeOutput(s.Reason))
 		}
 		return 3
 	}
@@ -445,7 +463,7 @@ func handleImport(args []string) int {
 	if len(res.Skipped) > 0 {
 		fmt.Println("\nSkipped:")
 		for _, s := range res.Skipped {
-			fmt.Printf("- %s\n", s.Reason)
+			fmt.Printf("- %s\n", sanitizeOutput(s.Reason))
 		}
 	}
 	cfg, err := config.Load(cfgPath2)
@@ -482,7 +500,7 @@ func handleTest(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate test <link> [--json]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
@@ -684,17 +702,17 @@ func handleBenchmark(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate benchmark [--network label] [--no-speed] [--json] [--config path]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
 		}
 	}
 	_ = positionals
-	cfgFile, _ := commandPaths(cfgPath)
+	cfgFile, managedDir := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	bytesPerRoute := cfg.Benchmark.DownloadBytes
@@ -743,7 +761,7 @@ func handleBenchmark(args []string) int {
 	var bres []benchRes
 	downloads := map[string]float64{}
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	proxyAddr, proxyUnavailableReason := benchmarkProxyAddr(cfg, filepath.Dir(cfgFile))
+	proxyAddr, proxyUnavailableReason := benchmarkProxyAddr(cfg, cfgFile, managedDir)
 	proxyConfigured := proxyAddr != ""
 	if !noSpeed {
 		measure := benchmark.MeasureSOCKSMbps
@@ -795,7 +813,11 @@ func handleBenchmark(args []string) int {
 			}
 			// Attributed measurement: captures the selector, switches per
 			// route, and restores it on success/error/cancellation.
-			tp := benchmark.BenchRoutes(ctx, client, "frostgate-selector", proxyAddr, downloadURL, bytesPerRoute, routes, measure)
+			tp, benchErr := benchmark.BenchRoutesChecked(ctx, client, "frostgate-selector", proxyAddr, downloadURL, bytesPerRoute, routes, measure)
+			if benchErr != nil {
+				invalidateBenchmarkThroughput(tp, benchErr)
+				fmt.Fprintf(os.Stderr, "benchmark: %s\n", sanitizeError(benchErr))
+			}
 			tpByName := map[string]benchmark.RouteThroughput{}
 			for _, t := range tp {
 				name := outboundToName[t.Route]
@@ -811,6 +833,8 @@ func handleBenchmark(args []string) int {
 				if t, ok := tpByName[r.Endpoint.Name]; ok {
 					br.Download = t.DownloadMbps
 					br.DownloadNA = t.NAReason
+				} else if benchErr != nil && r.Status != "down" {
+					br.DownloadNA = "selector state unavailable"
 				}
 				downloads[r.Endpoint.Name] = br.Download
 				bres = append(bres, br)
@@ -822,10 +846,13 @@ func handleBenchmark(args []string) int {
 		}
 	}
 	// History via the central recorder (honors enabled/retention/watch_interval).
-	recCfg := newRecorder(cfg)
+	profileID := historyProfileForPaths(cfgFile, managedDir)
+	recCfg := newRecorder(cfg, profileID)
 	defer recCfg.Close()
 	if recCfg.Enabled() {
-		_ = recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel))
+		if err := recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel, profileID)); err != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+		}
 	}
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -856,7 +883,7 @@ func handleBenchmark(args []string) int {
 		}
 		fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", br.Result.Endpoint.Name, status, loss, median, jitter, down)
 	}
-	rec := recommendFromResults(cfg, results, func(name string) float64 { return downloads[name] })
+	rec := recommendFromResultsWithDownloads(cfg, results, func(name string) float64 { return downloads[name] }, cfgFile, managedDir)
 	if rec.BestOverall.Name != "" {
 		fmt.Printf("\nBest proxy: %s\n", rec.BestOverall.Name)
 		if why := compactReasons(rec.Reasons); why != "" {
@@ -871,11 +898,34 @@ func handleBenchmark(args []string) int {
 	return exitCode(results)
 }
 
+// invalidateBenchmarkThroughput prevents a selector lifecycle failure from
+// being shown as an attributed throughput result.
+func invalidateBenchmarkThroughput(results []benchmark.RouteThroughput, err error) {
+	reason := "attributed benchmark failed"
+	if strings.Contains(err.Error(), "restore selector") {
+		reason = "selector restoration failed"
+	} else if strings.Contains(err.Error(), "capture selector") {
+		reason = "selector state unavailable"
+	}
+	for i := range results {
+		results[i].DownloadMbps = 0
+		results[i].NAReason = reason
+	}
+}
+
 func compactReasons(reasons []string) string {
 	return strings.Join(reasons, " - ")
 }
 
-func benchmarkProxyAddr(cfg *config.Config, dir string) (string, string) {
+func benchmarkProxyAddr(cfg *config.Config, configPath, managedDir string) (string, string) {
+	return benchmarkProxyAddrWithRunner(cfg, configPath, managedDir, nil)
+}
+
+func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir string, runner *managedconfig.SidecarRunner) (string, string) {
+	dir := managedDir
+	if dir == "" {
+		dir = filepath.Dir(configPath)
+	}
 	if addr := cfg.BenchmarkProxyAddr(); addr != "" {
 		return addr, ""
 	}
@@ -890,19 +940,20 @@ func benchmarkProxyAddr(cfg *config.Config, dir string) (string, string) {
 			outbounds = append(outbounds, ep.Outbound)
 		}
 	}
-	addr, _, err := managedconfig.EnsureBenchmarkProxy(
-		dir,
-		cfg.SingBox.Controller,
-		outbounds,
-		managedconfig.DefaultSidecarRunner(cfg.SingBox.Controller, cfg.SingBox.Secret),
-	)
-	if err != nil {
+	mg, err := managedconfig.Load(dir)
+	if err != nil || !mg.IsLegacyManagedBenchmarkConfig(cfg.SingBox.Controller, outbounds) {
+		return "", "benchmark_proxy not configured"
+	}
+	// Legacy migration shares the normal managed-route transaction so an
+	// explicit profile gets matching config bindings and service lifecycle.
+	mg.AdoptLegacyRoutes()
+	if err := commitManagedRoutes(mg, configPath, nil, runner); err != nil {
 		return "", "managed benchmark migration failed"
 	}
-	if addr != "" {
+	if addr, ok := managedconfig.DiscoverBenchmarkProxy(dir); ok {
 		return addr, ""
 	}
-	return "", "benchmark_proxy not configured"
+	return "", "managed benchmark migration failed"
 }
 
 func fmtDuration(d time.Duration) string {
@@ -933,7 +984,7 @@ func handleDiagnose(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate diagnose [route] [--json] [--config path]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
@@ -943,11 +994,12 @@ func handleDiagnose(args []string) int {
 	cfgFile, dir := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	var layers []diagnose.Layer
 	opts := diagnose.Options{}
+	opts.SidecarService = profileForPaths(cfgFile, dir).Service
 	if mg, err := managedconfig.Load(dir); err == nil {
 		opts.Managed = mg
 	}
@@ -1029,7 +1081,7 @@ func handleNetworkCheck(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate network-check [--json] [--config path]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		}
 	}
@@ -1047,7 +1099,7 @@ func handleNetworkCheck(args []string) int {
 	if loaded, err := config.Load(resolvedConfig); err == nil {
 		cfg = loaded
 	} else if cfgPath != "" {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	if cfg != nil && len(cfg.NetworkCheck.Destinations) > 0 {
@@ -1097,7 +1149,7 @@ func handleNetworkCheck(args []string) int {
 	recommended := ""
 	if cfg != nil {
 		results := probeRunQuick(cfg)
-		rec := recommendFromResults(cfg, results)
+		rec := recommendFromResults(cfg, results, resolvedConfig, managedDir)
 		if rec.BestOverall.Name != "" {
 			recommended = rec.BestOverall.Name
 		}
@@ -1294,17 +1346,30 @@ func compareBestProxy(summaries []history.Summary) (string, string) {
 
 func handleCompare(args []string) int {
 	jsonOut := false
-	for _, a := range args {
-		if a == "--json" {
+	cfgPath := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--json":
 			jsonOut = true
-		} else if a == "-h" || a == "--help" {
-			fmt.Fprintln(os.Stderr, "usage: frostgate compare [--json]")
+		case a == "--config" && i+1 < len(args):
+			cfgPath = args[i+1]
+			i++
+		case strings.HasPrefix(a, "--config="):
+			cfgPath = strings.TrimPrefix(a, "--config=")
+		case a == "-h" || a == "--help":
+			fmt.Fprintln(os.Stderr, "usage: frostgate compare [--json] [--config path]")
 			return 0
-		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+		case len(a) > 0 && a[0] == '-':
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
+			return 3
+		default:
+			fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(a))
 			return 3
 		}
 	}
+	configFile, managedDir := commandPaths(cfgPath)
+	profileID := historyProfileForPaths(configFile, managedDir)
 	db, err := history.OpenReadonly()
 	if err != nil {
 		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
@@ -1317,7 +1382,7 @@ func handleCompare(args []string) int {
 		return 0
 	}
 	defer db.Close()
-	records, _ := db.Query(30*24*time.Hour, "", "")
+	records, _ := db.QueryProfile(30*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
 	netSet := map[string]bool{}
 	for _, r := range records {
 		if r.Network != "" {
@@ -1342,7 +1407,7 @@ func handleCompare(args []string) int {
 
 	out := make([]compareNetwork, 0, len(networks))
 	for _, netw := range networks {
-		recs, _ := db.Query(30*24*time.Hour, "", netw)
+		recs, _ := db.QueryProfile(30*24*time.Hour, "", netw, profileID, profileID == history.DefaultProfile)
 		summ := history.Summarize(recs)
 		sort.Slice(summ, func(i, j int) bool { return summ[i].Route < summ[j].Route })
 		cn := compareNetwork{Network: netw, Routes: make([]compareRoute, 0, len(summ))}
@@ -1435,20 +1500,20 @@ func handleRecommend(args []string) int {
 			fmt.Fprintln(os.Stderr, "usage: frostgate recommend [--json] [--config path]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		}
 	}
-	cfgFile, _ := commandPaths(cfgPath)
+	cfgFile, managedDir := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	results := probe.Run(ctx, cfg)
 	cancel()
-	rec := recommendFromResults(cfg, results)
+	rec := recommendFromResults(cfg, results, cfgFile, managedDir)
 	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(rec)
 		return 0
@@ -1495,6 +1560,7 @@ func handleHistory(args []string) int {
 	route := ""
 	networkLabel := ""
 	jsonOut := false
+	cfgPath := ""
 	var positionals []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -1515,11 +1581,16 @@ func handleHistory(args []string) int {
 			i++
 		} else if strings.HasPrefix(a, "--network=") {
 			networkLabel = strings.TrimPrefix(a, "--network=")
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
+		} else if strings.HasPrefix(a, "--config=") {
+			cfgPath = strings.TrimPrefix(a, "--config=")
 		} else if a == "-h" || a == "--help" {
-			fmt.Fprintln(os.Stderr, "usage: frostgate history [--since duration] [--route name] [--network label] [--json]")
+			fmt.Fprintln(os.Stderr, "usage: frostgate history [--since duration] [--route name] [--network label] [--config path] [--json]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
+			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
 		} else {
 			positionals = append(positionals, a)
@@ -1541,9 +1612,11 @@ func handleHistory(args []string) int {
 		return 0
 	}
 	defer db.Close()
-	records, err := db.Query(since, route, networkLabel)
+	configFile, managedDir := commandPaths(cfgPath)
+	profileID := historyProfileForPaths(configFile, managedDir)
+	records, err := db.QueryProfile(since, route, networkLabel, profileID, profileID == history.DefaultProfile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	if jsonOut {
@@ -1600,9 +1673,12 @@ func parseSince(s string) (time.Duration, error) {
 }
 
 // --- helpers ---
-func newRecorder(cfg *config.Config) *history.Recorder {
+func newRecorder(cfg *config.Config, profileID string) *history.Recorder {
 	enabled := cfg.History.Enabled == nil || *cfg.History.Enabled
-	return history.NewRecorder(enabled, cfg.History.Retention.Duration, cfg.History.WatchInterval.Duration)
+	if profileID == "" {
+		profileID = history.DefaultProfile
+	}
+	return history.NewRecorderForProfile(enabled, cfg.History.Retention.Duration, cfg.History.WatchInterval.Duration, profileID)
 }
 
 func probeRunQuick(cfg *config.Config) []probe.Result {
@@ -1613,7 +1689,11 @@ func probeRunQuick(cfg *config.Config) []probe.Result {
 
 // recommendFromResults builds recommend inputs from probe results and
 // enriches them with per-route history evidence when history is enabled.
-func recommendFromResults(cfg *config.Config, results []probe.Result, downloadFor ...func(string) float64) recommend.Result {
+func recommendFromResults(cfg *config.Config, results []probe.Result, configPath string, managedDir ...string) recommend.Result {
+	return recommendFromResultsWithDownloads(cfg, results, nil, configPath, managedDir...)
+}
+
+func recommendFromResultsWithDownloads(cfg *config.Config, results []probe.Result, downloadFor func(string) float64, configPath string, managedDir ...string) recommend.Result {
 	var inputs []recommend.Input
 	for _, r := range results {
 		if r.Endpoint.Type != config.ProbeSingBox {
@@ -1627,16 +1707,20 @@ func recommendFromResults(cfg *config.Config, results []probe.Result, downloadFo
 			Jitter:   r.Metrics.Jitter,
 			Priority: r.Endpoint.Priority,
 		}
-		if len(downloadFor) > 0 && downloadFor[0] != nil {
-			in.Download = downloadFor[0](r.Endpoint.Name)
+		if downloadFor != nil {
+			in.Download = downloadFor(r.Endpoint.Name)
 		}
 		inputs = append(inputs, in)
 	}
-	rec := newRecorder(cfg)
+	profileID := historyProfileForConfig(configPath)
+	if len(managedDir) > 0 {
+		profileID = historyProfileForPaths(configPath, managedDir[0])
+	}
+	rec := newRecorder(cfg, profileID)
 	if rec.Enabled() {
 		if db, err := history.OpenReadonly(); err == nil {
 			defer db.Close()
-			recs, _ := db.Query(7*24*time.Hour, "", "")
+			recs, _ := db.QueryProfile(7*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
 			summaries := history.Summarize(recs)
 			for i := range inputs {
 				for _, s := range summaries {
@@ -1658,7 +1742,7 @@ func recommendFromResults(cfg *config.Config, results []probe.Result, downloadFo
 func emit(results []probe.Result, asJSON bool, verbose bool) {
 	if asJSON {
 		if err := report.JSON(os.Stdout, results); err != nil {
-			fmt.Fprintln(os.Stderr, "frostgate:", err)
+			fmt.Fprintln(os.Stderr, "frostgate:", sanitizeError(err))
 		}
 		return
 	}
@@ -1666,16 +1750,16 @@ func emit(results []probe.Result, asJSON bool, verbose bool) {
 	if verbose {
 		for _, r := range results {
 			if r.Err != nil {
-				fmt.Fprintf(os.Stderr, "debug %s: %v (category=%s)\n", r.Endpoint.Name, r.Err, r.Category)
+				fmt.Fprintf(os.Stderr, "debug %s: %s (category=%s)\n", r.Endpoint.Name, sanitizeError(r.Err), r.Category)
 			}
 		}
 	}
 }
 
-func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, verbose bool) int {
+func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) int {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	rec := newRecorder(cfg)
+	rec := newRecorder(cfg, profileID)
 	defer rec.Close()
 	for {
 		select {
@@ -1684,12 +1768,12 @@ func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, 
 		default:
 		}
 		results := probe.Run(ctx, cfg)
-		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "")); err != nil && verbose {
-			fmt.Fprintf(os.Stderr, "history: %v\n", err)
+		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
+			fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
 		}
 		line, err := report.NDJSONLine(results)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "json encode:", err)
+			fmt.Fprintln(os.Stderr, "json encode:", sanitizeError(err))
 		} else {
 			fmt.Println(string(line))
 		}
@@ -1708,8 +1792,8 @@ func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, 
 	}
 }
 
-func watchTUI(ctx context.Context, cfg *config.Config, interval time.Duration, verbose bool) int {
-	rec := newRecorder(cfg)
+func watchTUI(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) int {
+	rec := newRecorder(cfg, profileID)
 	defer rec.Close()
 	observer := func(results []probe.Result) {
 		if len(results) == 0 {
@@ -1717,8 +1801,8 @@ func watchTUI(ctx context.Context, cfg *config.Config, interval time.Duration, v
 		}
 		// Throttling (watch_interval) is owned by the recorder; manual
 		// refreshes cannot flood the history DB.
-		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "")); err != nil && verbose {
-			fmt.Fprintf(os.Stderr, "history: %v\n", err)
+		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
+			fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
 		}
 	}
 	m := tui.New(cfg, interval, verbose, observer)
@@ -1727,7 +1811,7 @@ func watchTUI(ctx context.Context, cfg *config.Config, interval time.Duration, v
 		if strings.Contains(err.Error(), "context canceled") {
 			return 0
 		}
-		fmt.Fprintln(os.Stderr, "tui:", err)
+		fmt.Fprintln(os.Stderr, "tui:", sanitizeError(err))
 		return 3
 	}
 	return 0

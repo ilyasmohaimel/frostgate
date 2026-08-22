@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,15 +31,15 @@ const (
 // configuration. It parses the on-disk sing-box.json into structured routes,
 // preserving Frostgate-managed structural fields and any extra user outbounds.
 type Managed struct {
-	Dir      string
-	Secret   string
-	VLESS    []*setup.VLESSOutbound
-	Hysteria []*setup.Hysteria2Outbound
+	Dir            string
+	Secret         string
+	ControllerAddr string
+	BenchmarkAddr  string
+	VLESS          []*setup.VLESSOutbound
+	Hysteria       []*setup.Hysteria2Outbound
 	// Raw preserves top-level sing-box keys not managed by Frostgate.
-	Raw map[string]any
-	// extraOutbounds preserves user-defined outbounds that Frostgate does
-	// not manage (anything other than direct/block/proxy/selector).
-	extraOutbounds []map[string]any
+	Raw         map[string]any
+	managedTags map[string]bool
 }
 
 // SidecarRunner abstracts the systemd sidecar lifecycle so it can be tested
@@ -46,6 +49,7 @@ type SidecarRunner struct {
 	// validity is checked. The default runner wires this to `sing-box check`.
 	Validator        func(candidate []byte) error
 	DaemonReload     func() error
+	Enable           func() error
 	Restart          func() error
 	IsActive         func() (bool, error)
 	ControllerReady  func(expectedOutbounds []string) (bool, error)
@@ -56,6 +60,15 @@ type SidecarRunner struct {
 // DefaultSidecarRunner shells out to systemctl for the user session and
 // verifies the controller is reachable with the expected outbounds.
 func DefaultSidecarRunner(controllerAddr, secret string) *SidecarRunner {
+	return DefaultSidecarRunnerForService(controllerAddr, secret, "frostgate-singbox.service")
+}
+
+// DefaultSidecarRunnerForService scopes lifecycle operations to one managed
+// profile. Custom profiles must never restart the default sidecar unit.
+func DefaultSidecarRunnerForService(controllerAddr, secret, service string) *SidecarRunner {
+	if service == "" {
+		service = "frostgate-singbox.service"
+	}
 	return &SidecarRunner{
 		controllerAddr:   controllerAddr,
 		controllerSecret: secret,
@@ -63,11 +76,14 @@ func DefaultSidecarRunner(controllerAddr, secret string) *SidecarRunner {
 		DaemonReload: func() error {
 			return runCmd("systemctl", "--user", "daemon-reload")
 		},
+		Enable: func() error {
+			return runCmd("systemctl", "--user", "enable", service)
+		},
 		Restart: func() error {
-			return runCmd("systemctl", "--user", "restart", "frostgate-singbox.service")
+			return runCmd("systemctl", "--user", "restart", service)
 		},
 		IsActive: func() (bool, error) {
-			out, err := outputCmd("systemctl", "--user", "is-active", "frostgate-singbox.service")
+			out, err := outputCmd("systemctl", "--user", "is-active", service)
 			if err != nil {
 				return false, err
 			}
@@ -154,7 +170,7 @@ func lookPath(name string) (string, error) {
 }
 
 func Load(dir string) (*Managed, error) {
-	m := &Managed{Dir: dir, Raw: map[string]any{}}
+	m := &Managed{Dir: dir, Raw: map[string]any{}, managedTags: map[string]bool{}}
 	if data, err := os.ReadFile(filepath.Join(dir, "controller-secret")); err == nil {
 		m.Secret = strings.TrimSpace(string(data))
 	}
@@ -170,11 +186,25 @@ func Load(dir string) (*Managed, error) {
 		return nil, err
 	}
 	m.Raw = raw
+	if m.Secret == "" {
+		experimental, _ := raw["experimental"].(map[string]any)
+		clash, _ := experimental["clash_api"].(map[string]any)
+		m.Secret = inboundString(clash, "secret")
+	}
 	m.parseOutbounds(raw)
 	return m, nil
 }
 
 func (m *Managed) parseOutbounds(raw map[string]any) {
+	for _, ob := range rawOutbounds(raw) {
+		mm, ok := ob.(map[string]any)
+		if !ok || inboundString(mm, "tag") != selectorTag {
+			continue
+		}
+		for _, tag := range stringSlice(mm["outbounds"]) {
+			m.managedTags[tag] = true
+		}
+	}
 	outs, _ := raw["outbounds"].([]any)
 	for _, ob := range outs {
 		mm, ok := ob.(map[string]any)
@@ -185,14 +215,13 @@ func (m *Managed) parseOutbounds(raw map[string]any) {
 		tag, _ := mm["tag"].(string)
 		switch t {
 		case "vless":
-			m.VLESS = append(m.VLESS, parseVLESS(mm, tag))
-		case "hysteria2":
-			m.Hysteria = append(m.Hysteria, parseHysteria(mm, tag))
-		default:
-			if tag == directTag || tag == blockTag || tag == selectorTag || tag == mixedTag {
-				continue
+			if m.managedTags[tag] {
+				m.VLESS = append(m.VLESS, parseVLESS(mm, tag))
 			}
-			m.extraOutbounds = append(m.extraOutbounds, mm)
+		case "hysteria2":
+			if m.managedTags[tag] {
+				m.Hysteria = append(m.Hysteria, parseHysteria(mm, tag))
+			}
 		}
 	}
 }
@@ -240,8 +269,36 @@ func parseHysteria(mm map[string]any, tag string) *setup.Hysteria2Outbound {
 	return h
 }
 
-// Generate rebuilds the canonical Frostgate sing-box.json preserving extra
-// user outbounds and non-managed top-level keys.
+// ConfigureProfile supplies bindings for a new Frostgate-managed sidecar. An
+// existing owned sidecar keeps its recorded bindings during regeneration.
+func (m *Managed) ConfigureProfile(controllerAddr, benchmarkAddr string) {
+	m.ControllerAddr = controllerHostPort(controllerAddr)
+	m.BenchmarkAddr = benchmarkAddr
+}
+
+func (m *Managed) HasManagedSidecar() bool {
+	return len(m.managedTags) > 0 || m.BenchmarkProxyPresent() || hasSelector(m.Raw)
+}
+
+// UsesProfileBindings reports whether an existing managed sidecar already
+// owns the supplied controller and benchmark listener. A running custom
+// profile must be updated in place rather than rejected because its own ports
+// are occupied.
+func (m *Managed) UsesProfileBindings(controller, benchmark string) bool {
+	if !sameController(m.clashController(), controller) {
+		return false
+	}
+	addr, ok := m.BenchmarkProxy()
+	return ok && addr == benchmark
+}
+
+func (m *Managed) BenchmarkProxyPresent() bool {
+	_, ok := m.BenchmarkProxy()
+	return ok
+}
+
+// Generate mutates only Frostgate-owned objects. Unrelated top-level keys,
+// inbounds, route rules, log settings and protocol outbounds survive intact.
 func (m *Managed) Generate() ([]byte, error) {
 	secret := m.Secret
 	if secret == "" {
@@ -252,69 +309,230 @@ func (m *Managed) Generate() ([]byte, error) {
 		secret = s
 		m.Secret = secret
 	}
+	top := cloneRaw(m.Raw)
 	hasProxy := len(m.VLESS)+len(m.Hysteria) > 0
-	outbounds := []any{
-		map[string]any{"type": "direct", "tag": directTag},
-		map[string]any{"type": "block", "tag": blockTag},
+	tags := m.ProxyTags()
+	updated := map[string]map[string]any{}
+	for _, v := range m.VLESS {
+		updated[v.Tag] = vlessMap(v)
 	}
-	if hasProxy {
-		var tags []string
-		for _, v := range m.VLESS {
-			tags = append(tags, v.Tag)
-			outbounds = append(outbounds, vlessMap(v))
-		}
-		for _, h := range m.Hysteria {
-			tags = append(tags, h.Tag)
-			outbounds = append(outbounds, hysteriaMap(h))
-		}
-		selector := map[string]any{
-			"type":      "selector",
-			"tag":       selectorTag,
-			"outbounds": tags,
-		}
-		if len(tags) > 0 {
-			selector["default"] = tags[0]
-		}
-		outbounds = append(outbounds, selector)
-	}
-	for _, eo := range m.extraOutbounds {
-		outbounds = append(outbounds, eo)
+	for _, h := range m.Hysteria {
+		updated[h.Tag] = hysteriaMap(h)
 	}
 
-	top := map[string]any{}
-	for k, v := range m.Raw {
-		top[k] = v
-	}
-	top["outbounds"] = outbounds
-	if hasProxy {
-		top["inbounds"] = []any{
-			map[string]any{
-				"type":        "mixed",
-				"tag":         mixedTag,
-				"listen":      "127.0.0.1",
-				"listen_port": 2080,
-			},
-		}
-		top["route"] = map[string]any{
-			"rules": []any{
-				map[string]any{"inbound": mixedTag, "outbound": selectorTag},
-			},
-			"final": directTag,
-		}
-	}
-	log := map[string]any{"level": "warn", "output": filepath.Join(m.Dir, "sing-box.log")}
-	top["log"] = log
-	cfg := map[string]any{}
-	for k, v := range m.Raw {
-		if k == "outbounds" || k == "inbounds" || k == "route" || k == "log" {
+	outs := rawOutbounds(top)
+	seen := map[string]bool{}
+	selectorIndex := -1
+	directSeen, blockSeen := false, false
+	for i, raw := range outs {
+		mm, ok := raw.(map[string]any)
+		if !ok {
 			continue
 		}
-		cfg[k] = v
+		tag := inboundString(mm, "tag")
+		if tag == directTag {
+			directSeen = true
+		}
+		if tag == blockTag {
+			blockSeen = true
+		}
+		if tag == selectorTag {
+			selectorIndex = i
+		}
+		if replacement, owned := updated[tag]; owned {
+			outs[i] = replacement
+			seen[tag] = true
+		}
 	}
-	for k, v := range top {
-		cfg[k] = v
+	for _, tag := range tags {
+		if !seen[tag] {
+			outs = append(outs, updated[tag])
+		}
 	}
-	return json.MarshalIndent(cfg, "", "  ")
+	if hasProxy {
+		if !directSeen {
+			outs = append([]any{map[string]any{"type": "direct", "tag": directTag}}, outs...)
+			if selectorIndex >= 0 {
+				selectorIndex++
+			}
+		}
+		if !blockSeen {
+			outs = append([]any{map[string]any{"type": "block", "tag": blockTag}}, outs...)
+			if selectorIndex >= 0 {
+				selectorIndex++
+			}
+		}
+		selector := map[string]any{"type": "selector", "tag": selectorTag}
+		if selectorIndex >= 0 {
+			if existing, ok := outs[selectorIndex].(map[string]any); ok {
+				selector = existing
+			}
+		} else {
+			selectorIndex = len(outs)
+			outs = append(outs, selector)
+		}
+		selector["outbounds"] = stringsToAny(tags)
+		if current := inboundString(selector, "default"); !containsString(tags, current) {
+			selector["default"] = tags[0]
+		}
+		outs[selectorIndex] = selector
+	}
+	top["outbounds"] = outs
+	if hasProxy {
+		m.ensureOwnedInfrastructure(top)
+	}
+	if _, ok := top["log"]; !ok {
+		top["log"] = map[string]any{"level": "warn", "output": filepath.Join(m.Dir, "sing-box.log")}
+	}
+	return json.MarshalIndent(top, "", "  ")
+}
+
+func (m *Managed) ensureOwnedInfrastructure(top map[string]any) {
+	controller := m.ControllerAddr
+	if controller == "" {
+		controller = "127.0.0.1:9090"
+	}
+	benchmark := m.BenchmarkAddr
+	if benchmark == "" {
+		if addr, ok := m.BenchmarkProxy(); ok {
+			benchmark = addr
+		} else {
+			benchmark = "127.0.0.1:2080"
+		}
+	}
+	host, portStr, err := net.SplitHostPort(benchmark)
+	if err != nil {
+		host, portStr = "127.0.0.1", "2080"
+	}
+	port, _ := strconv.Atoi(portStr)
+	inbounds, _ := top["inbounds"].([]any)
+	foundInbound := false
+	for i, raw := range inbounds {
+		inbound, ok := raw.(map[string]any)
+		if !ok || inboundString(inbound, "tag") != mixedTag {
+			continue
+		}
+		foundInbound = true
+		inbounds[i] = inbound
+	}
+	if !foundInbound {
+		inbounds = append(inbounds, map[string]any{"type": "mixed", "tag": mixedTag, "listen": host, "listen_port": port})
+	} else if m.BenchmarkAddr != "" {
+		for i, raw := range inbounds {
+			inbound, ok := raw.(map[string]any)
+			if !ok || inboundString(inbound, "tag") != mixedTag {
+				continue
+			}
+			inbound["listen"] = host
+			inbound["listen_port"] = port
+			inbounds[i] = inbound
+		}
+	}
+	top["inbounds"] = inbounds
+
+	route, _ := top["route"].(map[string]any)
+	if route == nil {
+		route = map[string]any{"final": directTag}
+	}
+	rules, _ := route["rules"].([]any)
+	foundRule := false
+	for i, raw := range rules {
+		rule, ok := raw.(map[string]any)
+		if ok && inboundString(rule, "inbound") == mixedTag {
+			rule["outbound"] = selectorTag
+			rules[i] = rule
+			foundRule = true
+		}
+	}
+	if !foundRule {
+		rules = append(rules, map[string]any{"inbound": mixedTag, "outbound": selectorTag})
+	}
+	route["rules"] = rules
+	top["route"] = route
+
+	experimental, _ := top["experimental"].(map[string]any)
+	if experimental == nil {
+		experimental = map[string]any{}
+	}
+	clash, _ := experimental["clash_api"].(map[string]any)
+	if clash == nil {
+		clash = map[string]any{}
+	}
+	if m.ControllerAddr != "" || inboundString(clash, "external_controller") == "" {
+		clash["external_controller"] = controller
+	}
+	if inboundString(clash, "secret") == "" {
+		clash["secret"] = m.Secret
+	}
+	experimental["clash_api"] = clash
+	if _, ok := experimental["cache_file"]; !ok {
+		experimental["cache_file"] = map[string]any{"enabled": true, "path": filepath.Join(m.Dir, "cache.db")}
+	}
+	top["experimental"] = experimental
+}
+
+func rawOutbounds(top map[string]any) []any {
+	outs, _ := top["outbounds"].([]any)
+	return append([]any(nil), outs...)
+}
+
+func stringSlice(raw any) []string {
+	items, _ := raw.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func stringsToAny(items []string) []any {
+	out := make([]any, len(items))
+	for i := range items {
+		out[i] = items[i]
+	}
+	return out
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSelector(top map[string]any) bool {
+	for _, raw := range rawOutbounds(top) {
+		if outbound, ok := raw.(map[string]any); ok && inboundString(outbound, "tag") == selectorTag {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneRaw(raw map[string]any) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	data, _ := json.Marshal(raw)
+	var out map[string]any
+	if json.Unmarshal(data, &out) != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func controllerHostPort(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
 }
 
 func vlessMap(v *setup.VLESSOutbound) map[string]any {
@@ -519,6 +737,11 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 					err = fmt.Errorf("expected outbounds unavailable")
 				}
 				return rollback(fmt.Errorf("controller verification failed: %w", err))
+			}
+		}
+		if runner.Enable != nil {
+			if err := runner.Enable(); err != nil {
+				return rollback(fmt.Errorf("sidecar enable failed: %w", err))
 			}
 		}
 	}

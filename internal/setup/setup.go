@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/routename"
 )
 
@@ -323,14 +324,14 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 			continue
 		}
 		if err := routename.Validate(tag); err != nil {
-			fmt.Printf("Invalid route name: %v\n", err)
+			fmt.Printf("Invalid route name: %s\n", redact.Error(err))
 			continue
 		}
 		linkLower := strings.ToLower(strings.TrimSpace(link))
 		if strings.HasPrefix(linkLower, "vless://") {
 			v, err := ParseVLESSShareLink(link, tag)
 			if err != nil {
-				fmt.Printf("Failed to parse VLESS: %v (redacted: %s)\n", err, RedactURL(link))
+				fmt.Printf("Failed to parse VLESS: %s (redacted: %s)\n", redact.Error(err), RedactURL(link))
 				continue
 			}
 			vlessOut = append(vlessOut, v)
@@ -338,7 +339,7 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 		} else if strings.HasPrefix(linkLower, "hysteria2://") || strings.HasPrefix(linkLower, "hy2://") {
 			h, err := ParseHysteria2ShareLink(link, tag)
 			if err != nil {
-				fmt.Printf("Failed to parse Hysteria2: %v (redacted: %s)\n", err, RedactURL(link))
+				fmt.Printf("Failed to parse Hysteria2: %s (redacted: %s)\n", redact.Error(err), RedactURL(link))
 				continue
 			}
 			hystOut = append(hystOut, h)
@@ -405,7 +406,7 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	if singBoxPath != "" {
 		cmd := exec.Command(singBoxPath, "check", "-c", singBoxConfigPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("sing-box check failed: %s\n", string(out))
+			fmt.Printf("sing-box check failed: %s\n", redact.String(string(out)))
 			return fmt.Errorf("sing-box check failed")
 		}
 		fmt.Println("sing-box check passed")
@@ -444,7 +445,7 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 		offer := prompt(opts.Stdin, "Install systemd user service for sing-box sidecar? [Y/n]: ")
 		if !isNo(offer) {
 			if err := installSystemdService(dir, singBoxPath); err != nil {
-				fmt.Printf("Failed to install service: %v\n", err)
+				fmt.Printf("Failed to install service: %s\n", redact.Error(err))
 			} else {
 				fmt.Println("systemd service installed and started")
 			}
@@ -454,7 +455,7 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	// Validate
 	fmt.Println("\nValidating...")
 	if err := runValidation(dir, singBoxPath); err != nil {
-		fmt.Printf("Validation failed: %v\n", err)
+		fmt.Printf("Validation failed: %s\n", redact.Error(err))
 		return err
 	}
 
@@ -597,7 +598,7 @@ func runValidation(dir string, knownSingBoxPath ...string) error {
 		if _, err := os.Stat(singBoxPath); err == nil {
 			cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
 			if out, err := cmd.CombinedOutput(); err != nil {
-				fmt.Printf("sing-box check failed: %s\n", string(out))
+				fmt.Printf("sing-box check failed: %s\n", redact.String(string(out)))
 				return err
 			}
 		}
@@ -605,7 +606,7 @@ func runValidation(dir string, knownSingBoxPath ...string) error {
 	fgPath := filepath.Join(dir, "config.yaml")
 	cfg, err := config.Load(fgPath)
 	if err != nil {
-		fmt.Printf("config check failed: %v\n", err)
+		fmt.Printf("config check failed: %s\n", redact.Error(err))
 		return err
 	}
 	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))

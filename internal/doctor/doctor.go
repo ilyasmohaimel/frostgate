@@ -13,7 +13,9 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
 
@@ -24,10 +26,20 @@ type Check struct {
 }
 
 func Run(cfgPath string, verbose bool) []Check {
+	resolved := config.ResolveConfigPath(cfgPath)
+	return RunForProfile(resolved, filepath.Dir(resolved), verbose)
+}
+
+// RunForProfile checks a resolved Frostgate config with its associated managed
+// directory. The two differ for the implicit local frostgate.yaml fallback.
+func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 	var out []Check
 
 	// Config path
 	resolved := config.ResolveConfigPath(cfgPath)
+	if managedDir == "" {
+		managedDir = filepath.Dir(resolved)
+	}
 	out = append(out, Check{Name: "Config path", Status: "PASS", Detail: resolved})
 	if _, err := os.Stat(resolved); err != nil {
 		out = append(out, Check{Name: "Config file", Status: "FAIL", Detail: redact.Error(err)})
@@ -36,7 +48,6 @@ func Run(cfgPath string, verbose bool) []Check {
 	out = append(out, Check{Name: "Config file", Status: "PASS", Detail: "exists"})
 
 	out = append(out, privateFileCheck("Config permissions", resolved))
-	managedDir := filepath.Dir(resolved)
 	for _, file := range []struct{ name, path string }{
 		{"Controller secret permissions", filepath.Join(managedDir, "controller-secret")},
 		{"Managed config permissions", filepath.Join(managedDir, "sing-box.json")},
@@ -70,7 +81,7 @@ func Run(cfgPath string, verbose bool) []Check {
 	}
 	if hasSBEndpoints {
 		if cfg.SingBox.BenchmarkProxy == "" {
-			if addr, ok := managedBenchmarkProxy(filepath.Dir(resolved), cfg); ok {
+			if addr, ok := managedBenchmarkProxy(managedDir); ok {
 				out = append(out, Check{Name: "Benchmark proxy", Status: "PASS", Detail: fmt.Sprintf("managed listener %s", addr)})
 			} else {
 				out = append(out, Check{Name: "Benchmark proxy", Status: "WARN", Detail: "singbox.benchmark_proxy not configured; proxy downloads will report N/A"})
@@ -155,12 +166,15 @@ func Run(cfgPath string, verbose bool) []Check {
 		} else {
 			out = append(out, Check{Name: "Controller", Status: "SKIP", Detail: "no singbox endpoints"})
 		}
-		// The setup-generated service lives beside the active XDG config home.
-		servicePath := filepath.Join(filepath.Dir(filepath.Dir(resolved)), "systemd", "user", "frostgate-singbox.service")
+		defaultDir := setup.ConfigDir(setup.DefaultHomeDir())
+		managedAbs, _ := filepath.Abs(managedDir)
+		defaultAbs, _ := filepath.Abs(defaultDir)
+		identity := profile.ForPath(resolved, managedAbs != "" && managedAbs == defaultAbs)
+		servicePath := setup.ServiceUnitPath(identity.Service)
 		if _, err := os.Stat(servicePath); err == nil {
-			status := getSystemdStatus("frostgate-singbox.service")
+			status := getSystemdStatus(identity.Service)
 			if strings.Contains(status, "active (running)") {
-				out = append(out, Check{Name: "Sidecar service", Status: "PASS", Detail: "frostgate-singbox active"})
+				out = append(out, Check{Name: "Sidecar service", Status: "PASS", Detail: strings.TrimSuffix(identity.Service, ".service") + " active"})
 			} else if status != "" {
 				out = append(out, Check{Name: "Sidecar service", Status: "WARN", Detail: status})
 			}
@@ -170,7 +184,7 @@ func Run(cfgPath string, verbose bool) []Check {
 	return out
 }
 
-func managedBenchmarkProxy(dir string, cfg *config.Config) (string, bool) {
+func managedBenchmarkProxy(dir string) (string, bool) {
 	return managedconfig.DiscoverBenchmarkProxy(dir)
 }
 

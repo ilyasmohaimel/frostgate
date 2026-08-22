@@ -244,20 +244,12 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
-			if transport, ok := mm["transport"]; ok && !isRawTransport(transport) {
-				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
-				continue
+			transportValue, hasTransport := mm["network"]
+			if !hasTransport {
+				transportValue, hasTransport = mm["transport"]
 			}
-			if network, ok := mm["network"].(string); ok && network != "" && !isRawTransport(network) {
-				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
-				continue
-			}
-			transport, _ := mm["network"].(string)
-			if transport == "" {
-				transport, _ = mm["transport"].(string)
-			}
-			transport = strings.ToLower(transport)
-			if transport != "tcp" && transport != "raw" {
+			transport := rawTransportName(transportValue)
+			if !hasTransport || transport == "" {
 				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
 				continue
 			}
@@ -432,11 +424,12 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
-			if transport, ok := mm["transport"]; ok && !isRawTransport(transport) {
-				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
-				continue
+			transportValue, hasTransport := mm["transport"]
+			if !hasTransport {
+				transportValue, hasTransport = mm["network"]
 			}
-			if network, ok := mm["network"].(string); ok && network != "" && !isRawTransport(network) {
+			transport := rawTransportName(transportValue)
+			if !hasTransport || transport == "" {
 				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
 				continue
 			}
@@ -502,7 +495,7 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 			if packet, _ := mm["packet_encoding"].(string); packet != "" {
 				q.Set("packet_encoding", packet)
 			}
-			q.Set("type", "tcp")
+			q.Set("type", transport)
 			fname := tag
 			if fname == "" {
 				fname = fmt.Sprintf("vless-%d", port)
@@ -569,17 +562,22 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 	return
 }
 
-func isRawTransport(v any) bool {
+func rawTransportName(v any) string {
 	switch transport := v.(type) {
 	case string:
 		transport = strings.ToLower(transport)
-		return transport == "tcp" || transport == "raw"
+		if transport == "tcp" || transport == "raw" {
+			return transport
+		}
 	case map[string]any:
-		kind, _ := transport["type"].(string)
-		return strings.EqualFold(kind, "tcp") || strings.EqualFold(kind, "raw")
-	default:
-		return false
+		if kind, ok := transport["type"].(string); ok {
+			kind = strings.ToLower(kind)
+			if kind == "tcp" || kind == "raw" {
+				return kind
+			}
+		}
 	}
+	return ""
 }
 
 func boolField(m map[string]any, key string) bool {

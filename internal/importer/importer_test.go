@@ -75,7 +75,7 @@ proxies:
 func TestSingBoxJSON(t *testing.T) {
 	jsonData := `{
   "outbounds": [
-    {"type": "vless", "tag": "v1", "server": "203.0.113.1", "server_port": 443, "uuid": "uuid1", "flow": "xtls-rprx-vision", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "pbk1", "short_id": "sid"}}},
+    {"type": "vless", "tag": "v1", "server": "203.0.113.1", "server_port": 443, "uuid": "uuid1", "transport": {"type": "tcp"}, "flow": "xtls-rprx-vision", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "pbk1", "short_id": "sid"}}},
     {"type": "hysteria2", "tag": "h1", "server": "203.0.113.2", "server_port": 443, "password": "pass1", "tls": {"enabled": true, "server_name": "example.com"}},
     {"type": "direct", "tag": "direct"},
     {"type": "trojan", "tag": "trojan1", "server": "1.1.1.1"}
@@ -111,6 +111,13 @@ func TestImportRejectsUnsupportedVLESSTransports(t *testing.T) {
 		if len(result.Links) != 0 || len(result.Skipped) != 1 {
 			t.Fatalf("unsupported transport was rewritten: %+v", result)
 		}
+	}
+}
+
+func TestSingBoxVLESSWithoutExplicitRawTransportIsRejected(t *testing.T) {
+	result := ParseSubscription([]byte(`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`))
+	if len(result.Links) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "unsupported VLESS transport" {
+		t.Fatalf("implicit transport was rewritten as tcp: %+v", result)
 	}
 }
 
@@ -175,7 +182,7 @@ func TestImportedFieldFidelityAndIPv6(t *testing.T) {
 		},
 		{
 			name: "singbox vless",
-			data: `{"outbounds":[{"type":"vless","tag":"v","server":"2001:db8::5","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`,
+			data: `{"outbounds":[{"type":"vless","tag":"v","server":"2001:db8::5","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","transport":{"type":"tcp"},"flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`,
 			check: func(t *testing.T, link string) {
 				v, err := setup.ParseVLESSShareLink(link, "route")
 				if err != nil || v.Server != "2001:db8::5" || v.Flow != "xtls-rprx-vision" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.FP != "firefox" || v.PBK != "fixture-key" || v.SID != "abcd" {

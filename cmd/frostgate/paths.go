@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/history"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
@@ -30,4 +32,23 @@ func commandPaths(explicitConfig string) (configPath, managedDir string) {
 		configPath = filepath.Join(managedDir, "config.yaml")
 	}
 	return configPath, managedDir
+}
+
+// profileForPaths derives identity from the managed directory, not merely the
+// config filename. This keeps an implicit ./frostgate.yaml on the historical
+// default sidecar while an explicit profile remains isolated beside its file.
+func profileForPaths(configPath, managedDir string) profile.Identity {
+	_, defaultDir := commandPaths("")
+	canonicalDir := profile.CanonicalPath(managedDir)
+	canonicalDefault := profile.CanonicalPath(defaultDir)
+	return profile.ForPath(configPath, canonicalDir != "" && canonicalDir == canonicalDefault)
+}
+
+func historyProfileForPaths(configPath, managedDir string) string {
+	identity := profileForPaths(configPath, managedDir)
+	return history.ProfileID(configPath, identity.ID == profile.DefaultID)
+}
+
+func historyProfileForConfig(configPath string) string {
+	return historyProfileForPaths(configPath, filepath.Dir(configPath))
 }

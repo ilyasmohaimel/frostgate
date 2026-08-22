@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +24,26 @@ type attrController struct {
 	mu      sync.Mutex
 	now     string
 	history []string
+}
+
+type selectorDouble struct {
+	now       string
+	getErr    error
+	selectErr map[string]error
+	switches  []string
+}
+
+func (d *selectorDouble) GetSelectedOutbound(context.Context, string) (string, error) {
+	return d.now, d.getErr
+}
+
+func (d *selectorDouble) SelectOutbound(_ context.Context, _ string, target string) error {
+	d.switches = append(d.switches, target)
+	if err := d.selectErr[target]; err != nil {
+		return err
+	}
+	d.now = target
+	return nil
 }
 
 func (c *attrController) handler() http.HandlerFunc {
@@ -327,5 +349,33 @@ func TestAttributionRestoreAfterCancel(t *testing.T) {
 	switches := ctrl.Switches()
 	if len(switches) < 2 || switches[len(switches)-1] != "ORIG" {
 		t.Fatalf("restore switch missing after cancel: %v", switches)
+	}
+}
+
+func TestBenchRoutesCheckedFailsClosedWhenCaptureFails(t *testing.T) {
+	ctrl := &selectorDouble{getErr: errors.New("controller unavailable")}
+	measured := false
+	results, err := BenchRoutesChecked(context.Background(), ctrl, "selector", "127.0.0.1:1", "https://example.com", 1, []string{"A"}, func(context.Context, string, string, int64) (float64, error) {
+		measured = true
+		return 1, nil
+	})
+	if err == nil || measured || len(ctrl.switches) != 0 {
+		t.Fatalf("capture failure switched or measured: results=%+v switches=%v err=%v", results, ctrl.switches, err)
+	}
+	if len(results) != 1 || results[0].NAReason != "selector state unavailable" {
+		t.Fatalf("capture failure result = %+v", results)
+	}
+}
+
+func TestBenchRoutesCheckedPropagatesRestoreFailure(t *testing.T) {
+	ctrl := &selectorDouble{now: "ORIG", selectErr: map[string]error{"ORIG": errors.New("restore refused")}}
+	results, err := BenchRoutesChecked(context.Background(), ctrl, "selector", "127.0.0.1:1", "https://example.com", 1, []string{"A"}, func(context.Context, string, string, int64) (float64, error) {
+		return 12, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "restore selector") {
+		t.Fatalf("restore failure was hidden: results=%+v err=%v", results, err)
+	}
+	if len(ctrl.switches) != 2 || ctrl.switches[0] != "A" || ctrl.switches[1] != "ORIG" {
+		t.Fatalf("switches = %v", ctrl.switches)
 	}
 }

@@ -8,6 +8,10 @@
 
 # Local config (may contain real endpoint hostnames)
 /frostgate.yaml
+/config.yaml
+/sing-box.json
+/controller-secret
+/history.db
 
 # Editor / OS
 .idea/

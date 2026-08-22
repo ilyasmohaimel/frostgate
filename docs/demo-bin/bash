@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+demo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /usr/bin/bash --noprofile --rcfile "$demo_dir/frostgate-demo-env.sh" -i

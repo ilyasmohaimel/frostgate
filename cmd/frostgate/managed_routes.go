@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 
@@ -10,8 +12,15 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/route"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
+)
+
+var (
+	findSingBox      = exec.LookPath
+	writeSystemdUnit = setup.WriteSystemdUnit
+	newSidecarRunner = managedconfig.DefaultSidecarRunnerForService
 )
 
 type managedRouteResult struct {
@@ -58,7 +67,15 @@ func addManagedRoute(dir, configPath, link, tag string, runner *managedconfig.Si
 }
 
 func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []string, runner *managedconfig.SidecarRunner) error {
-	configData, controller, configuredSecret, err := routeConfigCandidate(configPath, mg.Dir, tags)
+	identity := profileForPaths(configPath, mg.Dir)
+	newSidecar := !mg.HasManagedSidecar()
+	needsProfileBindings := newSidecar || (identity.ID != profile.DefaultID && !mg.UsesProfileBindings(identity.ControllerAddr, identity.BenchmarkAddr))
+	if identity.ID != profile.DefaultID && needsProfileBindings {
+		if err := identity.CheckAvailable(); err != nil {
+			return err
+		}
+	}
+	configData, controller, configuredSecret, err := routeConfigCandidate(configPath, mg.Dir, tags, identity, newSidecar)
 	if err != nil {
 		return err
 	}
@@ -71,23 +88,85 @@ func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []st
 			}
 		}
 	}
+	// A custom profile that owns a sidecar gets unique loopback bindings. The
+	// default profile keeps its long-standing ports and unit name.
+	if newSidecar || identity.ID != profile.DefaultID {
+		mg.ConfigureProfile(controller, identity.BenchmarkAddr)
+	}
+	var restoreUnit func() error
 	if runner == nil {
-		runner = managedconfig.DefaultSidecarRunner(controller, mg.Secret)
+		if newSidecar || identity.ID != profile.DefaultID {
+			sbPath, lookErr := findSingBox("sing-box")
+			if lookErr != nil {
+				return fmt.Errorf("sing-box not available for managed sidecar bootstrap: %w", lookErr)
+			}
+			var unitErr error
+			restoreUnit, unitErr = writeManagedUnit(setup.ServiceUnitPath(identity.Service), sbPath, mg.Dir)
+			if unitErr != nil {
+				return unitErr
+			}
+		}
+		runner = newSidecarRunner(controller, mg.Secret, identity.Service)
 	}
 	if err := mg.SaveTransactionWithConfig(runner, configPath, configData); err != nil {
+		if restoreUnit != nil {
+			var recovery error
+			if restoreErr := restoreUnit(); restoreErr != nil {
+				recovery = errors.Join(recovery, fmt.Errorf("restore service unit: %w", restoreErr))
+			}
+			if runner != nil && runner.DaemonReload != nil {
+				if reloadErr := runner.DaemonReload(); reloadErr != nil {
+					recovery = errors.Join(recovery, fmt.Errorf("reload restored service unit: %w", reloadErr))
+				}
+			}
+			if recovery != nil {
+				return errors.Join(err, recovery)
+			}
+		}
 		return err
 	}
 	return nil
 }
 
-func routeConfigCandidate(path, dir string, tags []string) ([]byte, string, string, error) {
+// writeManagedUnit snapshots a profile unit so failed first-route bootstraps
+// do not leave a sidecar registered for a configuration that was rolled back.
+func writeManagedUnit(path, binaryPath, configDir string) (func() error, error) {
+	before, err := os.ReadFile(path)
+	existed := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("snapshot service unit: %w", err)
+	}
+	if err := writeSystemdUnit(path, binaryPath, configDir); err != nil {
+		return nil, err
+	}
+	return func() error {
+		if existed {
+			if err := os.WriteFile(path, before, 0o644); err != nil {
+				return err
+			}
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}, nil
+}
+
+func routeConfigCandidate(path, dir string, tags []string, identity profile.Identity, bootstrap bool) ([]byte, string, string, error) {
+	controller := "http://" + identity.ControllerAddr
+	secretFile := filepath.Join(dir, "controller-secret")
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		data, marshalErr := setup.MarshalFrostgateConfig(tags, nil, config.DefaultTestURL, config.DefaultSingBoxController, filepath.Join(dir, "controller-secret"))
+		data, marshalErr := setup.MarshalFrostgateConfig(tags, nil, config.DefaultTestURL, controller, secretFile)
 		if marshalErr != nil {
 			return nil, "", "", marshalErr
 		}
-		return data, config.DefaultSingBoxController, "", nil
+		data, marshalErr = setManagedSingBoxSettings(data, controller, secretFile, identity.BenchmarkAddr)
+		if marshalErr != nil {
+			return nil, "", "", marshalErr
+		}
+		return data, controller, "", nil
 	}
 	if err != nil {
 		return nil, "", "", fmt.Errorf("read Frostgate config: %w", err)
@@ -96,11 +175,69 @@ func routeConfigCandidate(path, dir string, tags []string) ([]byte, string, stri
 	if err != nil {
 		return nil, "", "", err
 	}
+	if bootstrap {
+		for _, endpoint := range cfg.Endpoints {
+			if endpoint.Type == config.ProbeSingBox {
+				return nil, "", "", fmt.Errorf("cannot bootstrap a managed sidecar over an existing external controller")
+			}
+		}
+	}
 	data, err := appendSingBoxEndpoints(raw, tags)
 	if err != nil {
 		return nil, "", "", err
 	}
+	if bootstrap || identity.ID != profile.DefaultID {
+		data, err = setManagedSingBoxSettings(data, controller, secretFile, identity.BenchmarkAddr)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return data, controller, cfg.SingBox.Secret, nil
+	}
 	return data, cfg.SingBox.Controller, cfg.SingBox.Secret, nil
+}
+
+func setManagedSingBoxSettings(raw []byte, controller, secretFile, benchmarkAddr string) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("parse Frostgate config for managed sidecar: %w", err)
+	}
+	root := doc.Content[0]
+	singbox := mappingValue(root, "singbox")
+	if singbox == nil {
+		singbox = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "singbox"}, singbox)
+	}
+	if singbox.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("Frostgate config singbox must be a mapping")
+	}
+	setMappingString(singbox, "controller", controller)
+	setMappingString(singbox, "secret_file", secretFile)
+	setMappingString(singbox, "benchmark_proxy", benchmarkAddr)
+	return yaml.Marshal(&doc)
+}
+
+func mappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func setMappingString(mapping *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].Kind = yaml.ScalarNode
+			mapping.Content[i+1].Tag = "!!str"
+			mapping.Content[i+1].Value = value
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+	)
 }
 
 func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {

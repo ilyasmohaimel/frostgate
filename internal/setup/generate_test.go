@@ -97,6 +97,9 @@ func TestGenerateSingBoxConfigLoopbackEnforced(t *testing.T) {
 	if !IsLoopbackController("http://127.0.0.1:9090") {
 		t.Error("loopback check failed")
 	}
+	if !IsLoopbackController("http://127.42.7.9:9090") {
+		t.Error("127/8 loopback check failed")
+	}
 	if IsLoopbackController("http://0.0.0.0:9090") {
 		t.Error("0.0.0.0 should not be loopback")
 	}

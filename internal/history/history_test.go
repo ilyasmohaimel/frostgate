@@ -213,3 +213,30 @@ func TestConcurrentSafe(t *testing.T) {
 		t.Errorf("concurrent %d", len(records))
 	}
 }
+
+func TestQueryProfileScopesSameRouteNamesAndKeepsDefaultLegacyRecords(t *testing.T) {
+	db, cleanup := tempDB(t)
+	defer cleanup()
+	now := time.Now()
+	for _, record := range []Record{
+		{Timestamp: now, Route: "same-name", Status: "up", MedianMs: 40, Profile: "profile-a"},
+		{Timestamp: now.Add(time.Nanosecond), Route: "same-name", Status: "down", Profile: "profile-b"},
+		{Timestamp: now.Add(2 * time.Nanosecond), Route: "same-name", Status: "up", MedianMs: 80},
+	} {
+		if err := db.Add(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err := db.QueryProfile(0, "same-name", "", "profile-a", false)
+	if err != nil || len(a) != 1 || a[0].Profile != "profile-a" {
+		t.Fatalf("profile A records = %+v, %v", a, err)
+	}
+	b, err := db.QueryProfile(0, "same-name", "", "profile-b", false)
+	if err != nil || len(b) != 1 || b[0].Profile != "profile-b" {
+		t.Fatalf("profile B records = %+v, %v", b, err)
+	}
+	def, err := db.QueryProfile(0, "same-name", "", DefaultProfile, true)
+	if err != nil || len(def) != 1 || def[0].Profile != "" {
+		t.Fatalf("default legacy compatibility records = %+v, %v", def, err)
+	}
+}

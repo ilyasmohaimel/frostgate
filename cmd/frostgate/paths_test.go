@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 )
 
 func TestCustomConfigUsesIsolatedManagedDirectory(t *testing.T) {
@@ -41,6 +42,30 @@ func TestCustomConfigUsesIsolatedManagedDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(customDir, "sing-box.json")); err != nil {
 		t.Fatalf("custom managed sidecar missing: %v", err)
+	}
+}
+
+func TestImplicitFallbackConfigKeepsDefaultProfileIdentity(t *testing.T) {
+	root := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	if err := os.WriteFile("frostgate.yaml", []byte("endpoints: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath, managedDir := commandPaths("")
+	if configPath != "frostgate.yaml" {
+		t.Fatalf("implicit fallback config = %q", configPath)
+	}
+	if got := profileForPaths(configPath, managedDir); got.ID != profile.DefaultID {
+		t.Fatalf("implicit fallback must keep default profile identity: %+v", got)
 	}
 }
 

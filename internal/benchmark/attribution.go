@@ -2,7 +2,7 @@ package benchmark
 
 import (
 	"context"
-	"sync"
+	"fmt"
 	"time"
 )
 
@@ -33,6 +33,8 @@ type RouteThroughput struct {
 // returns, including after measurement errors and context cancellation.
 //
 // measure is injected so tests can observe which route was actually active.
+// Deprecated callers that need restoration failures should use
+// BenchRoutesChecked.
 func BenchRoutes(
 	ctx context.Context,
 	ctrl SelectorController,
@@ -43,37 +45,51 @@ func BenchRoutes(
 	routes []string,
 	measure func(ctx context.Context, socksAddr, url string, bytes int64) (float64, error),
 ) []RouteThroughput {
+	out, _ := BenchRoutesChecked(ctx, ctrl, selector, socksAddr, downloadURL, bytesPerRoute, routes, measure)
+	return out
+}
+
+// BenchRoutesChecked is the fail-closed attributed benchmark API. It captures
+// the active selector before the first switch and returns a restoration error
+// to the caller instead of silently leaving the selector changed.
+func BenchRoutesChecked(
+	ctx context.Context,
+	ctrl SelectorController,
+	selector string,
+	socksAddr string,
+	downloadURL string,
+	bytesPerRoute int64,
+	routes []string,
+	measure func(ctx context.Context, socksAddr, url string, bytes int64) (float64, error),
+) ([]RouteThroughput, error) {
 	out := make([]RouteThroughput, 0, len(routes))
 	if len(routes) == 0 {
-		return out
+		return out, nil
 	}
 	if selector == "" {
 		selector = "frostgate-selector"
 	}
-	originalSelector := ""
-	selectorExists := false
-	if now, err := ctrl.GetSelectedOutbound(ctx, selector); err == nil && now != "" {
-		originalSelector = now
-		selectorExists = true
+	originalSelector, err := ctrl.GetSelectedOutbound(ctx, selector)
+	if err != nil || originalSelector == "" {
+		for _, route := range routes {
+			out = append(out, RouteThroughput{Route: route, NAReason: "selector state unavailable"})
+		}
+		if err == nil {
+			err = fmt.Errorf("selector %q has no active outbound", selector)
+		}
+		return out, fmt.Errorf("capture selector state: %w", err)
 	}
-	var restoreOnce sync.Once
+	var restoreErr error
 	restore := func() {
-		restoreOnce.Do(func() {
-			if !selectorExists || originalSelector == "" {
-				return
-			}
-			rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer rcancel()
-			_ = ctrl.SelectOutbound(rctx, selector, originalSelector)
-		})
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer rcancel()
+		restoreErr = ctrl.SelectOutbound(rctx, selector, originalSelector)
 	}
-	// Restore on early return, error paths, and context cancellation.
-	defer restore()
-	go func() {
-		<-ctx.Done()
-		restore()
-	}()
+routeLoop:
 	for _, route := range routes {
+		if ctx.Err() != nil {
+			break
+		}
 		res := RouteThroughput{Route: route}
 		if err := ctrl.SelectOutbound(ctx, selector, route); err != nil {
 			res.NAReason = "selector switch failed"
@@ -81,7 +97,17 @@ func BenchRoutes(
 			continue
 		}
 		// Give the core a beat to settle connections through the new outbound.
-		time.Sleep(100 * time.Millisecond)
+		settle := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !settle.Stop() {
+				<-settle.C
+			}
+			res.NAReason = "throughput measurement cancelled"
+			out = append(out, res)
+			break routeLoop
+		case <-settle.C:
+		}
 		mctx, mcancel := context.WithTimeout(ctx, 30*time.Second)
 		mbps, err := measure(mctx, socksAddr, downloadURL, bytesPerRoute)
 		mcancel()
@@ -89,12 +115,18 @@ func BenchRoutes(
 			res.NAReason = "throughput measurement failed"
 			if ctx.Err() != nil {
 				out = append(out, res)
-				return out
+				break
 			}
 		} else {
 			res.DownloadMbps = mbps
 		}
 		out = append(out, res)
 	}
-	return out
+	// A named return would obscure the error from the deferred restore. Restore
+	// explicitly once here so callers can never treat a failed restore as pass.
+	restore()
+	if restoreErr != nil {
+		return out, fmt.Errorf("restore selector %q: %w", selector, restoreErr)
+	}
+	return out, nil
 }

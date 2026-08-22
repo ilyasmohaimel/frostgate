@@ -28,7 +28,8 @@ type Layer struct {
 // engine inspect the real server fields (host/port/SNI) without ever printing
 // secrets.
 type Options struct {
-	Managed *managedconfig.Managed
+	Managed        *managedconfig.Managed
+	SidecarService string
 }
 
 func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
@@ -37,7 +38,7 @@ func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
 	out = append(out, checkSingBox())
-	out = append(out, checkSidecar())
+	out = append(out, checkSidecar(opts.SidecarService))
 	out = append(out, checkController(cfg))
 	for _, ep := range cfg.Endpoints {
 		switch ep.Type {
@@ -66,7 +67,7 @@ func DiagnoseRoute(cfg *config.Config, routeName string, opts Options) []Layer {
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
 	out = append(out, checkSingBox())
-	out = append(out, checkSidecar())
+	out = append(out, checkSidecar(opts.SidecarService))
 	out = append(out, checkController(cfg))
 	if target.Type == config.ProbeSingBox {
 		out = append(out, diagnoseProxyRoute(cfg, *target, opts)...)
@@ -257,12 +258,15 @@ func getVersion(path string) string {
 	return s
 }
 
-func checkSidecar() Layer {
-	cmd := exec.Command("systemctl", "--user", "is-active", "frostgate-singbox.service")
+func checkSidecar(service string) Layer {
+	if service == "" {
+		service = "frostgate-singbox.service"
+	}
+	cmd := exec.Command("systemctl", "--user", "is-active", service)
 	out, _ := cmd.Output()
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
-		return Layer{Name: "sing-box sidecar", Status: "PASS", Detail: "frostgate-singbox active"}
+		return Layer{Name: "sing-box sidecar", Status: "PASS", Detail: strings.TrimSuffix(service, ".service") + " active"}
 	}
 	return Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "service not active (maybe manual run)"}
 }
@@ -277,7 +281,7 @@ func checkController(cfg *config.Config) Layer {
 		}
 		return Layer{Name: "Controller", Status: "FAIL", Detail: errString(err)}
 	}
-	return Layer{Name: "Controller", Status: "PASS", Detail: cfg.SingBox.Controller}
+	return Layer{Name: "Controller", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)}
 }
 
 func checkOutbound(client *singbox.Client, routeName, outbound string) Layer {
@@ -297,10 +301,12 @@ func checkEndToEnd(client *singbox.Client, cfg *config.Config, ep config.Endpoin
 	if err != nil {
 		hint := ""
 		switch kind {
+		case "vless":
+			hint = "check UUID, REALITY public key, short ID, SNI, server, or filtering"
 		case "hysteria2":
-			hint = "check Hysteria2 password/obfs/SNI or server availability"
+			hint = "check Hysteria2 password, obfs, SNI, UDP reachability, or server availability"
 		default:
-			hint = "server may be reachable, but REALITY/auth failed; check PBK, SID, or filtering"
+			hint = "check the controller route configuration and upstream connectivity"
 		}
 		return Layer{
 			Name:   endToEndName(kind, ep),

@@ -45,9 +45,9 @@ var commandSpecs = []commandSpec{
 	{Name: "diagnose", Usage: "frostgate diagnose [route] [--json] [--config path]", Summary: "diagnose route failures", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}, {Name: "config", TakesValue: true, Description: "path to config file"}}},
 	{Name: "network-check", Usage: "frostgate network-check [--json] [--config path]", Summary: "check local network signals", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}, {Name: "config", TakesValue: true, Description: "path to config file"}}},
 	{Name: "network_check", Usage: "frostgate network_check [--json] [--config path]", Summary: "alias for network-check", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}, {Name: "config", TakesValue: true, Description: "path to config file"}}},
-	{Name: "compare", Usage: "frostgate compare [--json]", Summary: "compare recorded networks", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}}},
+	{Name: "compare", Usage: "frostgate compare [--json] [--config path]", Summary: "compare recorded networks", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}, {Name: "config", TakesValue: true, Description: "profile config path"}}},
 	{Name: "recommend", Usage: "frostgate recommend [--json] [--config path]", Summary: "show the recommended route", Flags: []flagSpec{{Name: "json", Description: "emit JSON"}, {Name: "config", TakesValue: true, Description: "path to config file"}}},
-	{Name: "history", Usage: "frostgate history [--since duration] [--route name] [--network label] [--json]", Summary: "show local history", Flags: []flagSpec{{Name: "since", TakesValue: true, Description: "time range"}, {Name: "route", TakesValue: true, Description: "route name"}, {Name: "network", TakesValue: true, Description: "network label"}, {Name: "json", Description: "emit JSON"}}},
+	{Name: "history", Usage: "frostgate history [--since duration] [--route name] [--network label] [--config path] [--json]", Summary: "show local history", Flags: []flagSpec{{Name: "since", TakesValue: true, Description: "time range"}, {Name: "route", TakesValue: true, Description: "route name"}, {Name: "network", TakesValue: true, Description: "network label"}, {Name: "config", TakesValue: true, Description: "profile config path"}, {Name: "json", Description: "emit JSON"}}},
 	{Name: "doctor", Usage: "frostgate doctor [--config path] [--verbose]", Summary: "check local setup", Flags: []flagSpec{{Name: "config", TakesValue: true, Description: "path to config file"}, {Name: "verbose", Description: "verbose output"}}},
 	{Name: "completion", Usage: "frostgate completion <fish|bash|zsh>", Summary: "print shell completion"},
 	{Name: "help", Usage: "frostgate help", Summary: "show help"},
@@ -67,7 +67,7 @@ func handleCompletion(args []string) int {
 	case "zsh":
 		script = zshCompletion()
 	default:
-		fmt.Fprintf(os.Stderr, "unsupported shell %q (supported: fish, bash, zsh)\n", args[0])
+		fmt.Fprintf(os.Stderr, "unsupported shell %q (supported: fish, bash, zsh)\n", sanitizeOutput(args[0]))
 		return 3
 	}
 	_, _ = io.WriteString(os.Stdout, script)

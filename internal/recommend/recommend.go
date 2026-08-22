@@ -97,9 +97,15 @@ func Recommend(inputs []Input, historyCount int) Result {
 		reasons = append(reasons, fmt.Sprintf("%.0f Mbps", best.Download))
 	}
 	if best.Jitter > 0 {
+		// Jitter is meaningful only when every usable candidate has enough
+		// sample evidence to provide a non-zero aggregate. Otherwise a zero is
+		// ambiguous (often one successful sample), so avoid a superlative.
 		lowest := true
 		for _, in := range healthy {
-			if in.Name != best.Name && in.Jitter > 0 && in.Jitter < best.Jitter {
+			if in.Name == best.Name {
+				continue
+			}
+			if in.Jitter <= 0 || in.Jitter < best.Jitter {
 				lowest = false
 				break
 			}

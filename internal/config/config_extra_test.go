@@ -215,7 +215,7 @@ endpoints:
 }
 
 func TestBenchmarkProxyMustBeLoopback(t *testing.T) {
-	for _, addr := range []string{"127.0.0.1:2080", "localhost:2080", "[::1]:2080"} {
+	for _, addr := range []string{"127.0.0.1:2080", "127.42.7.9:2080", "localhost:2080", "[::1]:2080"} {
 		path := writeTemp(t, `
 singbox:
   benchmark_proxy: "`+addr+`"

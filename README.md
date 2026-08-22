@@ -94,9 +94,9 @@ Imports accept plain or base64 subscriptions, Clash YAML, and supported sing-box
 frostgate import --allow-insecure-http 'http://provider.example/subscription'
 ```
 
-Routes are validated, deduplicated by fingerprint, and written through the managed sing-box transaction. Frostgate validates the candidate with `sing-box check`, restarts only `frostgate-singbox.service`, checks the controller and expected outbounds, and rolls back on failure.
+Routes are validated, deduplicated by fingerprint, and written through the managed sing-box transaction. Frostgate validates the candidate with `sing-box check`, restarts only the profile's managed sidecar service, checks the controller and expected outbounds, and rolls back on failure.
 
-Share and subscription URLs are never printed. Keep `~/.config/frostgate/` private.
+Raw share and subscription URLs are never printed. Keep `~/.config/frostgate/` private.
 
 ### Supported protocol scope
 
@@ -131,7 +131,7 @@ Why: 0% loss - 355ms median - 84 Mbps
 Preferred: primary-reality
 ```
 
-For Frostgate-managed sidecars, proxy downloads use the managed loopback listener and `frostgate-selector`. Existing managed configurations without `singbox.benchmark_proxy` are discovered from the sidecar. Older Frostgate sidecars without the selector/listener are migrated transactionally when their managed structure can be verified.
+For Frostgate-managed sidecars, proxy downloads use the managed loopback listener and `frostgate-selector`. Existing managed configurations without `singbox.benchmark_proxy` are discovered from the sidecar. Older Frostgate sidecars without the selector/listener are migrated transactionally when their managed structure can be verified. Frostgate reads the active selector before a benchmark and restores it afterwards; if the selector state cannot be read, it does not switch routes.
 
 An external or unmanaged controller is never assigned a guessed listener. Without a proven loopback `singbox.benchmark_proxy`, proxy throughput remains `N/A`.
 
@@ -159,21 +159,22 @@ Diagnosis checks direct connectivity, DNS, measured VLESS TCP reachability, side
 frostgate benchmark --network home
 frostgate benchmark --network mobile
 frostgate compare
-frostgate history --since 7d
-frostgate recommend
+frostgate history --since 7d --config /path/to/config.yaml
+frostgate compare --config /path/to/config.yaml
+frostgate recommend --config /path/to/config.yaml
 ```
 
 `Direct baseline` is a non-proxy connectivity reference. It does not compete for `Best proxy`.
 
 Recommendations rank health, loss, historical availability, throughput, latency, jitter, and priority. Priority only resolves close candidates; a materially better route wins. A down route is never recommended.
 
-History is stored at `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/frostgate/history.db`. It contains measurements and error categories, not route credentials or URLs.
+History is stored at `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/frostgate/history.db`. It contains measurements and error categories, not route credentials or URLs. New records are scoped to the selected config profile, so equal route names in separate profiles do not share recommendation evidence. Existing unscoped records remain visible to the default profile.
 
 ## Configuration
 
 Most users should use `frostgate setup`, `add`, or `import`. The generated config is at `$XDG_CONFIG_HOME/frostgate/config.yaml` or `~/.config/frostgate/config.yaml`.
 
-An explicit `--config /path/to/config.yaml` is an isolated profile: its managed `sing-box.json` and `controller-secret` live beside that config instead of in the default XDG directory.
+An explicit `--config /path/to/config.yaml` is an isolated profile: its managed `sing-box.json` and `controller-secret` live beside that config instead of in the default XDG directory. Managed custom profiles use a deterministic profile-specific user service and loopback controller/benchmark bindings, so they do not restart or bind over the default profile.
 
 ```yaml
 defaults:
@@ -238,7 +239,7 @@ Core probe documents use JSON schema version 3. They include `direct` and `best_
 
 ## Sidecar and recovery
 
-The managed sidecar listens on loopback only. Check it with:
+The managed sidecar listens on loopback only. For the default profile, check it with:
 
 ```sh
 frostgate --doctor
@@ -246,14 +247,17 @@ sing-box check -c ~/.config/frostgate/sing-box.json
 systemctl --user status frostgate-singbox.service --no-pager
 ```
 
+For a custom profile, use `frostgate doctor --config /path/to/config.yaml`; it reports that profile's service.
+
 `frostgate setup` preserves an existing configuration unless you choose reconfigure or reset. Reconfigure creates `backup-<timestamp>` in the Frostgate configuration directory.
 
 ## Security notes
 
 - Share URLs, subscription URLs, controller secrets, UUIDs, REALITY material, and Hysteria passwords are credentials.
 - Frostgate stores route credentials only in private local configuration files with mode `0600`.
-- Frostgate redacts errors, JSON output, history, TUI output, and test data before printing or storing them. Share links and subscription URLs passed on the command line may remain in shell history or the local process list while Frostgate runs.
+- Frostgate redacts errors, verbose/debug output, JSON output, history, TUI output, and test data before printing or storing them. Share links and subscription URLs passed on the command line may remain in shell history or the local process list while Frostgate runs.
 - Temporary `frostgate test` configurations use a private temporary directory and are removed on exit.
+- The repository ignores root-level local Frostgate files such as `config.yaml`, `sing-box.json`, `controller-secret`, `history.db`, and `dist/`. Custom profiles can live anywhere, so do not commit private configuration directories.
 
 ## Limitations
 
@@ -271,10 +275,10 @@ go test -race ./...
 sh scripts/test-install.sh
 ```
 
-The README GIF is generated from a local fixture with no proxy credentials. With VHS and `ttyd` on `PATH`:
+The README GIF is generated from a local fixture with no proxy credentials. With VHS, `ttyd`, Go, and Python 3 on `PATH`:
 
 ```sh
-vhs docs/frostgate-demo.tape
+PATH="$PWD/docs/demo-bin:$PATH" vhs docs/frostgate-demo.tape
 ```
 
 ## License

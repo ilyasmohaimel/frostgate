@@ -2,8 +2,10 @@ package history
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +197,20 @@ func TestFromProbeResults(t *testing.T) {
 	}
 	if recs[0].Type != string(config.ProbeHTTP) {
 		t.Fatalf("type %q", recs[0].Type)
+	}
+}
+
+func TestRecorderReturnsPruneFailureAndDoesNotMarkItComplete(t *testing.T) {
+	withTempDataHome(t)
+	recorder := NewRecorder(true, time.Hour, time.Minute)
+	recorder.prune = func(*DB, time.Duration) error { return errors.New("prune blocked") }
+	if err := recorder.Record([]Record{{Route: "route", Status: "up", MedianMs: 10}}); err == nil || !strings.Contains(err.Error(), "prune blocked") {
+		t.Fatalf("prune failure was hidden: %v", err)
+	}
+	if !recorder.lastPrune.IsZero() {
+		t.Fatalf("failed prune was marked complete: %s", recorder.lastPrune)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

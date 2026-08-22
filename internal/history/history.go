@@ -1,6 +1,8 @@
 package history
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"go.etcd.io/bbolt"
 )
 
@@ -25,6 +28,19 @@ type Record struct {
 	DownloadMbps float64   `json:"download_mbps,omitempty"`
 	Network      string    `json:"network,omitempty"`
 	Category     string    `json:"category,omitempty"`
+	// Profile scopes equal route names in independent Frostgate configs. The
+	// empty value is a legacy record and is visible only to the default profile.
+	Profile string `json:"profile,omitempty"`
+}
+
+const DefaultProfile = "default"
+
+func ProfileID(configPath string, isDefault bool) string {
+	if isDefault {
+		return DefaultProfile
+	}
+	sum := sha256.Sum256([]byte(profile.CanonicalPath(configPath)))
+	return "p-" + hex.EncodeToString(sum[:12])
 }
 
 func HistoryPath() string {
@@ -95,6 +111,13 @@ func (d *DB) Add(r Record) error {
 }
 
 func (d *DB) Query(since time.Duration, route, network string) ([]Record, error) {
+	return d.QueryProfile(since, route, network, "", false)
+}
+
+// QueryProfile returns only records for a selected profile. Legacy unscoped
+// records are kept readable for the default profile but never leak into an
+// explicit custom profile.
+func (d *DB) QueryProfile(since time.Duration, route, network, profile string, includeLegacy bool) ([]Record, error) {
 	var out []Record
 	cutoff := time.Now().Add(-since)
 	if since == 0 {
@@ -119,6 +142,9 @@ func (d *DB) Query(since time.Duration, route, network string) ([]Record, error)
 			if network != "" && r.Network != network {
 				return nil
 			}
+			if profile != "" && r.Profile != profile && !(includeLegacy && r.Profile == "") {
+				return nil
+			}
 			out = append(out, r)
 			return nil
 		})
@@ -137,7 +163,7 @@ func (d *DB) Prune(retention time.Duration) error {
 			return nil
 		}
 		var toDelete [][]byte
-		b.ForEach(func(k, v []byte) error {
+		if err := b.ForEach(func(k, v []byte) error {
 			var r Record
 			if err := json.Unmarshal(v, &r); err != nil {
 				toDelete = append(toDelete, append([]byte(nil), k...))
@@ -147,9 +173,13 @@ func (d *DB) Prune(retention time.Duration) error {
 				toDelete = append(toDelete, append([]byte(nil), k...))
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
 		for _, k := range toDelete {
-			b.Delete(k)
+			if err := b.Delete(k); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
