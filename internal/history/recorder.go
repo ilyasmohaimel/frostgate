@@ -2,10 +2,12 @@ package history
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"go.etcd.io/bbolt"
 )
 
 // ErrNoHistory is returned by OpenReadonly when no history database exists.
@@ -15,10 +17,18 @@ var ErrNoHistory = errors.New("no history database")
 // never creates directories or files, so read-only commands are safe when
 // history is disabled or has never been written.
 func OpenReadonly() (*DB, error) {
-	if _, err := StatDB(); err != nil {
-		return nil, ErrNoHistory
+	path := HistoryPath()
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoHistory
+		}
+		return nil, err
 	}
-	return Open()
+	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: 2 * time.Second, ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	return &DB{db: bdb}, nil
 }
 
 // Recorder owns the history lifecycle for one process: enabled flag,

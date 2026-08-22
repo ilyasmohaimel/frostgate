@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -123,6 +124,31 @@ func TestParseHysteria2RejectsCertificatePins(t *testing.T) {
 		link := "hysteria2://example-password@203.0.113.10:443?sni=example.com&" + key + "=example-pin"
 		if _, err := ParseHysteria2ShareLink(link, "route"); err == nil || !strings.Contains(err.Error(), "pin") {
 			t.Fatalf("%s must be rejected, got %v", key, err)
+		}
+	}
+}
+
+func TestParseHysteria2DoesNotDoubleDecode(t *testing.T) {
+	password := "pct%25 plus+ space / ✓"
+	obfsPassword := "obfs%2B+ value"
+	link := "hysteria2://" + url.User(password).String() + "@203.0.113.10:443?sni=example.com&obfs=salamander&obfs-password=" + url.QueryEscape(obfsPassword)
+	h, err := ParseHysteria2ShareLink(link, "hyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Password != password || h.ObfsPassword != obfsPassword {
+		t.Fatalf("decoded values changed: password=%q obfs=%q", h.Password, h.ObfsPassword)
+	}
+}
+
+func TestParseVLESSRequiresReality(t *testing.T) {
+	for _, link := range []string{
+		"vless://uuid@203.0.113.10:443?security=tls&type=tcp&sni=example.com&pbk=x",
+		"vless://uuid@203.0.113.10:443?type=tcp&sni=example.com&pbk=x",
+		"vless://uuid@203.0.113.10:443?security=reality&type=httpupgrade&sni=example.com&pbk=x",
+	} {
+		if _, err := ParseVLESSShareLink(link, "route"); err == nil {
+			t.Fatalf("unsupported VLESS link accepted: %s", link)
 		}
 	}
 }

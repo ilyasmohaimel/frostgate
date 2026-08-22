@@ -152,6 +152,21 @@ func TestBuildFrostgateConfigDirectStatusPolicy(t *testing.T) {
 	}
 }
 
+func TestBenchmarkProxyOnlyForManagedSidecar(t *testing.T) {
+	managed := BuildFrostgateConfig([]string{"managed"}, nil, config.DefaultTestURL, config.DefaultSingBoxController, "secret")
+	if managed.SingBox.BenchmarkProxy != "127.0.0.1:2080" {
+		t.Fatalf("managed setup missing owned benchmark proxy: %+v", managed.SingBox)
+	}
+	external := BuildExternalControllerConfig([]string{"external"}, config.DefaultTestURL, "http://127.0.0.1:9999", "")
+	if external.SingBox.BenchmarkProxy != "" {
+		t.Fatalf("external controller guessed proxy: %+v", external.SingBox)
+	}
+	direct := BuildDirectOnlyConfig(config.DefaultTestURL)
+	if direct.SingBox.BenchmarkProxy != "" {
+		t.Fatalf("direct-only config has proxy listener: %+v", direct.SingBox)
+	}
+}
+
 func TestGeneratedCustomDirectUsesGenericHTTPStatusPolicy(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

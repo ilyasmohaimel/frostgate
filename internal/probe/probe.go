@@ -187,8 +187,8 @@ func Probe(ctx context.Context, e config.Endpoint, timeout time.Duration) Result
 			Timeout:        config.Duration{Duration: timeout},
 			Samples:        1,
 			SampleInterval: config.Duration{Duration: 0},
-			HealthyLatency: config.Duration{Duration: 800 * 1e9},
-			MaxJitter:      config.Duration{Duration: 80 * 1e9},
+			HealthyLatency: config.Duration{Duration: 800 * time.Millisecond},
+			MaxJitter:      config.Duration{Duration: 80 * time.Millisecond},
 		},
 	}
 	cfg.Defaults.Samples = 1

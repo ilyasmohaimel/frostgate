@@ -36,6 +36,7 @@ func TestModelRefreshOnR(t *testing.T) {
 		Endpoints: []config.Endpoint{{Name: "a", Host: "127.0.0.1", Port: 1}},
 	}
 	m := New(cfg, 5*time.Second, false, nil)
+	m.probing = false
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 	if cmd == nil {
 		t.Error("expected probe cmd on r")
@@ -58,6 +59,29 @@ func TestModelHandlesResultsMsg(t *testing.T) {
 	m3, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	if m3.(Model).width != 80 {
 		t.Error("width not set")
+	}
+}
+
+func TestModelCoalescesRefreshesWhileProbeIsInFlight(t *testing.T) {
+	m := New(&config.Config{}, time.Second, false, nil)
+	// New begins with the initial probe in flight. Ticks and repeated manual
+	// refreshes must leave exactly one pending refresh instead of starting more.
+	updated, cmd := m.Update(tickMsg(time.Unix(100, 0)))
+	if cmd == nil || !updated.(Model).probing || !updated.(Model).pending {
+		t.Fatal("tick while busy must coalesce and keep the timer alive")
+	}
+	updated, cmd = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if cmd != nil || !updated.(Model).pending {
+		t.Fatal("manual refresh while busy must not start a second probe")
+	}
+	completed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	updated, cmd = updated.(Model).Update(resultsMsg{completed: completed})
+	model := updated.(Model)
+	if cmd == nil || !model.probing || model.pending || !model.lastRefresh.Equal(completed) {
+		t.Fatalf("completion must start one coalesced probe and record completion time: %+v", model)
+	}
+	if view := model.View(); !containsStr(view, "Last refresh: 03:04:05") {
+		t.Fatalf("view must use completed refresh time:\n%s", view)
 	}
 }
 

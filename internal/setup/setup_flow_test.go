@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +28,16 @@ func TestDirectOnlyFlowUsesStatusPolicy(t *testing.T) {
 	}
 	if cfg.Endpoints[0].ExpectedStatus != 0 {
 		t.Fatalf("custom direct endpoint has exact status %d", cfg.Endpoints[0].ExpectedStatus)
+	}
+}
+
+func TestRunValidationPropagatesConfigFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("endpoints: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runValidation(dir); err == nil {
+		t.Fatal("invalid setup config was accepted")
 	}
 }
 

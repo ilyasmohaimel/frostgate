@@ -3,6 +3,7 @@ package managedconfig
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -466,15 +467,26 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 		if !f.install {
 			continue
 		}
-		if err := writeFileAtomic(f.path, f.candidate, 0o600); err != nil {
-			rollbackSnapshots(snapshots)
-			return fmt.Errorf("install %s: %w", f.path, err)
+		if err := atomicWriteFile(f.path, f.candidate, 0o600); err != nil {
+			original := fmt.Errorf("install %s: %w", f.path, err)
+			if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
+				return errors.Join(original, fmt.Errorf("rollback files: %w", rollbackErr))
+			}
+			return original
 		}
 	}
 	rollback := func(err error) error {
-		rollbackSnapshots(snapshots)
+		var recovery error
+		if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
+			recovery = errors.Join(recovery, fmt.Errorf("rollback files: %w", rollbackErr))
+		}
 		if runner != nil && runner.Restart != nil {
-			_ = runner.Restart()
+			if restartErr := runner.Restart(); restartErr != nil {
+				recovery = errors.Join(recovery, fmt.Errorf("restart restored sidecar: %w", restartErr))
+			}
+		}
+		if recovery != nil {
+			return errors.Join(err, recovery)
 		}
 		return err
 	}
@@ -536,12 +548,23 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmpPath, path)
 }
 
-func rollbackSnapshots(snapshots []fileSnapshot) {
+var (
+	atomicWriteFile = writeFileAtomic
+	removeFile      = os.Remove
+)
+
+func rollbackSnapshots(snapshots []fileSnapshot) error {
+	var errs []error
 	for _, snapshot := range snapshots {
 		if snapshot.exists {
-			_ = writeFileAtomic(snapshot.path, snapshot.data, 0o600)
+			if err := atomicWriteFile(snapshot.path, snapshot.data, 0o600); err != nil {
+				errs = append(errs, fmt.Errorf("restore %s: %w", snapshot.path, err))
+			}
 		} else {
-			_ = os.Remove(snapshot.path)
+			if err := removeFile(snapshot.path); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("remove %s: %w", snapshot.path, err))
+			}
 		}
 	}
+	return errors.Join(errs...)
 }

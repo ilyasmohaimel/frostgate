@@ -35,13 +35,14 @@ func Run(cfgPath string, verbose bool) []Check {
 	}
 	out = append(out, Check{Name: "Config file", Status: "PASS", Detail: "exists"})
 
-	// Permissions
-	if info, err := os.Stat(resolved); err == nil {
-		mode := info.Mode().Perm()
-		if mode&0o044 != 0 {
-			out = append(out, Check{Name: "Config permissions", Status: "WARN", Detail: fmt.Sprintf("mode %04o is world-readable; use 600", mode)})
-		} else {
-			out = append(out, Check{Name: "Config permissions", Status: "PASS", Detail: fmt.Sprintf("%04o", mode)})
+	out = append(out, privateFileCheck("Config permissions", resolved))
+	managedDir := filepath.Dir(resolved)
+	for _, file := range []struct{ name, path string }{
+		{"Controller secret permissions", filepath.Join(managedDir, "controller-secret")},
+		{"Managed config permissions", filepath.Join(managedDir, "sing-box.json")},
+	} {
+		if _, err := os.Stat(file.path); err == nil {
+			out = append(out, privateFileCheck(file.name, file.path))
 		}
 	}
 
@@ -171,6 +172,18 @@ func Run(cfgPath string, verbose bool) []Check {
 
 func managedBenchmarkProxy(dir string, cfg *config.Config) (string, bool) {
 	return managedconfig.DiscoverBenchmarkProxy(dir)
+}
+
+func privateFileCheck(name, path string) Check {
+	info, err := os.Stat(path)
+	if err != nil {
+		return Check{Name: name, Status: "FAIL", Detail: redact.Error(err)}
+	}
+	mode := info.Mode().Perm()
+	if mode&0o077 != 0 {
+		return Check{Name: name, Status: "WARN", Detail: fmt.Sprintf("mode %04o allows group/world access; use 600", mode)}
+	}
+	return Check{Name: name, Status: "PASS", Detail: fmt.Sprintf("%04o", mode)}
 }
 
 func checkDNS() error {

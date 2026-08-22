@@ -138,6 +138,63 @@ func TestTrendCalculation(t *testing.T) {
 	}
 }
 
+func TestSummarizeIgnoresFailedLatencyForStatisticsAndTrend(t *testing.T) {
+	base := time.Now()
+	records := []Record{
+		{Route: "route", Status: "up", MedianMs: 100, JitterMs: 10, Timestamp: base},
+		{Route: "route", Status: "down", MedianMs: 0, Timestamp: base.Add(time.Minute)},
+		{Route: "route", Status: "degraded", MedianMs: 140, JitterMs: 20, Timestamp: base.Add(2 * time.Minute)},
+		{Route: "route", Status: "down", MedianMs: 0, Timestamp: base.Add(3 * time.Minute)},
+	}
+	s := Summarize(records)[0]
+	if s.Availability != 50 || s.Failures != 2 || s.Median != 120*time.Millisecond || s.Jitter != 15*time.Millisecond || s.Trend != "stable" {
+		t.Fatalf("bad summary: %+v", s)
+	}
+}
+
+func TestSummarizeAllFailuresHasNoLatency(t *testing.T) {
+	s := Summarize([]Record{{Route: "down", Status: "down"}, {Route: "down", Status: "down"}})[0]
+	if s.Availability != 0 || s.Median != 0 || s.Jitter != 0 || s.Trend != "stable" || s.Failures != 2 {
+		t.Fatalf("bad all-down summary: %+v", s)
+	}
+}
+
+func TestSummarizeLatencyMedianAndTrendUseOnlyUsableMeasurements(t *testing.T) {
+	base := time.Now()
+	for _, tt := range []struct {
+		name string
+		ms   []int64
+		want time.Duration
+	}{
+		{"odd valid samples", []int64{100, 200, 300}, 200 * time.Millisecond},
+		{"even valid samples", []int64{100, 200, 400, 500}, 300 * time.Millisecond},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var records []Record
+			for i, median := range tt.ms {
+				records = append(records, Record{Route: "route", Status: "up", MedianMs: median, Timestamp: base.Add(time.Duration(i) * time.Minute)})
+			}
+			if got := Summarize(records)[0].Median; got != tt.want {
+				t.Fatalf("median %s want %s", got, tt.want)
+			}
+		})
+	}
+
+	records := []Record{
+		{Route: "route", Status: "up", MedianMs: 100, Timestamp: base},
+		{Route: "route", Status: "down", Timestamp: base.Add(time.Minute)},
+		{Route: "route", Status: "degraded", MedianMs: 120, Timestamp: base.Add(2 * time.Minute)},
+		{Route: "route", Status: "down", Timestamp: base.Add(3 * time.Minute)},
+		{Route: "route", Status: "up", MedianMs: 240, Timestamp: base.Add(4 * time.Minute)},
+		{Route: "route", Status: "down", Timestamp: base.Add(5 * time.Minute)},
+		{Route: "route", Status: "up", MedianMs: 270, Timestamp: base.Add(6 * time.Minute)},
+	}
+	s := Summarize(records)[0]
+	if s.Trend != "getting worse" || s.Availability < 57.14 || s.Availability > 57.15 || s.Failures != 3 {
+		t.Fatalf("failed samples distorted trend or availability: %+v", s)
+	}
+}
+
 func TestConcurrentSafe(t *testing.T) {
 	db, cleanup := tempDB(t)
 	defer cleanup()

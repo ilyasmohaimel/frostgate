@@ -264,6 +264,19 @@ endpoints:
 	}
 }
 
+func TestEndpointAddrIPv6(t *testing.T) {
+	tests := []struct{ host, want string }{
+		{"203.0.113.10", "203.0.113.10:443"},
+		{"example.com", "example.com:443"},
+		{"2001:db8::1", "[2001:db8::1]:443"},
+	}
+	for _, tt := range tests {
+		if got := (Endpoint{Host: tt.host, Port: 443}).Addr(); got != tt.want {
+			t.Errorf("Addr(%q) = %q, want %q", tt.host, got, tt.want)
+		}
+	}
+}
+
 func TestResolveConfigPathExplicit(t *testing.T) {
 	p := "/tmp/custom.yaml"
 	if got := ResolveConfigPath(p); got != p {

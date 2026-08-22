@@ -4,6 +4,8 @@ Frostgate checks proxy routes, measures latency and throughput, diagnoses failur
 
 It supports Frostgate-managed VLESS + REALITY over RAW/TCP, including Vision, and Hysteria2 through sing-box. It runs locally and stores its configuration and history on the local machine.
 
+![Frostgate CLI demo](assets/frostgate-demo.gif)
+
 ## Quick start
 
 ```sh
@@ -100,7 +102,7 @@ Share and subscription URLs are never printed. Keep `~/.config/frostgate/` priva
 
 - VLESS + REALITY over RAW/TCP; Vision (`xtls-rprx-vision`) is supported.
 - Hysteria2 with password, SNI, salamander obfs, obfs password, and `tls.insecure`.
-- VLESS `ws`, `grpc`, `http`, `quic`, and `kcp` transports are rejected.
+- VLESS `ws`, `grpc`, `http`, `httpupgrade`, `quic`, and `kcp` transports are rejected.
 - Hysteria2 certificate pin parameters (`pinSHA256` and `pin`) are rejected because sing-box pin preservation is not implemented.
 - Trojan, Shadowsocks, VMess, and unsupported subscription nodes are reported as unsupported.
 
@@ -170,6 +172,8 @@ History is stored at `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/fr
 ## Configuration
 
 Most users should use `frostgate setup`, `add`, or `import`. The generated config is at `$XDG_CONFIG_HOME/frostgate/config.yaml` or `~/.config/frostgate/config.yaml`.
+
+An explicit `--config /path/to/config.yaml` is an isolated profile: its managed `sing-box.json` and `controller-secret` live beside that config instead of in the default XDG directory.
 
 ```yaml
 defaults:
@@ -265,6 +269,12 @@ make check
 make dist
 go test -race ./...
 sh scripts/test-install.sh
+```
+
+The README GIF is generated from a local fixture with no proxy credentials. With VHS and `ttyd` on `PATH`:
+
+```sh
+vhs docs/frostgate-demo.tape
 ```
 
 ## License

@@ -14,15 +14,18 @@ import (
 )
 
 type Model struct {
-	cfg      *config.Config
-	results  []probe.Result
-	err      error
-	interval time.Duration
-	width    int
-	height   int
-	lastTick time.Time
-	quitting bool
-	verbose  bool
+	cfg         *config.Config
+	results     []probe.Result
+	err         error
+	interval    time.Duration
+	width       int
+	height      int
+	lastTick    time.Time
+	lastRefresh time.Time
+	probing     bool
+	pending     bool
+	quitting    bool
+	verbose     bool
 	// onSnapshot is invoked after every completed probe snapshot (scheduled
 	// tick or manual refresh). The application layer uses it to feed the
 	// history recorder; the TUI itself never touches storage.
@@ -31,8 +34,9 @@ type Model struct {
 
 type tickMsg time.Time
 type resultsMsg struct {
-	results []probe.Result
-	err     error
+	results   []probe.Result
+	err       error
+	completed time.Time
 }
 
 var (
@@ -48,6 +52,7 @@ func New(cfg *config.Config, interval time.Duration, verbose bool, onSnapshot fu
 		interval:   interval,
 		verbose:    verbose,
 		lastTick:   time.Now(),
+		probing:    true,
 		onSnapshot: onSnapshot,
 	}
 }
@@ -61,7 +66,7 @@ func (m Model) probeCmd() tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		results := probe.Run(ctx, m.cfg)
-		return resultsMsg{results: results}
+		return resultsMsg{results: results, completed: time.Now()}
 	}
 }
 
@@ -79,6 +84,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "r":
+			if m.probing {
+				m.pending = true
+				return m, nil
+			}
+			m.probing = true
 			return m, m.probeCmd()
 		}
 	case tea.WindowSizeMsg:
@@ -87,17 +97,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tickMsg:
 		m.lastTick = time.Time(msg)
+		if m.probing {
+			m.pending = true
+			return m, m.tickCmd()
+		}
+		m.probing = true
 		return m, tea.Batch(m.probeCmd(), m.tickCmd())
 	case resultsMsg:
+		m.probing = false
 		if msg.err != nil {
 			m.err = msg.err
 		} else {
 			m.results = msg.results
 			m.err = nil
-			m.lastTick = time.Now()
+			m.lastRefresh = msg.completed
+			if m.lastRefresh.IsZero() {
+				m.lastRefresh = time.Now()
+			}
 			if m.onSnapshot != nil {
 				m.onSnapshot(msg.results)
 			}
+		}
+		if m.pending {
+			m.pending = false
+			m.probing = true
+			return m, m.probeCmd()
 		}
 		return m, nil
 	}
@@ -149,7 +173,11 @@ func (m Model) View() string {
 		}
 	}
 	b += "\n"
-	b += subStyle.Render(fmt.Sprintf("Last refresh: %s", time.Now().Format("15:04:05"))) + "  " + helpStyle.Render("q quit  r refresh") + "\n"
+	lastRefresh := "never"
+	if !m.lastRefresh.IsZero() {
+		lastRefresh = m.lastRefresh.Format("15:04:05")
+	}
+	b += subStyle.Render(fmt.Sprintf("Last refresh: %s", lastRefresh)) + "  " + helpStyle.Render("q quit  r refresh") + "\n"
 	if m.verbose && len(m.results) > 0 {
 		// show details: each route's samples?
 	}

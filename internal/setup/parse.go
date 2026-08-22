@@ -86,15 +86,8 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if spx == "" {
 		spx = q.Get("spiderX")
 	}
-	security := q.Get("security")
-	if security == "" {
-		security = q.Get("type")
-		// type may be tcp etc, not security, so fallback to empty; we already validated transport separately
-		if security == "tcp" || security == "raw" {
-			security = ""
-		}
-	}
-	transport := q.Get("type")
+	security := strings.ToLower(q.Get("security"))
+	transport := strings.ToLower(q.Get("type"))
 	if transport != "" && transport != "tcp" && transport != "raw" {
 		return nil, fmt.Errorf("unsupported VLESS transport %q", transport)
 	}
@@ -107,7 +100,7 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if sni == "" {
 		return nil, fmt.Errorf("missing sni/serverName for reality")
 	}
-	if security != "" && !strings.EqualFold(security, "reality") {
+	if security != "reality" {
 		return nil, fmt.Errorf("non-REALITY VLESS is not currently supported: security=%q", security)
 	}
 	// Fragment may contain name but not needed
@@ -156,9 +149,6 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if pass == "" {
 		return nil, fmt.Errorf("missing password")
 	}
-	if decoded, err := url.QueryUnescape(pass); err == nil {
-		pass = decoded
-	}
 	host := u.Hostname()
 	portStr := u.Port()
 	if host == "" || portStr == "" {
@@ -186,9 +176,6 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	}
 	if obfs == "salamander" && obfsPass == "" {
 		return nil, fmt.Errorf("salamander obfs requires obfs-password")
-	}
-	if decoded, err := url.QueryUnescape(obfsPass); err == nil {
-		obfsPass = decoded
 	}
 	insecure := false
 	if v := q.Get("insecure"); v == "1" || strings.EqualFold(v, "true") {

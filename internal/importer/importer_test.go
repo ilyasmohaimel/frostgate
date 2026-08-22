@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
 func TestParseLinkList(t *testing.T) {
@@ -40,6 +42,7 @@ proxies:
     server: 203.0.113.1
     port: 443
     uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
     flow: xtls-rprx-vision
     servername: example.com
     client-fingerprint: chrome
@@ -90,6 +93,115 @@ func TestSingBoxJSON(t *testing.T) {
 	}
 	if !foundTrojan {
 		t.Error("expected trojan skipped")
+	}
+}
+
+func TestImportRejectsUnsupportedVLESSTransports(t *testing.T) {
+	for _, data := range [][]byte{[]byte(`proxies:
+  - name: bad
+    type: vless
+    server: 203.0.113.10
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: ws
+    servername: example.com
+    reality-opts: {public-key: fixture-key}
+	`), []byte(`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","transport":{"type":"grpc"},"tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`)} {
+		result := ParseSubscription(data)
+		if len(result.Links) != 0 || len(result.Skipped) != 1 {
+			t.Fatalf("unsupported transport was rewritten: %+v", result)
+		}
+	}
+}
+
+func TestImportedFieldFidelityAndIPv6(t *testing.T) {
+	cases := []struct {
+		name  string
+		data  string
+		check func(t *testing.T, link string)
+	}{
+		{
+			name: "direct vless share",
+			data: "vless://11111111-1111-4111-8111-111111111111@[2001:db8::3]:443?encryption=none&security=reality&sni=example.com&pbk=fixture-key&sid=abcd&fp=firefox&flow=xtls-rprx-vision&spx=%2Fedge&packet_encoding=packetaddr&type=raw#direct",
+			check: func(t *testing.T, link string) {
+				v, err := setup.ParseVLESSShareLink(link, "route")
+				if err != nil || v.Server != "2001:db8::3" || v.Flow != "xtls-rprx-vision" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.FP != "firefox" || v.PBK != "fixture-key" || v.SID != "abcd" {
+					t.Fatalf("direct VLESS fidelity failed: %+v err=%v link=%s", v, err, link)
+				}
+			},
+		},
+		{
+			name: "clash vless",
+			data: `proxies:
+  - name: v6-reality
+    type: vless
+    server: "2001:db8::1"
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
+    flow: xtls-rprx-vision
+    servername: example.com
+    client-fingerprint: firefox
+    packet-encoding: packetaddr
+    spider-x: /edge
+    reality-opts: {public-key: fixture-key, short-id: abcd}
+`,
+			check: func(t *testing.T, link string) {
+				v, err := setup.ParseVLESSShareLink(link, "route")
+				if err != nil || v.Server != "2001:db8::1" || v.Flow != "xtls-rprx-vision" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.FP != "firefox" || v.PBK != "fixture-key" || v.SID != "abcd" {
+					t.Fatalf("vless fidelity failed: %+v err=%v link=%s", v, err, link)
+				}
+			},
+		},
+		{
+			name: "clash hysteria",
+			data: `proxies:
+  - name: h
+    type: hysteria2
+    server: "2001:db8::4"
+    port: 443
+    password: "p%25+ text"
+    sni: example.com
+    obfs: salamander
+    obfs-password: "obfs%2B+ text"
+    skip-cert-verify: true
+`,
+			check: func(t *testing.T, link string) {
+				h, err := setup.ParseHysteria2ShareLink(link, "route")
+				if err != nil || h.Server != "2001:db8::4" || h.Password != "p%25+ text" || h.ObfsType != "salamander" || h.ObfsPassword != "obfs%2B+ text" || !h.Insecure {
+					t.Fatalf("clash Hysteria2 fidelity failed: %+v err=%v link=%s", h, err, link)
+				}
+			},
+		},
+		{
+			name: "singbox vless",
+			data: `{"outbounds":[{"type":"vless","tag":"v","server":"2001:db8::5","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`,
+			check: func(t *testing.T, link string) {
+				v, err := setup.ParseVLESSShareLink(link, "route")
+				if err != nil || v.Server != "2001:db8::5" || v.Flow != "xtls-rprx-vision" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.FP != "firefox" || v.PBK != "fixture-key" || v.SID != "abcd" {
+					t.Fatalf("sing-box VLESS fidelity failed: %+v err=%v link=%s", v, err, link)
+				}
+			},
+		},
+		{
+			name: "singbox hysteria",
+			data: `{"outbounds":[{"type":"hysteria2","tag":"h","server":"2001:db8::2","server_port":443,"password":"p%25+ text","obfs":{"type":"salamander","password":"obfs%2B+ text"},"tls":{"enabled":true,"server_name":"example.com","insecure":true}}]}`,
+			check: func(t *testing.T, link string) {
+				h, err := setup.ParseHysteria2ShareLink(link, "route")
+				if err != nil || h.Server != "2001:db8::2" || h.Password != "p%25+ text" || h.ObfsType != "salamander" || h.ObfsPassword != "obfs%2B+ text" || !h.Insecure {
+					t.Fatalf("hysteria fidelity failed: %+v err=%v link=%s", h, err, link)
+				}
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ParseSubscription([]byte(tt.data))
+			if len(result.Links) != 1 {
+				t.Fatalf("links=%d skipped=%+v", len(result.Links), result.Skipped)
+			}
+			tt.check(t, result.Links[0])
+		})
 	}
 }
 

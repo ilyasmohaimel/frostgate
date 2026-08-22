@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -243,7 +244,28 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
+			if transport, ok := mm["transport"]; ok && !isRawTransport(transport) {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+				continue
+			}
+			if network, ok := mm["network"].(string); ok && network != "" && !isRawTransport(network) {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+				continue
+			}
+			transport, _ := mm["network"].(string)
+			if transport == "" {
+				transport, _ = mm["transport"].(string)
+			}
+			transport = strings.ToLower(transport)
+			if transport != "tcp" && transport != "raw" {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+				continue
+			}
 			flow, _ := mm["flow"].(string)
+			if flow != "" && flow != "xtls-rprx-vision" {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS flow", Line: typ})
+				continue
+			}
 			sni := ""
 			if v, ok := mm["servername"].(string); ok {
 				sni = v
@@ -262,7 +284,12 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			if v, ok := mm["fingerprint"].(string); ok && v != "" {
 				fp = v
 			}
-			if opts, ok := mm["reality-opts"].(map[string]any); ok {
+			opts, ok := mm["reality-opts"].(map[string]any)
+			if !ok {
+				skipped = append(skipped, Skipped{Reason: "missing REALITY options", Line: typ})
+				continue
+			}
+			{
 				if pk, ok := opts["public-key"].(string); ok {
 					pbk = pk
 				}
@@ -274,11 +301,6 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				}
 				if si2, ok := opts["short_id"].(string); ok && sid == "" {
 					sid = si2
-				}
-			}
-			if pbk == "" {
-				if v, ok := mm["public-key"].(string); ok {
-					pbk = v
 				}
 			}
 			if pbk == "" {
@@ -301,9 +323,19 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			if flow != "" {
 				q.Set("flow", flow)
 			}
-			q.Set("type", "tcp")
+			if spx, _ := mm["spider-x"].(string); spx != "" {
+				q.Set("spx", spx)
+			} else if spx, _ := mm["spider_x"].(string); spx != "" {
+				q.Set("spx", spx)
+			}
+			if packet, _ := mm["packet-encoding"].(string); packet != "" {
+				q.Set("packet_encoding", packet)
+			} else if packet, _ := mm["packet_encoding"].(string); packet != "" {
+				q.Set("packet_encoding", packet)
+			}
+			q.Set("type", transport)
 			fragment := url.QueryEscape(name)
-			link := fmt.Sprintf("vless://%s@%s:%d?%s#%s", uuid, server, port, q.Encode(), fragment)
+			link := vlessLink(uuid, server, port, q, fragment)
 			links = append(links, link)
 		case "hysteria2", "hysteria":
 			server, _ := mm["server"].(string)
@@ -337,7 +369,11 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			}
 			if obfs != "" {
 				q.Set("obfs", obfs)
-				if obfs == "salamander" && obfsPass != "" {
+				if obfs == "salamander" {
+					if obfsPass == "" {
+						skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 salamander obfs", Line: typ})
+						continue
+					}
 					q.Set("obfs-password", obfsPass)
 				}
 			}
@@ -345,11 +381,7 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				q.Set("insecure", "1")
 			}
 			fragment := url.QueryEscape(name)
-			u := fmt.Sprintf("hysteria2://%s@%s:%d", url.QueryEscape(password), server, port)
-			if len(q) > 0 {
-				u += "?" + q.Encode()
-			}
-			u += "#" + fragment
+			u := hysteria2Link(password, server, port, q, fragment)
 			links = append(links, u)
 		default:
 			skipped = append(skipped, Skipped{Reason: "unsupported clash type: " + typ, Line: typ})
@@ -400,12 +432,30 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
+			if transport, ok := mm["transport"]; ok && !isRawTransport(transport) {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+				continue
+			}
+			if network, ok := mm["network"].(string); ok && network != "" && !isRawTransport(network) {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+				continue
+			}
 			flow, _ := mm["flow"].(string)
+			if flow != "" && flow != "xtls-rprx-vision" {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS flow", Line: typ})
+				continue
+			}
 			sni := ""
 			pbk := ""
 			sid := ""
+			spx := ""
 			fp := "chrome"
-			if tlsRaw, ok := mm["tls"].(map[string]any); ok {
+			tlsRaw, ok := mm["tls"].(map[string]any)
+			if !ok || !boolField(tlsRaw, "enabled") || hasCertificatePin(tlsRaw) {
+				skipped = append(skipped, Skipped{Reason: "missing or unsupported VLESS TLS/REALITY settings", Line: typ})
+				continue
+			}
+			{
 				if sn, ok := tlsRaw["server_name"].(string); ok {
 					sni = sn
 				}
@@ -414,12 +464,15 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 						fp = f
 					}
 				}
-				if reality, ok := tlsRaw["reality"].(map[string]any); ok {
+				if reality, ok := tlsRaw["reality"].(map[string]any); ok && boolField(reality, "enabled") {
 					if pk, ok := reality["public_key"].(string); ok {
 						pbk = pk
 					}
 					if si, ok := reality["short_id"].(string); ok {
 						sid = si
+					}
+					if value, ok := reality["spider_x"].(string); ok && value != "" {
+						spx = value
 					}
 				}
 			}
@@ -443,12 +496,18 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 			if flow != "" {
 				q.Set("flow", flow)
 			}
+			if spx != "" {
+				q.Set("spx", spx)
+			}
+			if packet, _ := mm["packet_encoding"].(string); packet != "" {
+				q.Set("packet_encoding", packet)
+			}
 			q.Set("type", "tcp")
 			fname := tag
 			if fname == "" {
 				fname = fmt.Sprintf("vless-%d", port)
 			}
-			link := fmt.Sprintf("vless://%s@%s:%d?%s#%s", uuid, server, port, q.Encode(), url.QueryEscape(fname))
+			link := vlessLink(uuid, server, port, q, url.QueryEscape(fname))
 			links = append(links, link)
 		case "hysteria2":
 			server, _ := mm["server"].(string)
@@ -458,10 +517,18 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 route", Line: typ})
 				continue
 			}
+			q := url.Values{}
 			sni := ""
 			if tlsRaw, ok := mm["tls"].(map[string]any); ok {
+				if hasCertificatePin(tlsRaw) {
+					skipped = append(skipped, Skipped{Reason: "unsupported Hysteria2 certificate pin", Line: typ})
+					continue
+				}
 				if sn, ok := tlsRaw["server_name"].(string); ok {
 					sni = sn
+				}
+				if boolField(tlsRaw, "insecure") {
+					q.Set("insecure", "1")
 				}
 			}
 			obfsPass := ""
@@ -474,12 +541,15 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 					obfsPass = p
 				}
 			}
-			q := url.Values{}
 			if sni != "" {
 				q.Set("sni", sni)
 			}
 			if obfsType != "" {
 				q.Set("obfs", obfsType)
+				if obfsType == "salamander" && obfsPass == "" {
+					skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 salamander obfs", Line: typ})
+					continue
+				}
 				if obfsPass != "" {
 					q.Set("obfs-password", obfsPass)
 				}
@@ -488,11 +558,7 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 			if fname == "" {
 				fname = fmt.Sprintf("hysteria-%d", port)
 			}
-			u := fmt.Sprintf("hysteria2://%s@%s:%d", url.QueryEscape(password), server, port)
-			if len(q) > 0 {
-				u += "?" + q.Encode()
-			}
-			u += "#" + url.QueryEscape(fname)
+			u := hysteria2Link(password, server, port, q, url.QueryEscape(fname))
 			links = append(links, u)
 		default:
 			if typ != "direct" && typ != "block" && typ != "selector" && typ != "urltest" {
@@ -501,6 +567,45 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 		}
 	}
 	return
+}
+
+func isRawTransport(v any) bool {
+	switch transport := v.(type) {
+	case string:
+		transport = strings.ToLower(transport)
+		return transport == "tcp" || transport == "raw"
+	case map[string]any:
+		kind, _ := transport["type"].(string)
+		return strings.EqualFold(kind, "tcp") || strings.EqualFold(kind, "raw")
+	default:
+		return false
+	}
+}
+
+func boolField(m map[string]any, key string) bool {
+	v, _ := m[key].(bool)
+	return v
+}
+
+func hasCertificatePin(m map[string]any) bool {
+	for _, key := range []string{"pin", "pinSHA256", "certificate_public_key_sha256", "certificate_fingerprint", "fingerprint"} {
+		if v, ok := m[key].(string); ok && v != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func vlessLink(uuid, server string, port int, q url.Values, fragment string) string {
+	return fmt.Sprintf("vless://%s@%s?%s#%s", url.User(uuid).String(), net.JoinHostPort(server, strconv.Itoa(port)), q.Encode(), fragment)
+}
+
+func hysteria2Link(password, server string, port int, q url.Values, fragment string) string {
+	link := fmt.Sprintf("hysteria2://%s@%s", url.User(password).String(), net.JoinHostPort(server, strconv.Itoa(port)))
+	if len(q) > 0 {
+		link += "?" + q.Encode()
+	}
+	return link + "#" + fragment
 }
 
 func redactLine(line string) string {

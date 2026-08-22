@@ -255,6 +255,83 @@ func TestConfigContractAffectsRuntime(t *testing.T) {
 	}
 }
 
+func TestUnknownRootCommandsFail(t *testing.T) {
+	for _, command := range []string{"recomemd", "frobnicate"} {
+		stdout, stderr, code := runCLI(t, nil, command)
+		if code != 3 || len(stdout) != 0 || !strings.Contains(string(stderr), `unknown command "`+command+`"`) {
+			t.Fatalf("%s: code=%d stdout=%q stderr=%q", command, code, stdout, stderr)
+		}
+	}
+	stdout, stderr, code := runCLI(t, nil, "--json", "recomemd")
+	if code != 3 || len(stdout) != 0 || !strings.Contains(string(stderr), `unknown command "recomemd"`) {
+		t.Fatalf("global flags before unknown command: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestHistoryDoesNotAcceptConfigFlag(t *testing.T) {
+	stdout, stderr, code := runCLI(t, nil, "history", "--config", "fixture.yaml")
+	if code != 3 || len(stdout) != 0 || !strings.Contains(string(stderr), `unknown flag "--config"`) {
+		t.Fatalf("history accepted ignored config flag: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestCustomConfigKeepsManagedSidecarsIsolated(t *testing.T) {
+	f := newCLIFixture(t)
+	defaultSidecar := []byte(`{"outbounds":[{"type":"vless","tag":"default-route","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`)
+	defaultSidecarPath := filepath.Join(filepath.Dir(f.configPath), "sing-box.json")
+	if err := os.WriteFile(defaultSidecarPath, defaultSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	customDir := filepath.Join(f.home, "profiles", "custom")
+	if err := os.MkdirAll(customDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	customConfig := filepath.Join(customDir, "config.yaml")
+	data, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.ReplaceAll(data, []byte("proxy-display-name"), []byte("custom-hysteria"))
+	data = bytes.ReplaceAll(data, []byte("proxy-out"), []byte("custom-hysteria"))
+	if err := os.WriteFile(customConfig, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	customSidecar := []byte(`{"outbounds":[{"type":"hysteria2","tag":"custom-hysteria","server":"203.0.113.20","server_port":443,"password":"fixture-password","tls":{"enabled":true,"server_name":"example.com"}}]}`)
+	if err := os.WriteFile(filepath.Join(customDir, "sing-box.json"), customSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, f.env(), "diagnose", "--json", "custom-hysteria", "--config", customConfig)
+	if code != 0 {
+		t.Fatalf("diagnose exit=%d stderr=%s", code, stderr)
+	}
+	layers := requireJSON(t, stdout).([]any)
+	foundManagedHysteria := false
+	for _, raw := range layers {
+		layer := raw.(map[string]any)
+		if layer["name"] == "Server custom-hysteria" && strings.Contains(layer["detail"].(string), "not independently verified") {
+			foundManagedHysteria = true
+		}
+	}
+	if !foundManagedHysteria {
+		t.Fatalf("diagnose did not load custom managed sidecar: %v", layers)
+	}
+
+	stdout, stderr, code = runCLI(t, f.env(), "network-check", "--json", "--config", customConfig)
+	if code != 0 {
+		t.Fatalf("network-check exit=%d stderr=%s", code, stderr)
+	}
+	doc := requireJSON(t, stdout).(map[string]any)
+	matrix := doc["matrix"].([]any)
+	if len(matrix) == 0 || len(matrix[0].(map[string]any)["routes"].([]any)) != 1 || matrix[0].(map[string]any)["routes"].([]any)[0].(map[string]any)["kind"] != "hysteria2" {
+		t.Fatalf("network-check did not load custom managed sidecar: %v", doc["matrix"])
+	}
+	gotDefault, err := os.ReadFile(defaultSidecarPath)
+	if err != nil || !bytes.Equal(gotDefault, defaultSidecar) {
+		t.Fatalf("custom config commands changed default sidecar: err=%v", err)
+	}
+}
+
 func TestBenchmarkDiscoversManagedProxyFromPreV042Config(t *testing.T) {
 	f := newCLIFixture(t)
 	configData, err := os.ReadFile(f.configPath)

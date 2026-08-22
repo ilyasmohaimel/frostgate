@@ -53,7 +53,7 @@ func init() {
 func main() { os.Exit(run()) }
 
 func run() int {
-	if len(os.Args) > 1 {
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
 		case "setup":
 			home := setup.DefaultHomeDir()
@@ -102,6 +102,9 @@ func run() int {
 		case "help", "--help", "-h":
 			printHelp()
 			return 0
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
+			return 3
 		}
 	}
 
@@ -118,6 +121,10 @@ func run() int {
 	setupFlag := flag.Bool("setup", false, "run interactive setup wizard")
 	flag.Usage = func() { printHelp() }
 	flag.Parse()
+	if args := flag.Args(); len(args) > 0 {
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
+		return 3
+	}
 	if *verbose || *debug {
 		*verbose = true
 	}
@@ -259,11 +266,7 @@ func handleAdd(args []string) int {
 		fmt.Fprintln(os.Stderr, "empty link")
 		return 3
 	}
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
-	}
-	dir := setup.ConfigDir(home)
+	cfgPath2, dir := commandPaths(cfgPath)
 	if err := setup.EnsureConfigDir(dir); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
@@ -271,10 +274,6 @@ func handleAdd(args []string) int {
 	tag := strings.TrimSpace(nameFlag)
 	if tag == "" {
 		tag = route.SanitizeName(route.DeriveNameFromLink(link, 1))
-	}
-	cfgPath2 := filepath.Join(dir, "config.yaml")
-	if cfgPath != "" {
-		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
 	fmt.Println("Importing route...")
 	result, err := addManagedRoute(dir, cfgPath2, link, tag, nil)
@@ -368,11 +367,7 @@ func handleImport(args []string) int {
 		return 3
 	}
 	fmt.Printf("Found %d links, %d skipped\n", len(res.Links), len(res.Skipped))
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
-	}
-	dir := setup.ConfigDir(home)
+	cfgPath2, dir := commandPaths(cfgPath)
 	if err := setup.EnsureConfigDir(dir); err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
@@ -437,10 +432,6 @@ func handleImport(args []string) int {
 		if r.Hysteria != nil {
 			mg.AddHysteria(r.Hysteria)
 		}
-	}
-	cfgPath2 := filepath.Join(dir, "config.yaml")
-	if cfgPath != "" {
-		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
 	tags := make([]string, 0, len(toAdd))
 	for _, imported := range toAdd {
@@ -700,17 +691,7 @@ func handleBenchmark(args []string) int {
 		}
 	}
 	_ = positionals
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
-	}
-	dir := setup.ConfigDir(home)
-	cfgFile := config.ResolveConfigPath(cfgPath)
-	if cfgPath == "" {
-		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
-			cfgFile = filepath.Join(dir, "config.yaml")
-		}
-	}
+	cfgFile, _ := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -959,17 +940,7 @@ func handleDiagnose(args []string) int {
 		}
 	}
 	rest := positionals
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
-	}
-	dir := setup.ConfigDir(home)
-	cfgFile := config.ResolveConfigPath(cfgPath)
-	if cfgPath == "" {
-		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
-			cfgFile = filepath.Join(dir, "config.yaml")
-		}
-	}
+	cfgFile, dir := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -977,7 +948,7 @@ func handleDiagnose(args []string) int {
 	}
 	var layers []diagnose.Layer
 	opts := diagnose.Options{}
-	if mg, err := managedconfig.Load(setup.ConfigDir(testHome())); err == nil {
+	if mg, err := managedconfig.Load(dir); err == nil {
 		opts.Managed = mg
 	}
 	if len(rest) == 0 {
@@ -1072,7 +1043,7 @@ func handleNetworkCheck(args []string) int {
 	var destURLs []string
 	destLabels := map[string]string{}
 	var cfg *config.Config
-	resolvedConfig := config.ResolveConfigPath(cfgPath)
+	resolvedConfig, managedDir := commandPaths(cfgPath)
 	if loaded, err := config.Load(resolvedConfig); err == nil {
 		cfg = loaded
 	} else if cfgPath != "" {
@@ -1107,7 +1078,7 @@ func handleNetworkCheck(args []string) int {
 	// Proxy destination matrix via per-outbound URL-test. Never mutates the
 	// benchmark selector.
 	if cfg != nil {
-		mg, _ := managedconfig.Load(setup.ConfigDir(testHome()))
+		mg, _ := managedconfig.Load(managedDir)
 		routes := proxyRoutesForMatrix(cfg, mg)
 		client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1265,14 +1236,6 @@ func proxyRoutesForMatrix(cfg *config.Config, mg *managedconfig.Managed) []netwo
 	return out
 }
 
-func testHome() string {
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		return h
-	}
-	return setup.DefaultHomeDir()
-}
-
-// defaultSidecarConfig returns the sidecar config path when it exists.
 // --- compare ---
 type compareRoute struct {
 	Route        string  `json:"route"`
@@ -1459,15 +1422,15 @@ func handleCompare(args []string) int {
 func handleRecommend(args []string) int {
 	jsonOut := false
 	cfgPath := ""
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--json" {
 			jsonOut = true
-		} else if a == "--config" {
-			// handled via next arg if needed, but recommend doesn't have config flag; ignore
+		} else if a == "--config" && i+1 < len(args) {
+			cfgPath = args[i+1]
+			i++
 		} else if strings.HasPrefix(a, "--config=") {
 			cfgPath = strings.TrimPrefix(a, "--config=")
-		} else if a == "--config" {
-			// handled above
 		} else if a == "-h" || a == "--help" {
 			fmt.Fprintln(os.Stderr, "usage: frostgate recommend [--json] [--config path]")
 			return 0
@@ -1476,23 +1439,7 @@ func handleRecommend(args []string) int {
 			return 3
 		}
 	}
-	// Also handle --config as second arg
-	for i, a := range args {
-		if a == "--config" && i+1 < len(args) {
-			cfgPath = args[i+1]
-		}
-	}
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
-	}
-	dir := setup.ConfigDir(home)
-	cfgFile := filepath.Join(dir, "config.yaml")
-	if cfgPath != "" {
-		cfgFile = config.ResolveConfigPath(cfgPath)
-	} else if _, err := os.Stat(cfgFile); err != nil {
-		cfgFile = config.ResolveConfigPath("")
-	}
+	cfgFile, _ := commandPaths(cfgPath)
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -1548,7 +1495,6 @@ func handleHistory(args []string) int {
 	route := ""
 	networkLabel := ""
 	jsonOut := false
-	cfgPath := ""
 	var positionals []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -1569,13 +1515,8 @@ func handleHistory(args []string) int {
 			i++
 		} else if strings.HasPrefix(a, "--network=") {
 			networkLabel = strings.TrimPrefix(a, "--network=")
-		} else if a == "--config" && i+1 < len(args) {
-			cfgPath = args[i+1]
-			i++
-		} else if strings.HasPrefix(a, "--config=") {
-			cfgPath = strings.TrimPrefix(a, "--config=")
 		} else if a == "-h" || a == "--help" {
-			fmt.Fprintln(os.Stderr, "usage: frostgate history [--since duration] [--route name] [--network label] [--json] [--config path]")
+			fmt.Fprintln(os.Stderr, "usage: frostgate history [--since duration] [--route name] [--network label] [--json]")
 			return 0
 		} else if len(a) > 0 && a[0] == '-' {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
@@ -1585,7 +1526,6 @@ func handleHistory(args []string) int {
 		}
 	}
 	_ = positionals
-	_ = cfgPath
 	since, err := parseSince(sinceStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --since: %v\n", err)

@@ -96,8 +96,19 @@ func Recommend(inputs []Input, historyCount int) Result {
 	if best.Download > 0 {
 		reasons = append(reasons, fmt.Sprintf("%.0f Mbps", best.Download))
 	}
-	if best.Jitter < 20*time.Millisecond {
-		reasons = append(reasons, "lowest jitter")
+	if best.Jitter > 0 {
+		lowest := true
+		for _, in := range healthy {
+			if in.Name != best.Name && in.Jitter > 0 && in.Jitter < best.Jitter {
+				lowest = false
+				break
+			}
+		}
+		if lowest {
+			reasons = append(reasons, "lowest jitter")
+		} else {
+			reasons = append(reasons, fmt.Sprintf("%dms jitter", best.Jitter.Milliseconds()))
+		}
 	}
 	if best.Availability > 90 {
 		reasons = append(reasons, fmt.Sprintf("%.1f%% availability over history", best.Availability))

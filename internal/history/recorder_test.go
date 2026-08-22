@@ -116,8 +116,69 @@ func TestOpenReadonlyNoCreate(t *testing.T) {
 	if _, err := OpenReadonly(); err != ErrNoHistory {
 		t.Fatalf("want ErrNoHistory got %v", err)
 	}
-	if _, err := os.Stat(dataHome); err != nil {
-		t.Fatal("readonly open must not create data home")
+	if _, err := os.Stat(filepath.Join(dataHome, "frostgate")); !os.IsNotExist(err) {
+		t.Fatalf("readonly open created history directory: %v", err)
+	}
+}
+
+func TestOpenReadonlyDoesNotMutateExistingDB(t *testing.T) {
+	withTempDataHome(t)
+	db, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Add(Record{Route: "route", Status: "up", MedianMs: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := HistoryPath()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro, err := OpenReadonly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := ro.Query(0, "", "")
+	if err != nil || len(records) != 1 {
+		t.Fatalf("readonly query: records=%v err=%v", records, err)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("readonly changed DB: %v", err)
+	}
+}
+
+func TestOpenReadonlyCanReadNonWritableDB(t *testing.T) {
+	withTempDataHome(t)
+	db, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Add(Record{Route: "route", Status: "up", MedianMs: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := HistoryPath()
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	ro, err := OpenReadonly()
+	if err != nil {
+		t.Fatalf("readonly open failed for readable non-writable DB: %v", err)
+	}
+	defer ro.Close()
+	if records, err := ro.Query(0, "", ""); err != nil || len(records) != 1 {
+		t.Fatalf("readonly query records=%v err=%v", records, err)
 	}
 }
 

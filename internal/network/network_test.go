@@ -2,14 +2,15 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
 func TestNormalizeAddrs(t *testing.T) {
-	got := NormalizeAddrs([]string{"B", "a", "a", " c ", ""})
-	want := []string{"a", "b", "c"}
+	got := NormalizeAddrs([]string{"2001:0DB8::1", "203.0.113.2", "203.0.113.2", " 203.0.113.1 ", "bad"})
+	want := []string{"2001:db8::1", "203.0.113.1", "203.0.113.2"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
@@ -38,11 +39,15 @@ func dohStub(answers map[string]string, status int) *httptest.Server {
 		w.Header().Set("Content-Type", "application/dns-json")
 		w.WriteHeader(status)
 		data := answers[qtype]
+		rr := 1
+		if qtype == "AAAA" {
+			rr = 28
+		}
 		if data == "" {
 			w.Write([]byte(`{"Status":0,"Answer":[]}`))
 			return
 		}
-		w.Write([]byte(`{"Status":0,"Answer":[{"name":"x","type":1,"data":"` + data + `"}]}`))
+		w.Write([]byte(fmt.Sprintf(`{"Status":0,"Answer":[{"name":"x","type":%d,"data":"%s"}]}`, rr, data)))
 	}))
 }
 
@@ -88,6 +93,41 @@ func TestFetchDoHAnswersMalformed(t *testing.T) {
 	defer srv.Close()
 	if _, err := FetchDoHAnswers(context.Background(), srv.Client(), srv.URL, "x"); err == nil {
 		t.Fatal("expected malformed error")
+	}
+}
+
+func TestFetchDoHFiltersOnlyAddressRecords(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("type") == "A" {
+			_, _ = w.Write([]byte(`{"Status":0,"Answer":[{"type":5,"data":"alias.example"},{"type":1,"data":"203.0.113.9"},{"type":1,"data":"203.0.113.9"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"Status":0,"Answer":[{"type":28,"data":"2001:0db8::9"}]}`))
+	}))
+	defer srv.Close()
+	got, err := FetchDoHAnswers(context.Background(), srv.Client(), srv.URL, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"2001:db8::9", "203.0.113.9"}
+	got = NormalizeAddrs(got)
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("answers %v want %v", got, want)
+	}
+}
+
+func TestFetchDoHRejectsDNSFailureAndMalformedAddress(t *testing.T) {
+	for _, body := range []string{
+		`{"Status":3,"Answer":[]}`,
+		`{"Status":2,"Answer":[]}`,
+		`{"Status":0,"Answer":[{"type":1,"data":"not-an-ip"}]}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+		_, err := FetchDoHAnswers(context.Background(), srv.Client(), srv.URL, "example.com")
+		srv.Close()
+		if err == nil {
+			t.Fatalf("body %s was accepted", body)
+		}
 	}
 }
 

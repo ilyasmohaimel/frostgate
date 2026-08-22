@@ -175,6 +175,22 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 // Later route additions preserve the user's existing YAML instead of replacing
 // it with this initial template.
 func BuildFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string) config.Config {
+	return buildFrostgateConfig(vlessTags, hysteriaTags, testURL, controller, secretFile, true)
+}
+
+// BuildExternalControllerConfig creates a config for an unmanaged controller.
+// Frostgate has not established ownership of a SOCKS listener there, so it
+// must not guess benchmark_proxy.
+func BuildExternalControllerConfig(tags []string, testURL, controller, secretFile string) config.Config {
+	return buildFrostgateConfig(tags, nil, testURL, controller, secretFile, false)
+}
+
+// BuildDirectOnlyConfig creates a config without any proxy benchmark listener.
+func BuildDirectOnlyConfig(testURL string) config.Config {
+	return buildFrostgateConfig(nil, nil, testURL, config.DefaultSingBoxController, "", false)
+}
+
+func buildFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller, secretFile string, managed bool) config.Config {
 	if testURL == "" {
 		testURL = config.DefaultTestURL
 	}
@@ -190,10 +206,9 @@ func BuildFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller,
 			MaxJitter:      config.Duration{Duration: 80 * time.Millisecond},
 		},
 		SingBox: config.SingBoxConfig{
-			Controller:     controller,
-			SecretFile:     secretFile,
-			TestURL:        testURL,
-			BenchmarkProxy: "127.0.0.1:2080",
+			Controller: controller,
+			SecretFile: secretFile,
+			TestURL:    testURL,
 		},
 		Endpoints: []config.Endpoint{{
 			Name:     "direct",
@@ -201,6 +216,9 @@ func BuildFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controller,
 			URL:      testURL,
 			Priority: 100,
 		}},
+	}
+	if managed && len(vlessTags)+len(hysteriaTags) > 0 {
+		cfg.SingBox.BenchmarkProxy = "127.0.0.1:2080"
 	}
 	if testURL == config.DefaultTestURL {
 		cfg.Endpoints[0].ExpectedStatus = 204

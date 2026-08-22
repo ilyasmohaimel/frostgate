@@ -27,6 +27,41 @@ func TestHugeDifferenceBeatsPriority(t *testing.T) {
 	}
 }
 
+func TestReasonsOnlyClaimLowestJitterWhenCompared(t *testing.T) {
+	inputs := []Input{
+		{Name: "winner", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Jitter: 12 * time.Millisecond, Priority: 10},
+		{Name: "steadier", Status: "up", Loss: 10, Median: 500 * time.Millisecond, Jitter: 4 * time.Millisecond, Priority: 20},
+	}
+	result := Recommend(inputs, 0)
+	if result.BestOverall.Name != "winner" || containsReason(result.Reasons, "lowest jitter") || !containsReason(result.Reasons, "12ms jitter") {
+		t.Fatalf("untrue jitter reason: %+v", result)
+	}
+	inputs[1].Jitter = 20 * time.Millisecond
+	result = Recommend(inputs, 0)
+	if !containsReason(result.Reasons, "lowest jitter") {
+		t.Fatalf("true lowest jitter missing: %+v", result.Reasons)
+	}
+	inputs[1].Jitter = 12 * time.Millisecond
+	result = Recommend(inputs, 0)
+	if !containsReason(result.Reasons, "lowest jitter") {
+		t.Fatalf("tied lowest jitter missing: %+v", result.Reasons)
+	}
+	inputs[0].Jitter = 0
+	result = Recommend(inputs, 0)
+	if containsReason(result.Reasons, "lowest jitter") || containsReason(result.Reasons, "0ms jitter") {
+		t.Fatalf("missing jitter evidence became a superlative: %+v", result.Reasons)
+	}
+}
+
+func containsReason(reasons []string, want string) bool {
+	for _, reason := range reasons {
+		if reason == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCloseAllowsPriority(t *testing.T) {
 	inputs := []Input{
 		{Name: "Reality", Status: "up", Loss: 0, Median: 180 * time.Millisecond, Download: 100, Priority: 10},

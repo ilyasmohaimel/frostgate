@@ -101,7 +101,7 @@ type Endpoint struct {
 }
 
 func (e Endpoint) Addr() string {
-	return fmt.Sprintf("%s:%d", e.Host, e.Port)
+	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }
 
 func (e Endpoint) ServerName() string {

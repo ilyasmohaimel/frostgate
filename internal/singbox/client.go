@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 )
 
@@ -277,5 +276,3 @@ func ParseDelay(b []byte) (time.Duration, error) {
 	}
 	return time.Duration(dr.Delay) * time.Millisecond, nil
 }
-
-var _ = strconv.Itoa

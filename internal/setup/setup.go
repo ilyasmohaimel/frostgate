@@ -514,7 +514,7 @@ func existingControllerFlow(opts Options, dir string) error {
 		return fmt.Errorf("no tags provided")
 	}
 	testURL := config.DefaultTestURL
-	fgConfig := BuildFrostgateConfig(tags, nil, testURL, controller, secretFile)
+	fgConfig := BuildExternalControllerConfig(tags, testURL, controller, secretFile)
 	if secretFile == "" && secret != "" {
 		fgConfig.SingBox.Secret = secret
 	}
@@ -539,7 +539,7 @@ func directOnlyFlow(opts Options, dir string) error {
 	if custom != "" {
 		testURL = custom
 	}
-	content, err := MarshalFrostgateConfig(nil, nil, testURL, config.DefaultSingBoxController, "")
+	content, err := yaml.Marshal(BuildDirectOnlyConfig(testURL))
 	if err != nil {
 		return fmt.Errorf("encode Frostgate config: %w", err)
 	}
@@ -609,14 +609,6 @@ func runValidation(dir string, knownSingBoxPath ...string) error {
 		return err
 	}
 	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))
-	if _, err := exec.LookPath("frostgate"); err == nil {
-		cmd := exec.Command("frostgate", "--check", "--config", fgPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("frostgate --check failed: %s\n", string(out))
-		} else {
-			fmt.Printf("frostgate check passed\n")
-		}
-	}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -178,44 +179,37 @@ func Summarize(records []Record) []Summary {
 			continue
 		}
 		routeType := recs[0].Type
-		// Sort by timestamp for trend
-		for i := 0; i < len(recs); i++ {
-			for j := i + 1; j < len(recs); j++ {
-				if recs[j].Timestamp.Before(recs[i].Timestamp) {
-					recs[i], recs[j] = recs[j], recs[i]
-				}
-			}
-		}
+		sort.Slice(recs, func(i, j int) bool { return recs[i].Timestamp.Before(recs[j].Timestamp) })
 		up := 0
-		var sumJitter, sumDownload int64
+		var sumJitter int64
+		var sumDownload float64
+		var validLatency []Record
+		var validJitterCount int
 		var sumDownloadCount int
 		failures := 0
 		var medians []int64
 		for _, r := range recs {
-			if r.Status != "down" {
+			usable := r.Status == "up" || r.Status == "degraded"
+			if usable {
 				up++
 			} else {
 				failures++
 			}
-			if r.Status != "down" && r.MedianMs > 0 {
+			if usable && r.MedianMs > 0 {
 				medians = append(medians, r.MedianMs)
+				validLatency = append(validLatency, r)
+				sumJitter += r.JitterMs
+				validJitterCount++
 			}
-			sumJitter += r.JitterMs
-			if r.DownloadMbps > 0 {
-				sumDownload += int64(r.DownloadMbps * 100)
+			if usable && r.DownloadMbps > 0 {
+				sumDownload += r.DownloadMbps
 				sumDownloadCount++
 			}
 		}
 		avail := float64(up) / float64(len(recs)) * 100
 		median := time.Duration(0)
 		if len(medians) > 0 {
-			for i := 0; i < len(medians); i++ {
-				for j := i + 1; j < len(medians); j++ {
-					if medians[j] < medians[i] {
-						medians[i], medians[j] = medians[j], medians[i]
-					}
-				}
-			}
+			sort.Slice(medians, func(i, j int) bool { return medians[i] < medians[j] })
 			mid := len(medians) / 2
 			if len(medians)%2 == 1 {
 				median = time.Duration(medians[mid]) * time.Millisecond
@@ -224,25 +218,25 @@ func Summarize(records []Record) []Summary {
 			}
 		}
 		jitter := time.Duration(0)
-		if len(recs) > 0 {
-			jitter = time.Duration(sumJitter/int64(len(recs))) * time.Millisecond
+		if validJitterCount > 0 {
+			jitter = time.Duration(sumJitter/int64(validJitterCount)) * time.Millisecond
 		}
 		avgDownload := 0.0
 		if sumDownloadCount > 0 {
-			avgDownload = float64(sumDownload) / float64(sumDownloadCount) / 100
+			avgDownload = sumDownload / float64(sumDownloadCount)
 		}
 		trend := "stable"
-		if len(recs) >= 4 {
-			mid := len(recs) / 2
+		if len(validLatency) >= 4 {
+			mid := len(validLatency) / 2
 			var firstSum, secondSum int64
 			for i := 0; i < mid; i++ {
-				firstSum += recs[i].MedianMs
+				firstSum += validLatency[i].MedianMs
 			}
-			for i := mid; i < len(recs); i++ {
-				secondSum += recs[i].MedianMs
+			for i := mid; i < len(validLatency); i++ {
+				secondSum += validLatency[i].MedianMs
 			}
 			firstAvg := firstSum / int64(mid)
-			secondAvg := secondSum / int64(len(recs)-mid)
+			secondAvg := secondSum / int64(len(validLatency)-mid)
 			if secondAvg > firstAvg+20 {
 				trend = "getting worse"
 			} else if secondAvg < firstAvg-20 {
@@ -261,5 +255,6 @@ func Summarize(records []Record) []Summary {
 			Download:     avgDownload,
 		})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Route < out[j].Route })
 	return out
 }

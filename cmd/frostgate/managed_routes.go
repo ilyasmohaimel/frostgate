@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 
@@ -128,6 +129,16 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 	if endpoints.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("Frostgate config endpoints must be a list")
 	}
+	maxPriority := 0
+	for _, endpoint := range endpoints.Content {
+		if endpoint.Kind != yaml.MappingNode || endpointField(endpoint, "type") != string(config.ProbeSingBox) {
+			continue
+		}
+		if priority, err := strconv.Atoi(endpointField(endpoint, "priority")); err == nil && priority > maxPriority {
+			maxPriority = priority
+		}
+	}
+	nextPriority := ((maxPriority / 10) + 1) * 10
 	for _, tag := range tags {
 		for _, endpoint := range endpoints.Content {
 			if endpoint.Kind != yaml.MappingNode {
@@ -139,7 +150,7 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 				}
 			}
 		}
-		endpointData, err := yaml.Marshal(config.Endpoint{Name: tag, Type: config.ProbeSingBox, Outbound: tag, Priority: 10})
+		endpointData, err := yaml.Marshal(config.Endpoint{Name: tag, Type: config.ProbeSingBox, Outbound: tag, Priority: nextPriority})
 		if err != nil {
 			return nil, err
 		}
@@ -148,10 +159,20 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 			return nil, fmt.Errorf("encode endpoint: %w", err)
 		}
 		endpoints.Content = append(endpoints.Content, endpoint.Content[0])
+		nextPriority += 10
 	}
 	data, err := yaml.Marshal(&doc)
 	if err != nil {
 		return nil, fmt.Errorf("encode Frostgate config: %w", err)
 	}
 	return data, nil
+}
+
+func endpointField(endpoint *yaml.Node, key string) string {
+	for i := 0; i+1 < len(endpoint.Content); i += 2 {
+		if endpoint.Content[i].Value == key {
+			return endpoint.Content[i+1].Value
+		}
+	}
+	return ""
 }

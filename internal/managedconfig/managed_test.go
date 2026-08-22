@@ -2,8 +2,10 @@ package managedconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
@@ -363,6 +365,34 @@ func TestSaveTransactionRollbackOnControllerMissing(t *testing.T) {
 	}
 	if err := m.SaveTransaction(runner); err == nil {
 		t.Fatal("expected error when controller missing outbound")
+	}
+}
+
+func TestSaveTransactionReportsRollbackRecoveryFailures(t *testing.T) {
+	d := tempDir(t)
+	original := []byte(`{"outbounds":[]}`)
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldWrite := atomicWriteFile
+	oldRemove := removeFile
+	t.Cleanup(func() { atomicWriteFile, removeFile = oldWrite, oldRemove })
+	calls := 0
+	atomicWriteFile = func(path string, data []byte, mode os.FileMode) error {
+		calls++
+		if calls >= 3 { // candidate config + secret installed; restoring config now fails.
+			return errors.New("restore blocked")
+		}
+		return oldWrite(path, data, mode)
+	}
+	m := &Managed{Dir: d, Secret: "fixture-secret"}
+	runner := &SidecarRunner{
+		DaemonReload: func() error { return errors.New("daemon failed") },
+		Restart:      func() error { return errors.New("restored restart failed") },
+	}
+	err := m.SaveTransaction(runner)
+	if err == nil || !strings.Contains(err.Error(), "daemon failed") || !strings.Contains(err.Error(), "restore blocked") || !strings.Contains(err.Error(), "restored restart failed") {
+		t.Fatalf("rollback errors were swallowed: %v", err)
 	}
 }
 

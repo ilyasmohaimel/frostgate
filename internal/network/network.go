@@ -131,8 +131,16 @@ func NormalizeAddrs(in []string) []string {
 	out := make([]string, 0, len(in))
 	seen := map[string]bool{}
 	for _, a := range in {
-		a = strings.ToLower(strings.TrimSpace(a))
-		if a == "" || seen[a] {
+		ip := net.ParseIP(strings.TrimSpace(a))
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			a = v4.String()
+		} else {
+			a = ip.String()
+		}
+		if seen[a] {
 			continue
 		}
 		seen[a] = true
@@ -176,14 +184,18 @@ func FetchDoHAnswers(ctx context.Context, client *http.Client, dohBase, host str
 		client = http.DefaultClient
 	}
 	var out []string
-	for _, qtype := range []string{"A", "AAAA"} {
+	for _, query := range []struct {
+		name string
+		rr   int
+		v4   bool
+	}{{"A", 1, true}, {"AAAA", 28, false}} {
 		u, err := url.Parse(dohBase)
 		if err != nil {
 			return nil, err
 		}
 		q := u.Query()
 		q.Set("name", host)
-		q.Set("type", qtype)
+		q.Set("type", query.name)
 		u.RawQuery = q.Encode()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
@@ -206,10 +218,18 @@ func FetchDoHAnswers(ctx context.Context, client *http.Client, dohBase, host str
 		if err := json.Unmarshal(body, &dr); err != nil {
 			return nil, fmt.Errorf("malformed DoH response: %w", err)
 		}
+		if dr.Status != 0 {
+			return nil, fmt.Errorf("DoH DNS status %d", dr.Status)
+		}
 		for _, a := range dr.Answer {
-			if a.Data != "" {
-				out = append(out, a.Data)
+			if a.Type != query.rr {
+				continue
 			}
+			ip := net.ParseIP(strings.TrimSpace(a.Data))
+			if ip == nil || (query.v4 && ip.To4() == nil) || (!query.v4 && ip.To4() != nil) {
+				return nil, fmt.Errorf("invalid %s answer %q", query.name, a.Data)
+			}
+			out = append(out, ip.String())
 		}
 	}
 	return out, nil
