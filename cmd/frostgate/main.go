@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -26,9 +27,12 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/doctor"
 	"github.com/ilyasmohaimel/frostgate/internal/history"
 	"github.com/ilyasmohaimel/frostgate/internal/importer"
+	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/network"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/ranking"
 	"github.com/ilyasmohaimel/frostgate/internal/recommend"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/report"
 	"github.com/ilyasmohaimel/frostgate/internal/route"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
@@ -172,11 +176,12 @@ func run() int {
 		}
 		return watchTUI(ctx, cfg, *interval, *verbose)
 	}
-	results := probe.Run(ctx, cfg)
-	// history write (throttled for watch not needed here)
-	recordHistory(results, "")
-	emit(results, *jsonOut, *verbose)
-	return exitCode(results)
+	res := probe.Run(ctx, cfg)
+	rec := newRecorder(cfg)
+	defer rec.Close()
+	_ = rec.Record(history.FromProbeResults(res, nil, ""))
+	emit(res, *jsonOut, *verbose)
+	return exitCode(res)
 }
 
 func printHelp() {
@@ -239,13 +244,13 @@ func handleAdd(args []string) int {
 		return 3
 	}
 	tag := strings.TrimSpace(nameFlag)
-	if tag == "" {
-		tag = route.DeriveNameFromLink(link, 1)
-	}
-	tag = strings.ReplaceAll(tag, " ", "-")
-	tag = strings.TrimSpace(tag)
-	if tag == "" {
-		tag = route.DeriveNameFromLink(link, 1)
+	if tag != "" {
+		if err := route.ValidateName(tag); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid route name %q: %v\n", tag, sanitizeError(err))
+			return 3
+		}
+	} else {
+		tag = route.SanitizeName(route.DeriveNameFromLink(link, 1))
 	}
 	r, err := route.ParseShareLink(link, tag)
 	if err != nil {
@@ -262,87 +267,64 @@ func handleAdd(args []string) int {
 		displayProto = "Hysteria2"
 	}
 	fmt.Printf("parsed %s\n", displayProto)
-	singBoxPath := filepath.Join(dir, "sing-box.json")
-	existingVless, existingHyst, existingFPs, existingTags := loadExistingOutbounds(singBoxPath)
-	if _, exists := existingTags[tag]; exists {
-		fmt.Printf("Route already exists: %s\n", tag)
-		return 0
-	}
-	if _, dup := existingFPs[r.Fingerprint]; dup {
-		for _, v := range existingVless {
-			if route.FingerprintVLESS(v) == r.Fingerprint {
-				fmt.Printf("Route already exists: %s\n", v.Tag)
-				return 0
-			}
-		}
-		for _, h := range existingHyst {
-			if route.FingerprintHysteria(h) == r.Fingerprint {
-				fmt.Printf("Route already exists: %s\n", h.Tag)
-				return 0
-			}
-		}
-		fmt.Printf("Route already exists: %s\n", tag)
-		return 0
-	}
-	backupDir := backupConfig(dir)
-	vlessOut := append([]*setup.VLESSOutbound{}, existingVless...)
-	hystOut := append([]*setup.Hysteria2Outbound{}, existingHyst...)
-	if r.VLESS != nil {
-		vlessOut = append(vlessOut, r.VLESS)
-	} else if r.Hysteria != nil {
-		hystOut = append(hystOut, r.Hysteria)
-	}
-	secretFile := filepath.Join(dir, "controller-secret")
-	secret := ""
-	if data, err := os.ReadFile(secretFile); err == nil {
-		secret = strings.TrimSpace(string(data))
-	} else {
-		s, _ := setup.GenerateSecret()
-		secret = s
-		setup.WriteSecretFile(secretFile, secret)
-	}
-	singData, err := setup.GenerateSingBoxConfig(secret, vlessOut, hystOut, dir)
+	mg, err := managedconfig.Load(dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		rollbackConfig(dir, backupDir)
+		fmt.Fprintln(os.Stderr, "load managed config:", sanitizeError(err))
 		return 3
 	}
-	if err := setup.WriteFileSecure(singBoxPath, singData); err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		rollbackConfig(dir, backupDir)
-		return 3
-	}
-	fmt.Println("sing-box config valid")
-	if sbPath, err := exec.LookPath("sing-box"); err == nil {
-		cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("sing-box check failed: %s\n", sanitizeOutput(string(out)))
-			rollbackConfig(dir, backupDir)
-			fmt.Println("rolled back")
-			return 3
+	for _, v := range mg.VLESS {
+		if v.Tag == tag || route.FingerprintVLESS(v) == r.Fingerprint {
+			fmt.Printf("Route already exists: %s\n", v.Tag)
+			return 0
 		}
 	}
-	var vlessTags []string
-	for _, v := range vlessOut {
-		vlessTags = append(vlessTags, v.Tag)
+	for _, h := range mg.Hysteria {
+		if h.Tag == tag || route.FingerprintHysteria(h) == r.Fingerprint {
+			fmt.Printf("Route already exists: %s\n", h.Tag)
+			return 0
+		}
 	}
-	var hystTags []string
-	for _, h := range hystOut {
-		hystTags = append(hystTags, h.Tag)
+	if r.VLESS != nil {
+		mg.AddVLESS(r.VLESS)
+	} else if r.Hysteria != nil {
+		mg.AddHysteria(r.Hysteria)
 	}
-	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
 	cfgPath2 := filepath.Join(dir, "config.yaml")
 	if cfgPath != "" {
 		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
-	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
+	controller := config.DefaultSingBoxController
+	if existing, loadErr := config.Load(cfgPath2); loadErr == nil {
+		controller = existing.SingBox.Controller
+	}
+	if mg.Secret == "" {
+		mg.Secret, err = setup.GenerateSecret()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			return 3
+		}
+	}
+	runner := managedconfig.DefaultSidecarRunner(controller, mg.Secret)
+	if err := mg.SaveTransaction(runner); err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		rollbackConfig(dir, backupDir)
 		return 3
 	}
-	if err := reloadSidecar(); err == nil {
-		fmt.Println("sidecar reloaded")
+	fmt.Println("sing-box config valid")
+	secretFile := filepath.Join(dir, "controller-secret")
+	var vlessTags []string
+	for _, v := range mg.VLESS {
+		vlessTags = append(vlessTags, v.Tag)
 	}
+	var hystTags []string
+	for _, h := range mg.Hysteria {
+		hystTags = append(hystTags, h.Tag)
+	}
+	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", controller, secretFile)
+	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
+	fmt.Println("sidecar reloaded and verified")
 	fmt.Println("Testing new route...")
 	cfg, err := config.Load(cfgPath2)
 	if err != nil {
@@ -371,138 +353,12 @@ func handleAdd(args []string) int {
 	return 0
 }
 
-func loadExistingOutbounds(singBoxPath string) ([]*setup.VLESSOutbound, []*setup.Hysteria2Outbound, map[string]bool, map[string]bool) {
-	vlessOut := []*setup.VLESSOutbound{}
-	hystOut := []*setup.Hysteria2Outbound{}
-	fps := map[string]bool{}
-	tags := map[string]bool{}
-	data, err := os.ReadFile(singBoxPath)
-	if err != nil {
-		return vlessOut, hystOut, fps, tags
-	}
-	var cfg map[string]any
-	if json.Unmarshal(data, &cfg) != nil {
-		return vlessOut, hystOut, fps, tags
-	}
-	outs, ok := cfg["outbounds"].([]any)
-	if !ok {
-		return vlessOut, hystOut, fps, tags
-	}
-	for _, ob := range outs {
-		m, ok := ob.(map[string]any)
-		if !ok {
-			continue
-		}
-		t, _ := m["type"].(string)
-		tag, _ := m["tag"].(string)
-		if tag != "" {
-			tags[tag] = true
-		}
-		if t == "vless" {
-			server, _ := m["server"].(string)
-			portF, _ := m["server_port"].(float64)
-			uuid, _ := m["uuid"].(string)
-			sni := ""
-			pbk := ""
-			sid := ""
-			fp := "chrome"
-			flow := ""
-			if tlsRaw, ok := m["tls"].(map[string]any); ok {
-				sni, _ = tlsRaw["server_name"].(string)
-				if utls, ok := tlsRaw["utls"].(map[string]any); ok {
-					fp, _ = utls["fingerprint"].(string)
-				}
-				if reality, ok := tlsRaw["reality"].(map[string]any); ok {
-					pbk, _ = reality["public_key"].(string)
-					sid, _ = reality["short_id"].(string)
-				}
-			}
-			if f, ok := m["flow"].(string); ok {
-				flow = f
-			}
-			v := &setup.VLESSOutbound{Tag: tag, Server: server, ServerPort: int(portF), UUID: uuid, SNI: sni, PBK: pbk, SID: sid, FP: fp, Flow: flow}
-			vlessOut = append(vlessOut, v)
-			fps[route.FingerprintVLESS(v)] = true
-		} else if t == "hysteria2" {
-			server, _ := m["server"].(string)
-			portF, _ := m["server_port"].(float64)
-			pass, _ := m["password"].(string)
-			obfsPass := ""
-			if obfs, ok := m["obfs"].(map[string]any); ok {
-				obfsPass, _ = obfs["password"].(string)
-			}
-			sni := ""
-			if tlsRaw, ok := m["tls"].(map[string]any); ok {
-				sni, _ = tlsRaw["server_name"].(string)
-			}
-			h := &setup.Hysteria2Outbound{Tag: tag, Server: server, ServerPort: int(portF), Password: pass, ObfsPassword: obfsPass, SNI: sni}
-			hystOut = append(hystOut, h)
-			fps[route.FingerprintHysteria(h)] = true
-		}
-	}
-	return vlessOut, hystOut, fps, tags
-}
-
-func backupConfig(dir string) string {
-	backupDir := filepath.Join(dir, fmt.Sprintf("backup-%s", time.Now().Format("20060102T150405")))
-	os.MkdirAll(backupDir, 0o700)
-	for _, n := range []string{"config.yaml", "sing-box.json", "controller-secret"} {
-		if data, err := os.ReadFile(filepath.Join(dir, n)); err == nil {
-			os.WriteFile(filepath.Join(backupDir, n), data, 0o600)
-		}
-	}
-	return backupDir
-}
-
-func rollbackConfig(dir, backupDir string) {
-	for _, n := range []string{"config.yaml", "sing-box.json", "controller-secret"} {
-		if data, err := os.ReadFile(filepath.Join(backupDir, n)); err == nil {
-			os.WriteFile(filepath.Join(dir, n), data, 0o600)
-		} else {
-			os.Remove(filepath.Join(dir, n))
-		}
-	}
-}
-
-func reloadSidecar() error {
-	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(filepath.Dir(setup.ConfigDir(setup.DefaultHomeDir())), "systemd", "user", "frostgate-singbox.service"),
-		filepath.Join(home, ".config", "systemd", "user", "frostgate-singbox.service"),
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			exec.Command("systemctl", "--user", "daemon-reload").Run()
-			exec.Command("systemctl", "--user", "restart", "frostgate-singbox.service").Run()
-			time.Sleep(800 * time.Millisecond)
-			return nil
-		}
-	}
-	return fmt.Errorf("no sidecar service")
-}
-
 func sanitizeError(err error) string {
-	if err == nil {
-		return ""
-	}
-	s := err.Error()
-	if strings.Contains(s, "vless://") || strings.Contains(s, "hysteria2://") || strings.Contains(s, "hy2://") {
-		return "proxy parse error [redacted]"
-	}
-	if len(s) > 120 {
-		s = s[:120]
-	}
-	return s
+	return redact.Error(err)
 }
 
 func sanitizeOutput(s string) string {
-	if strings.Contains(s, "vless://") || strings.Contains(s, "hysteria2://") {
-		return "[redacted]"
-	}
-	if len(s) > 200 {
-		s = s[:200]
-	}
-	return s
+	return redact.String(s)
 }
 
 // --- import ---
@@ -556,33 +412,40 @@ func handleImport(args []string) int {
 	dir := setup.ConfigDir(home)
 	setup.EnsureConfigDir(dir)
 	// Deduplicate via fingerprint against existing and within subscription
-	singBoxPath := filepath.Join(dir, "sing-box.json")
-	_, _, existingFPs, _ := loadExistingOutbounds(singBoxPath)
+	mg, err := managedconfig.Load(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "load managed config:", sanitizeError(err))
+		return 3
+	}
 	seen := map[string]bool{}
-	for k := range existingFPs {
-		seen[k] = true
+	for _, v := range mg.VLESS {
+		seen[route.FingerprintVLESS(v)] = true
+	}
+	for _, h := range mg.Hysteria {
+		seen[route.FingerprintHysteria(h)] = true
+	}
+	existingTags := map[string]bool{}
+	for _, v := range mg.VLESS {
+		existingTags[v.Tag] = true
+	}
+	for _, h := range mg.Hysteria {
+		existingTags[h.Tag] = true
 	}
 	var toAdd []*route.ImportedRoute
 	skippedDedup := 0
 	skippedInvalid := 0
 	for i, link := range res.Links {
-		tag := route.DeriveNameFromLink(link, i+1)
-		// Ensure tag uniqueness against existing and toAdd
+		tag := route.SanitizeName(route.DeriveNameFromLink(link, i+1))
 		origTag := tag
 		suffix := 1
-		existingTags := map[string]bool{}
-		ev, eh, _, et := loadExistingOutbounds(singBoxPath)
-		_ = ev
-		_ = eh
-		for k := range et {
-			existingTags[k] = true
-		}
-		for _, r2 := range toAdd {
-			existingTags[r2.Tag] = true
-		}
 		for existingTags[tag] {
 			suffix++
-			tag = fmt.Sprintf("%s-%d", origTag, suffix)
+			suffixText := fmt.Sprintf("-%d", suffix)
+			base := origTag
+			if len(base)+len(suffixText) > route.MaxRouteNameLen {
+				base = base[:route.MaxRouteNameLen-len(suffixText)]
+			}
+			tag = base + suffixText
 		}
 		r, err := route.ParseShareLink(link, tag)
 		if err != nil {
@@ -594,71 +457,55 @@ func handleImport(args []string) int {
 			continue
 		}
 		seen[r.Fingerprint] = true
+		existingTags[tag] = true
 		toAdd = append(toAdd, r)
 	}
 	if len(toAdd) == 0 {
 		fmt.Fprintln(os.Stderr, "all routes were duplicates or invalid")
 		return 3
 	}
-	var vlessOut []*setup.VLESSOutbound
-	var hystOut []*setup.Hysteria2Outbound
 	for _, r := range toAdd {
 		if r.VLESS != nil {
-			vlessOut = append(vlessOut, r.VLESS)
+			mg.AddVLESS(r.VLESS)
 		}
 		if r.Hysteria != nil {
-			hystOut = append(hystOut, r.Hysteria)
+			mg.AddHysteria(r.Hysteria)
 		}
 	}
-	backupDir := backupConfig(dir)
-	// Merge with existing
-	existingVless, existingHyst, _, _ := loadExistingOutbounds(singBoxPath)
-	// Prepend existing to keep order: existing first, then new
-	vlessOut = append(existingVless, vlessOut...)
-	hystOut = append(existingHyst, hystOut...)
-	secretFile := filepath.Join(dir, "controller-secret")
-	secret := ""
-	if data, err := os.ReadFile(secretFile); err == nil {
-		secret = strings.TrimSpace(string(data))
-	} else {
-		s, _ := setup.GenerateSecret()
-		secret = s
-		setup.WriteSecretFile(secretFile, secret)
-	}
-	singData, err := setup.GenerateSingBoxConfig(strings.TrimSpace(secret), vlessOut, hystOut, dir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		rollbackConfig(dir, backupDir)
-		return 3
-	}
-	if err := setup.WriteFileSecure(singBoxPath, singData); err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		rollbackConfig(dir, backupDir)
-		return 3
-	}
-	if sbPath, err := exec.LookPath("sing-box"); err == nil {
-		cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("sing-box check failed: %s\n", sanitizeOutput(string(out)))
-			rollbackConfig(dir, backupDir)
-			return 3
-		}
-	}
-	var vlessTags []string
-	for _, v := range vlessOut {
-		vlessTags = append(vlessTags, v.Tag)
-	}
-	var hystTags []string
-	for _, h := range hystOut {
-		hystTags = append(hystTags, h.Tag)
-	}
-	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
 	cfgPath2 := filepath.Join(dir, "config.yaml")
 	if cfgPath != "" {
 		cfgPath2 = config.ResolveConfigPath(cfgPath)
 	}
-	setup.WriteFileSecure(cfgPath2, []byte(fgContent))
-	_ = reloadSidecar()
+	controller := config.DefaultSingBoxController
+	if existing, loadErr := config.Load(cfgPath2); loadErr == nil {
+		controller = existing.SingBox.Controller
+	}
+	if mg.Secret == "" {
+		mg.Secret, err = setup.GenerateSecret()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			return 3
+		}
+	}
+	runner := managedconfig.DefaultSidecarRunner(controller, mg.Secret)
+	if err := mg.SaveTransaction(runner); err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
+	secretFile := filepath.Join(dir, "controller-secret")
+	var vlessTags []string
+	for _, v := range mg.VLESS {
+		vlessTags = append(vlessTags, v.Tag)
+	}
+	var hystTags []string
+	for _, h := range mg.Hysteria {
+		hystTags = append(hystTags, h.Tag)
+	}
+	fgContent := setup.GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", controller, secretFile)
+	if err := setup.WriteFileSecure(cfgPath2, []byte(fgContent)); err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
 	fmt.Printf("Imported %d routes (%d skipped, %d deduped)\n", len(toAdd), len(res.Skipped)+skippedInvalid, skippedDedup)
 	if len(res.Skipped) > 0 {
 		fmt.Println("\nSkipped:")
@@ -714,8 +561,7 @@ func handleTest(args []string) int {
 	tag := "test-temp"
 	r, err := route.ParseShareLink(link, tag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse: %v\n", sanitizeError(err))
-		return 3
+		return testCommandFailure(jsonOut, "", "error", fmt.Errorf("parse: %w", err), 3)
 	}
 	if jsonOut {
 		fmt.Fprintln(os.Stderr, "Testing route (temporary, not saved)...")
@@ -724,8 +570,7 @@ func handleTest(args []string) int {
 	}
 	tmpDir, err := os.MkdirTemp("", "frostgate-test-*")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 3
+		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
 	}
 	defer os.RemoveAll(tmpDir)
 	os.Chmod(tmpDir, 0o700)
@@ -746,8 +591,7 @@ func handleTest(args []string) int {
 	controller := fmt.Sprintf("http://127.0.0.1:%d", port)
 	singData, err := setup.GenerateSingBoxConfig(secret, vlessOut, hystOut, tmpDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
-		return 3
+		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
 	}
 	var cfgMap map[string]any
 	json.Unmarshal(singData, &cfgMap)
@@ -769,12 +613,10 @@ func handleTest(args []string) int {
 	if sbPath, err := exec.LookPath("sing-box"); err == nil {
 		cmd := exec.Command(sbPath, "check", "-c", singPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("sing-box check failed: %s\n", sanitizeOutput(string(out)))
-			return 3
+			return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box check failed: %s", sanitizeOutput(string(out))), 3)
 		}
 	} else {
-		fmt.Fprintln(os.Stderr, "sing-box not found")
-		return 3
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box not found"), 3)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -785,8 +627,7 @@ func handleTest(args []string) int {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 3
+		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
 	}
 	defer func() {
 		if cmd.Process != nil {
@@ -820,8 +661,7 @@ func handleTest(args []string) int {
 		}
 	}
 	if !ready {
-		fmt.Fprintln(os.Stderr, "controller not ready")
-		return 3
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("controller not ready"), 3)
 	}
 	timeout := 8 * time.Second
 	delayCtx, cancel2 := context.WithTimeout(ctx, timeout)
@@ -856,6 +696,20 @@ func handleTest(args []string) int {
 		fmt.Println("Use `frostgate add` to keep it.")
 	}
 	return 0
+}
+
+func testCommandFailure(asJSON bool, protocol, status string, err error, code int) int {
+	safe := sanitizeError(err)
+	if asJSON {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"protocol": strings.ToUpper(protocol),
+			"status":   status,
+			"error":    safe,
+		})
+	} else {
+		fmt.Fprintln(os.Stderr, safe)
+	}
+	return code
 }
 
 func freePort() int {
@@ -940,7 +794,12 @@ func handleBenchmark(args []string) int {
 		reader := bufio.NewReader(os.Stdin)
 		ans, _ := reader.ReadString('\n')
 		if !strings.EqualFold(strings.TrimSpace(ans), "y") && !strings.EqualFold(strings.TrimSpace(ans), "yes") {
-			fmt.Println("Cancelled")
+			if jsonOut {
+				fmt.Fprintln(os.Stderr, "Cancelled")
+				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"status": "cancelled", "results": []any{}})
+			} else {
+				fmt.Println("Cancelled")
+			}
 			return 0
 		}
 	}
@@ -948,153 +807,146 @@ func handleBenchmark(args []string) int {
 	defer cancel()
 	results := probe.Run(ctx, cfg)
 	type benchRes struct {
-		Result   probe.Result `json:"result"`
-		Download float64      `json:"download_mbps"`
+		Result     probe.Result      `json:"-"`
+		JSONResult report.JSONResult `json:"result"`
+		Download   float64           `json:"download_mbps"`
+		DownloadNA string            `json:"download_na,omitempty"`
+	}
+	newBenchRes := func(r probe.Result) benchRes {
+		return benchRes{Result: r, JSONResult: report.ToJSONResult(r)}
 	}
 	var bres []benchRes
+	downloads := map[string]float64{}
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	var originalSelector string
-	selectorExists := false
+	proxyAddr := cfg.BenchmarkProxyAddr()
+	proxyConfigured := proxyAddr != ""
 	if !noSpeed {
-		if now, err := client.GetSelectedOutbound(ctx, "frostgate-selector"); err == nil {
-			originalSelector = now
-			selectorExists = true
+		measure := benchmark.MeasureSOCKSMbps
+		switch {
+		case !proxyConfigured:
+			// No loopback listener configured: proxy throughput must be N/A,
+			// never guessed. Direct baseline (if alone) still measures direct.
+			for _, r := range results {
+				br := newBenchRes(r)
+				if r.Endpoint.Type == config.ProbeSingBox {
+					if r.Status != "down" {
+						br.DownloadNA = "benchmark_proxy not configured"
+					}
+				} else if probe.HasProxy(results) {
+					br.DownloadNA = "direct baseline"
+				} else {
+					sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
+					mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
+					scancel()
+					br.Download = mbps
+				}
+				downloads[r.Endpoint.Name] = br.Download
+				bres = append(bres, br)
+			}
+		default:
+			for _, r := range results {
+				if r.Endpoint.Type != config.ProbeSingBox {
+					br := newBenchRes(r)
+					if probe.HasProxy(results) {
+						// Direct baseline is diagnostic only.
+						br.DownloadNA = "direct baseline"
+					} else {
+						sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
+						mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
+						scancel()
+						br.Download = mbps
+					}
+					downloads[r.Endpoint.Name] = br.Download
+					bres = append(bres, br)
+				}
+			}
+			outboundToName := map[string]string{}
+			var routes []string
+			for _, r := range results {
+				if r.Endpoint.Type == config.ProbeSingBox && r.Status != "down" {
+					routes = append(routes, r.Endpoint.Outbound)
+					outboundToName[r.Endpoint.Outbound] = r.Endpoint.Name
+				}
+			}
+			// Attributed measurement: captures the selector, switches per
+			// route, and restores it on success/error/cancellation.
+			tp := benchmark.BenchRoutes(ctx, client, "frostgate-selector", proxyAddr, downloadURL, bytesPerRoute, routes, measure)
+			tpByName := map[string]benchmark.RouteThroughput{}
+			for _, t := range tp {
+				name := outboundToName[t.Route]
+				if name != "" {
+					tpByName[name] = t
+				}
+			}
+			for _, r := range results {
+				if r.Endpoint.Type != config.ProbeSingBox {
+					continue
+				}
+				br := newBenchRes(r)
+				if t, ok := tpByName[r.Endpoint.Name]; ok {
+					br.Download = t.DownloadMbps
+					br.DownloadNA = t.NAReason
+				}
+				downloads[r.Endpoint.Name] = br.Download
+				bres = append(bres, br)
+			}
+		}
+	} else {
+		for _, r := range results {
+			bres = append(bres, newBenchRes(r))
 		}
 	}
-	// Ensure restore on exit, signal, error
-	defer func() {
-		if selectorExists && originalSelector != "" {
-			cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = client.SelectOutbound(cctx, "frostgate-selector", originalSelector)
-			ccancel()
-		}
-	}()
-	// Handle signal restore
-	go func() {
-		<-ctx.Done()
-		if selectorExists && originalSelector != "" {
-			cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = client.SelectOutbound(cctx, "frostgate-selector", originalSelector)
-			ccancel()
-		}
-	}()
-	for _, r := range results {
-		download := 0.0
-		if !noSpeed && r.Status != "down" {
-			if r.Endpoint.Type == config.ProbeSingBox {
-				if !selectorExists {
-					// No selector, cannot benchmark via SOCKS
-					download = 0
-				} else {
-					if err := client.SelectOutbound(ctx, "frostgate-selector", r.Endpoint.Outbound); err != nil {
-						download = 0
-					} else {
-						// Verify and quick check
-						time.Sleep(100 * time.Millisecond)
-						sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-						mbps, _, err := benchmark.MeasureViaSOCKS(sctx, "127.0.0.1:2080", downloadURL, bytesPerRoute)
-						scancel()
-						if err == nil {
-							download = mbps
-						} else {
-							download = 0
-						}
-					}
-				}
-			} else {
-				sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-				mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
-				scancel()
-				download = mbps
-			}
-		}
-		bres = append(bres, benchRes{Result: r, Download: download})
-		if cfg.History.Enabled == nil || *cfg.History.Enabled {
-			rec := history.Record{
-				Route:        r.Endpoint.Name,
-				Type:         string(r.Endpoint.Type),
-				Status:       string(r.Status),
-				Loss:         r.Metrics.LossPct,
-				MedianMs:     r.Metrics.Median.Milliseconds(),
-				JitterMs:     r.Metrics.Jitter.Milliseconds(),
-				MinMs:        r.Metrics.Min.Milliseconds(),
-				MaxMs:        r.Metrics.Max.Milliseconds(),
-				MeanMs:       r.Metrics.Mean.Milliseconds(),
-				DownloadMbps: download,
-				Network:      networkLabel,
-				Category:     r.Category,
-			}
-			if db, err := history.Open(); err == nil {
-				db.Add(rec)
-				db.Close()
-				db2, _ := history.Open()
-				if db2 != nil {
-					_ = db2.Prune(cfg.History.Retention.Duration)
-					db2.Close()
-				}
-			}
-		}
+	// History via the central recorder (honors enabled/retention/watch_interval).
+	recCfg := newRecorder(cfg)
+	defer recCfg.Close()
+	if recCfg.Enabled() {
+		_ = recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel))
 	}
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(map[string]any{"results": bres, "network": networkLabel})
+		_ = enc.Encode(map[string]any{"schema_version": 3, "results": bres, "network": networkLabel})
 		return exitCode(results)
 	}
 	fmt.Println("\nFROSTGATE BENCHMARK")
+	if d, ok := probe.DirectBaseline(results); ok {
+		lat := "—"
+		if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+			lat = fmtDuration(d.Metrics.Median)
+		}
+		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), lat)
+	}
 	fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", "ROUTE", "STATUS", "LOSS", "MEDIAN", "JITTER", "DOWNLOAD")
 	for _, br := range bres {
 		status := string(br.Result.Status)
 		loss := fmt.Sprintf("%.0f%%", br.Result.Metrics.LossPct)
 		median := fmtDuration(br.Result.Metrics.Median)
 		jitter := fmtDuration(br.Result.Metrics.Jitter)
-		down := "N/A"
-		if br.Download > 0 {
-			down = fmt.Sprintf("%.0f Mbps", br.Download)
-		} else if br.Result.Endpoint.Type == config.ProbeSingBox && br.Download == 0 {
-			if !selectorExists {
-				down = "N/A (no selector)"
-			} else {
-				down = "N/A"
+		down := fmt.Sprintf("%.0f Mbps", br.Download)
+		if br.Download <= 0 {
+			down = "N/A"
+			if br.DownloadNA != "" {
+				down = "N/A (" + br.DownloadNA + ")"
 			}
 		}
 		fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", br.Result.Endpoint.Name, status, loss, median, jitter, down)
 	}
-	var inputs []recommend.Input
-	for _, br := range bres {
-		inputs = append(inputs, recommend.Input{
-			Name:     br.Result.Endpoint.Name,
-			Status:   string(br.Result.Status),
-			Loss:     br.Result.Metrics.LossPct,
-			Median:   br.Result.Metrics.Median,
-			Jitter:   br.Result.Metrics.Jitter,
-			Download: br.Download,
-			Priority: br.Result.Endpoint.Priority,
-		})
+	if bp, ok := probe.BestProxy(results); ok {
+		fmt.Printf("\nBest proxy: %s (%s)\n", bp.Endpoint.Name, fmtDuration(bp.Metrics.Median))
+	} else if probe.HasProxy(results) {
+		fmt.Println("\nBest proxy: none usable")
 	}
-	// Enrich with history if available
-	if db, err := history.Open(); err == nil {
-		recs, _ := db.Query(7*24*time.Hour, "", "")
-		summ := history.Summarize(recs)
-		for i, inp := range inputs {
-			for _, s := range summ {
-				if s.Route == inp.Name {
-					inputs[i].Availability = s.Availability
-					break
-				}
-			}
-		}
-		db.Close()
-	}
-	rec := recommend.Recommend(inputs, len(bres))
+	rec := recommendFromResults(cfg, results, func(name string) float64 { return downloads[name] })
 	if rec.BestOverall.Name != "" {
-		fmt.Printf("\nBEST OVERALL: %s\n", rec.BestOverall.Name)
+		fmt.Printf("\nBEST PROXY: %s\n", rec.BestOverall.Name)
 		for _, r := range rec.Reasons {
 			fmt.Printf("  ✓ %s\n", r)
 		}
 		if rec.Preferred != nil {
 			fmt.Printf("\nPreferred configured route:\n%s\n", rec.Preferred.Name)
 		}
+	} else if probe.HasProxy(results) {
+		fmt.Println("\nBest proxy: none configured")
 	}
 	return exitCode(results)
 }
@@ -1151,10 +1003,14 @@ func handleDiagnose(args []string) int {
 		return 3
 	}
 	var layers []diagnose.Layer
+	opts := diagnose.Options{}
+	if mg, err := managedconfig.Load(setup.ConfigDir(testHome())); err == nil {
+		opts.Managed = mg
+	}
 	if len(rest) == 0 {
-		layers = diagnose.DiagnoseAll(cfg)
+		layers = diagnose.DiagnoseAll(cfg, opts)
 	} else {
-		layers = diagnose.DiagnoseRoute(cfg, rest[0])
+		layers = diagnose.DiagnoseRoute(cfg, rest[0], opts)
 	}
 	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(layers)
@@ -1204,6 +1060,15 @@ func handleDiagnose(args []string) int {
 }
 
 // --- network-check ---
+type networkCheckDoc struct {
+	SchemaVersion    int                 `json:"schema_version"`
+	Checks           []network.Check     `json:"checks"`
+	Matrix           []network.MatrixRow `json:"matrix,omitempty"`
+	Destinations     []string            `json:"destinations,omitempty"`
+	RecommendedProxy string              `json:"recommended_proxy,omitempty"`
+	Recommendation   string              `json:"recommendation"`
+}
+
 func handleNetworkCheck(args []string) int {
 	cfgPath := ""
 	jsonOut := false
@@ -1224,99 +1089,273 @@ func handleNetworkCheck(args []string) int {
 			return 3
 		}
 	}
-	checks := network.CheckAll()
-	// Add destinations
-	dests := []string{"https://github.com/", "https://www.google.com/generate_204", "https://www.wikipedia.org/"}
-	for _, d := range network.CheckDestinations(dests) {
-		checks = append(checks, d)
+
+	doc := networkCheckDoc{SchemaVersion: 3}
+	if os.Getenv("FROSTGATE_TEST_SKIP_BASE_NETWORK_CHECKS") != "1" {
+		doc.Checks = network.CheckAll()
 	}
-	// Proxy routes
-	home := setup.DefaultHomeDir()
-	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-		home = h
+
+	// Config-first destinations; defaults only when the list is empty.
+	var destURLs []string
+	destLabels := map[string]string{}
+	var cfg *config.Config
+	resolvedConfig := config.ResolveConfigPath(cfgPath)
+	if loaded, err := config.Load(resolvedConfig); err == nil {
+		cfg = loaded
+	} else if cfgPath != "" {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
 	}
-	dir := setup.ConfigDir(home)
-	cfgFile := config.ResolveConfigPath(cfgPath)
-	if cfgPath == "" {
-		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
-			cfgFile = filepath.Join(dir, "config.yaml")
+	if cfg != nil && len(cfg.NetworkCheck.Destinations) > 0 {
+		for _, d := range cfg.NetworkCheck.Destinations {
+			if d.URL == "" {
+				continue
+			}
+			label := d.Name
+			if label == "" {
+				label = d.URL
+			}
+			destLabels[d.URL] = label
+			destURLs = append(destURLs, d.URL)
 		}
 	}
-	if _, err := os.Stat(cfgFile); err == nil {
-		if cfg, err := config.Load(cfgFile); err == nil {
-			// Use configured destinations if present, else defaults
-			_ = cfg
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			results := probe.Run(ctx, cfg)
-			cancel()
-			for _, r := range results {
-				status := "PASS"
-				if r.Status == "down" {
-					status = "FAIL"
-				}
-				checks = append(checks, network.Check{Name: r.Endpoint.Name + " via proxy", Status: status, Detail: string(r.Status)})
+	if len(destURLs) == 0 {
+		destURLs = append(destURLs, network.DefaultDestinations...)
+	}
+	for _, dest := range destURLs {
+		if label := destLabels[dest]; label != "" {
+			doc.Destinations = append(doc.Destinations, label)
+		} else {
+			doc.Destinations = append(doc.Destinations, redact.String(dest))
+		}
+	}
+	doc.Checks = append(doc.Checks, network.CheckDestinations(destURLs)...)
+
+	// Proxy destination matrix via per-outbound URL-test. Never mutates the
+	// benchmark selector.
+	if cfg != nil {
+		mg, _ := managedconfig.Load(setup.ConfigDir(testHome()))
+		routes := proxyRoutesForMatrix(cfg, mg)
+		client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		doc.Matrix = network.DestinationMatrix(ctx, destURLs, routes, client, 6*time.Second)
+		cancel()
+		for i := range doc.Matrix {
+			if label := destLabels[doc.Matrix[i].Destination]; label != "" {
+				doc.Matrix[i].Destination = label
+			} else {
+				doc.Matrix[i].Destination = redact.String(doc.Matrix[i].Destination)
 			}
 		}
 	}
+
+	// Lightweight recommendation from a full probe + shared ranking engine.
+	recommended := ""
+	if cfg != nil {
+		results := probeRunQuick(cfg)
+		rec := recommendFromResults(cfg, results)
+		if rec.BestOverall.Name != "" {
+			recommended = rec.BestOverall.Name
+		}
+	}
+	doc.RecommendedProxy = recommended
+	if recommended == "" {
+		doc.Recommendation = "insufficient data"
+	} else {
+		doc.Recommendation = recommended
+	}
+
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(checks)
+		json.NewEncoder(os.Stdout).Encode(doc)
 		return 0
 	}
+
 	fmt.Println("\nFROSTGATE NETWORK CHECK")
-	fmt.Println("")
-	fmt.Println("Connection")
-	for _, c := range checks {
-		if c.Name == "IPv4" || c.Name == "IPv6" || c.Name == "HTTPS" || c.Name == "Captive portal" {
-			fmt.Printf("%-25s %-12s %s\n", c.Name, c.Status, c.Detail)
+	fmt.Println("\nConnection")
+	printChecks(doc.Checks, func(c network.Check) bool {
+		switch c.Name {
+		case "IPv4", "IPv6", "HTTPS", "Captive portal":
+			return true
 		}
-	}
+		return false
+	})
 	fmt.Println("\nDNS")
-	for _, c := range checks {
-		if strings.Contains(c.Name, "resolver") || strings.Contains(c.Name, "Answers") {
-			fmt.Printf("%-25s %-12s %s\n", c.Name, c.Status, c.Detail)
-		}
-	}
-	fmt.Println("\nRoutes")
-	for _, c := range checks {
-		if strings.Contains(c.Name, "via proxy") || c.Name == "Direct" {
-			fmt.Printf("%-25s %-12s %s\n", c.Name, c.Status, c.Detail)
-		}
-	}
+	printChecks(doc.Checks, func(c network.Check) bool {
+		return strings.Contains(c.Name, "resolver") || strings.Contains(c.Name, "DNS")
+	})
 	fmt.Println("\nDestinations")
-	for _, c := range checks {
-		if strings.HasPrefix(c.Name, "https://") {
-			fmt.Printf("%-25s %-12s %s\n", c.Name, c.Status, c.Detail)
+	printChecks(doc.Checks, func(c network.Check) bool {
+		return strings.HasPrefix(c.Name, "http://") || strings.HasPrefix(c.Name, "https://")
+	})
+	fmt.Println("\nMatrix")
+	for _, row := range doc.Matrix {
+		fmt.Printf("%s\n", matrixLabel(row.Destination, destLabels))
+		dirStatus := strings.Fields(row.Direct)
+		directCol := "FAIL"
+		if len(dirStatus) > 0 {
+			directCol = dirStatus[0]
+		}
+		fmt.Printf("  %-14s %s\n", "Direct", directCol)
+		for _, cell := range row.Routes {
+			status := cell.Status
+			if status == "PASS" {
+				status = "PASS"
+			}
+			fmt.Printf("  %-14s %-5s (%s)\n", truncateRoute(cell.Route), status, cell.Kind)
 		}
 	}
 	fmt.Println("\nSignals")
-	// Simple signals
 	hasDirectFail := false
 	hasProxyPass := false
-	for _, c := range checks {
-		if c.Name == "https://www.google.com/generate_204" && c.Status == "FAIL" {
+	for _, c := range doc.Checks {
+		if strings.HasPrefix(c.Name, "http") && c.Status == "FAIL" && !hasDirectFail {
 			hasDirectFail = true
 		}
-		if strings.Contains(c.Name, "via proxy") && c.Status == "PASS" {
-			hasProxyPass = true
+	}
+	for _, row := range doc.Matrix {
+		for _, cell := range row.Routes {
+			if cell.Status == "PASS" {
+				hasProxyPass = true
+			}
 		}
 	}
 	if hasDirectFail && hasProxyPass {
-		fmt.Println("- direct access differs by destination")
+		fmt.Println("- direct access differs by destination; proxy routes are usable")
 	}
-	for _, c := range checks {
-		if c.Name == "Answers differ" && c.Status == "FAIL" {
-			fmt.Println("- DNS answers differ from DoH")
+	for _, c := range doc.Checks {
+		if c.Name == "DNS vs DoH" && c.Status == "WARN" {
+			fmt.Println("- DNS answers differ from DoH (signal only)")
 		}
 	}
 	fmt.Println("\nRecommendation")
-	// Find best route from last probe
-	home2 := setup.ConfigDir(setup.DefaultHomeDir())
-	_ = home2
-	fmt.Println("Use best route from `frostgate benchmark`")
+	if recommended != "" {
+		fmt.Printf("Recommended proxy: %s\n", recommended)
+	} else {
+		fmt.Println("Recommendation: insufficient data")
+	}
 	return 0
 }
 
+func printChecks(checks []network.Check, keep func(network.Check) bool) {
+	for _, c := range checks {
+		if keep(c) {
+			fmt.Printf("%-25s %-12s %s\n", c.Name, c.Status, c.Detail)
+		}
+	}
+}
+
+func matrixLabel(url string, labels map[string]string) string {
+	if l, ok := labels[url]; ok && l != "" {
+		return l
+	}
+	return url
+}
+
+func truncateRoute(name string) string {
+	if len(name) > 14 {
+		return name[:13] + "~"
+	}
+	return name
+}
+
+// proxyRoutesForMatrix maps singbox endpoints to matrix columns using managed
+// metadata for protocol kinds (reality / hysteria2 / proxy).
+func proxyRoutesForMatrix(cfg *config.Config, mg *managedconfig.Managed) []network.RouteProbe {
+	var out []network.RouteProbe
+	isVLESS := map[string]bool{}
+	isHyst := map[string]bool{}
+	if mg != nil {
+		for _, v := range mg.VLESS {
+			if v != nil {
+				isVLESS[v.Tag] = true
+			}
+		}
+		for _, h := range mg.Hysteria {
+			if h != nil {
+				isHyst[h.Tag] = true
+			}
+		}
+	}
+	for _, ep := range cfg.Endpoints {
+		if ep.Type != config.ProbeSingBox {
+			continue
+		}
+		kind := "proxy"
+		switch {
+		case isVLESS[ep.Outbound]:
+			kind = "reality"
+		case isHyst[ep.Outbound]:
+			kind = "hysteria2"
+		}
+		out = append(out, network.RouteProbe{Name: ep.Name, Outbound: ep.Outbound, Kind: kind})
+	}
+	return out
+}
+
+func testHome() string {
+	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
+		return h
+	}
+	return setup.DefaultHomeDir()
+}
+
+// defaultSidecarConfig returns the sidecar config path when it exists.
 // --- compare ---
+type compareRoute struct {
+	Route        string  `json:"route"`
+	Type         string  `json:"type,omitempty"`
+	Availability float64 `json:"availability_pct"`
+	Samples      int     `json:"samples"`
+	MedianMs     int64   `json:"median_ms"`
+	JitterMs     int64   `json:"jitter_ms"`
+	DownloadMbps float64 `json:"download_mbps,omitempty"`
+	Trend        string  `json:"trend"`
+}
+
+type compareNetwork struct {
+	Network             string         `json:"network"`
+	Routes              []compareRoute `json:"routes"`
+	BestProxy           string         `json:"best_proxy,omitempty"`
+	BestProxyConfidence string         `json:"best_proxy_confidence,omitempty"`
+}
+
+// compareBestProxy ranks a network's routes with the shared ranking engine;
+// direct/non-proxy rows are never eligible for Best Proxy.
+func compareBestProxy(summaries []history.Summary) (string, string) {
+	var cands []ranking.Candidate
+	for _, s := range summaries {
+		status := "up"
+		if s.Availability == 0 {
+			status = "down"
+		} else if s.Availability < 95 {
+			status = "degraded"
+		}
+		cands = append(cands, ranking.Candidate{
+			Name:            s.Route,
+			IsProxy:         s.Type == string(config.ProbeSingBox),
+			Status:          status,
+			LossPct:         100 - s.Availability,
+			Median:          s.Median,
+			Jitter:          s.Jitter,
+			DownloadMbps:    s.Download,
+			HistoryCount:    s.Count,
+			AvailabilityPct: s.Availability,
+		})
+	}
+	best := ranking.Best(cands)
+	if best == nil {
+		return "", ""
+	}
+	conf := "low"
+	switch {
+	case best.HistoryCount >= 50:
+		conf = "high"
+	case best.HistoryCount >= 10:
+		conf = "medium"
+	}
+	return best.Name, conf
+}
+
 func handleCompare(args []string) int {
 	jsonOut := false
 	for _, a := range args {
@@ -1330,10 +1369,16 @@ func handleCompare(args []string) int {
 			return 3
 		}
 	}
-	db, err := history.Open()
+	db, err := history.OpenReadonly()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 3
+		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
+		if jsonOut {
+			fmt.Fprintln(os.Stderr, msg)
+			json.NewEncoder(os.Stdout).Encode([]compareNetwork{})
+			return 0
+		}
+		fmt.Print(msg)
+		return 0
 	}
 	defer db.Close()
 	records, _ := db.Query(30*24*time.Hour, "", "")
@@ -1346,104 +1391,93 @@ func handleCompare(args []string) int {
 	if len(netSet) == 0 {
 		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
 		if jsonOut {
-			json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "no network history"})
+			fmt.Fprintln(os.Stderr, msg)
+			json.NewEncoder(os.Stdout).Encode([]compareNetwork{})
 			return 0
 		}
 		fmt.Print(msg)
 		return 0
 	}
-	var networks []string
+	networks := make([]string, 0, len(netSet))
 	for n := range netSet {
 		networks = append(networks, n)
 	}
-	// Deterministic: sort networks
-	for i := 0; i < len(networks); i++ {
-		for j := i + 1; j < len(networks); j++ {
-			if networks[j] < networks[i] {
-				networks[i], networks[j] = networks[j], networks[i]
-			}
-		}
-	}
-	// For each network, summarize
-	type netSummary struct {
-		Network   string
-		Summaries []history.Summary
-	}
-	var all []netSummary
+	sort.Strings(networks)
+
+	out := make([]compareNetwork, 0, len(networks))
 	for _, netw := range networks {
 		recs, _ := db.Query(30*24*time.Hour, "", netw)
 		summ := history.Summarize(recs)
-		all = append(all, netSummary{Network: netw, Summaries: summ})
+		sort.Slice(summ, func(i, j int) bool { return summ[i].Route < summ[j].Route })
+		cn := compareNetwork{Network: netw, Routes: make([]compareRoute, 0, len(summ))}
+		for _, s := range summ {
+			cn.Routes = append(cn.Routes, compareRoute{
+				Route:        s.Route,
+				Type:         s.Type,
+				Availability: s.Availability,
+				Samples:      s.Count,
+				MedianMs:     s.Median.Milliseconds(),
+				JitterMs:     s.Jitter.Milliseconds(),
+				DownloadMbps: s.Download,
+				Trend:        s.Trend,
+			})
+		}
+		cn.BestProxy, cn.BestProxyConfidence = compareBestProxy(summ)
+		out = append(out, cn)
 	}
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(all)
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(out)
 		return 0
 	}
 	fmt.Println("\nNETWORK COMPARISON")
-	fmt.Println("")
-	// Header
-	fmt.Printf("%-20s", "")
-	for _, ns := range all {
-		fmt.Printf("%-12s", strings.ToUpper(ns.Network))
-	}
 	fmt.Println()
-	// For each route, print per network
-	// Collect all routes
-	routeSet := map[string]bool{}
-	for _, ns := range all {
-		for _, s := range ns.Summaries {
-			routeSet[s.Route] = true
+	header := fmt.Sprintf("%-20s", "")
+	for _, cn := range out {
+		header += fmt.Sprintf("%-14s", strings.ToUpper(cn.Network))
+	}
+	fmt.Println(header)
+	routeNames := map[string]bool{}
+	for _, cn := range out {
+		for _, r := range cn.Routes {
+			routeNames[r.Route] = true
 		}
 	}
-	for route := range routeSet {
-		fmt.Printf("\n%-20s\n", route)
-		fmt.Printf("%-20s", "  Availability")
-		for _, ns := range all {
-			avail := "—"
-			for _, s := range ns.Summaries {
-				if s.Route == route {
-					avail = fmt.Sprintf("%.0f%%", s.Availability)
-				}
-			}
-			fmt.Printf("%-12s", avail)
-		}
-		fmt.Println()
-		fmt.Printf("%-20s", "  Median")
-		for _, ns := range all {
-			med := "—"
-			for _, s := range ns.Summaries {
-				if s.Route == route {
-					med = fmt.Sprintf("%dms", s.Median.Milliseconds())
-				}
-			}
-			fmt.Printf("%-12s", med)
-		}
-		fmt.Println()
-		fmt.Printf("%-20s", "  Download")
-		for _, ns := range all {
-			dl := "—"
-			for _, s := range ns.Summaries {
-				if s.Route == route && s.Download > 0 {
-					dl = fmt.Sprintf("%.0fMb", s.Download)
-				}
-			}
-			fmt.Printf("%-12s", dl)
-		}
-		fmt.Println()
+	sortedRoutes := make([]string, 0, len(routeNames))
+	for rn := range routeNames {
+		sortedRoutes = append(sortedRoutes, rn)
 	}
-	fmt.Println("\nBest per network:")
-	for _, ns := range all {
-		best := ""
-		bestAvail := -1.0
-		for _, s := range ns.Summaries {
-			if s.Availability > bestAvail {
-				bestAvail = s.Availability
-				best = s.Route
+	sort.Strings(sortedRoutes)
+
+	fmt.Println()
+	for _, route := range sortedRoutes {
+		fmt.Printf("%s\n", route)
+		for _, cn := range out {
+			var cr *compareRoute
+			for i := range cn.Routes {
+				if cn.Routes[i].Route == route {
+					cr = &cn.Routes[i]
+				}
 			}
+			if cr == nil {
+				continue
+			}
+			dl := ""
+			if cr.DownloadMbps > 0 {
+				dl = fmt.Sprintf(" download %.0fMb", cr.DownloadMbps)
+			}
+			fmt.Printf("  %-12s avail %3.0f%%  samples %-4d median %4dms  jitter %3dms%s\n",
+				cn.Network, cr.Availability, cr.Samples, cr.MedianMs, cr.JitterMs, dl)
 		}
-		if best != "" {
-			fmt.Printf("%-12s %s\n", ns.Network, best)
+	}
+	fmt.Println("\nBest proxy per network:")
+	for _, cn := range out {
+		if cn.BestProxy == "" {
+			fmt.Printf("%-12s (none usable)\n", cn.Network)
+			continue
 		}
+		fmt.Printf("%-12s %s (confidence: %s)\n", cn.Network, cn.BestProxy, cn.BestProxyConfidence)
 	}
 	return 0
 }
@@ -1494,41 +1528,26 @@ func handleRecommend(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	results := probe.Run(ctx, cfg)
 	cancel()
-	var inputs []recommend.Input
-	for _, r := range results {
-		inputs = append(inputs, recommend.Input{
-			Name:     r.Endpoint.Name,
-			Status:   string(r.Status),
-			Loss:     r.Metrics.LossPct,
-			Median:   r.Metrics.Median,
-			Jitter:   r.Metrics.Jitter,
-			Priority: r.Endpoint.Priority,
-		})
-	}
-	db, err := history.Open()
-	historyCount := 0
-	if err == nil {
-		defer db.Close()
-		recs, _ := db.Query(7*24*time.Hour, "", "")
-		historyCount = len(recs)
-		summaries := history.Summarize(recs)
-		for i, inp := range inputs {
-			for _, s := range summaries {
-				if s.Route == inp.Name {
-					inputs[i].Availability = s.Availability
-					inputs[i].Download = s.Download
-				}
-			}
-		}
-	}
-	rec := recommend.Recommend(inputs, historyCount)
+	rec := recommendFromResults(cfg, results)
 	if jsonOut {
 		json.NewEncoder(os.Stdout).Encode(rec)
 		return 0
 	}
 	fmt.Println("\nRECOMMENDATION")
 	fmt.Println("")
-	fmt.Printf("Best overall:\n%s\n\n", rec.BestOverall.Name)
+	if d, ok := probe.DirectBaseline(results); ok {
+		lat := "—"
+		if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+			lat = fmtDuration(d.Metrics.Median)
+		}
+		fmt.Printf("Direct baseline:\n%s %s\n\n", strings.ToUpper(string(d.Status)), lat)
+	}
+	if rec.BestOverall.Name == "" {
+		fmt.Println("Best proxy:\nnone configured")
+		fmt.Println("Confidence: insufficient data")
+		return 0
+	}
+	fmt.Printf("Best proxy:\n%s\n\n", rec.BestOverall.Name)
 	fmt.Println("Why:")
 	for _, r := range rec.Reasons {
 		fmt.Printf("✓ %s\n", r)
@@ -1597,10 +1616,14 @@ func handleHistory(args []string) int {
 		fmt.Fprintf(os.Stderr, "invalid --since: %v\n", err)
 		return 3
 	}
-	db, err := history.Open()
+	db, err := history.OpenReadonly()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 3
+		if jsonOut {
+			fmt.Fprintln(os.Stdout, "[]")
+			return 0
+		}
+		fmt.Println("No history")
+		return 0
 	}
 	defer db.Close()
 	records, err := db.Query(since, route, networkLabel)
@@ -1662,30 +1685,59 @@ func parseSince(s string) (time.Duration, error) {
 }
 
 // --- helpers ---
-func recordHistory(results []probe.Result, network string) {
-	db, err := history.Open()
-	if err != nil {
-		return
-	}
-	defer db.Close()
+func newRecorder(cfg *config.Config) *history.Recorder {
+	enabled := cfg.History.Enabled == nil || *cfg.History.Enabled
+	return history.NewRecorder(enabled, cfg.History.Retention.Duration, cfg.History.WatchInterval.Duration)
+}
+
+func probeRunQuick(cfg *config.Config) []probe.Result {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return probe.Run(ctx, cfg)
+}
+
+// recommendFromResults builds recommend inputs from probe results and
+// enriches them with per-route history evidence when history is enabled.
+func recommendFromResults(cfg *config.Config, results []probe.Result, downloadFor ...func(string) float64) recommend.Result {
+	var inputs []recommend.Input
 	for _, r := range results {
-		rec := history.Record{
-			Route:    r.Endpoint.Name,
-			Type:     string(r.Endpoint.Type),
+		if r.Endpoint.Type != config.ProbeSingBox {
+			continue
+		}
+		in := recommend.Input{
+			Name:     r.Endpoint.Name,
 			Status:   string(r.Status),
 			Loss:     r.Metrics.LossPct,
-			MedianMs: r.Metrics.Median.Milliseconds(),
-			JitterMs: r.Metrics.Jitter.Milliseconds(),
-			MinMs:    r.Metrics.Min.Milliseconds(),
-			MaxMs:    r.Metrics.Max.Milliseconds(),
-			MeanMs:   r.Metrics.Mean.Milliseconds(),
-			Network:  network,
-			Category: r.Category,
+			Median:   r.Metrics.Median,
+			Jitter:   r.Metrics.Jitter,
+			Priority: r.Endpoint.Priority,
 		}
-		db.Add(rec)
+		if len(downloadFor) > 0 && downloadFor[0] != nil {
+			in.Download = downloadFor[0](r.Endpoint.Name)
+		}
+		inputs = append(inputs, in)
 	}
-	// Prune old
-	db.Prune(90 * 24 * time.Hour)
+	rec := newRecorder(cfg)
+	if rec.Enabled() {
+		if db, err := history.OpenReadonly(); err == nil {
+			defer db.Close()
+			recs, _ := db.Query(7*24*time.Hour, "", "")
+			summaries := history.Summarize(recs)
+			for i := range inputs {
+				for _, s := range summaries {
+					if s.Route == inputs[i].Name {
+						inputs[i].Availability = s.Availability
+						inputs[i].HistoryCount = s.Count
+						if inputs[i].Download == 0 {
+							inputs[i].Download = s.Download
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	return recommend.Recommend(inputs, 0)
 }
 
 func emit(results []probe.Result, asJSON bool, verbose bool) {
@@ -1708,8 +1760,8 @@ func emit(results []probe.Result, asJSON bool, verbose bool) {
 func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, verbose bool) int {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	// Also history throttling: only write every 5m
-	lastHistory := time.Now().Add(-10 * time.Minute)
+	rec := newRecorder(cfg)
+	defer rec.Close()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1717,9 +1769,8 @@ func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, 
 		default:
 		}
 		results := probe.Run(ctx, cfg)
-		if time.Since(lastHistory) > 5*time.Minute {
-			recordHistory(results, "")
-			lastHistory = time.Now()
+		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "")); err != nil && verbose {
+			fmt.Fprintf(os.Stderr, "history: %v\n", err)
 		}
 		line, err := report.NDJSONLine(results)
 		if err != nil {
@@ -1730,7 +1781,7 @@ func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, 
 		if verbose {
 			for _, r := range results {
 				if r.Err != nil {
-					fmt.Fprintf(os.Stderr, "debug %s: %v\n", r.Endpoint.Name, r.Err)
+					fmt.Fprintf(os.Stderr, "debug %s: %s\n", r.Endpoint.Name, sanitizeError(r.Err))
 				}
 			}
 		}
@@ -1743,7 +1794,19 @@ func watchJSON(ctx context.Context, cfg *config.Config, interval time.Duration, 
 }
 
 func watchTUI(ctx context.Context, cfg *config.Config, interval time.Duration, verbose bool) int {
-	m := tui.New(cfg, interval, verbose)
+	rec := newRecorder(cfg)
+	defer rec.Close()
+	observer := func(results []probe.Result) {
+		if len(results) == 0 {
+			return
+		}
+		// Throttling (watch_interval) is owned by the recorder; manual
+		// refreshes cannot flood the history DB.
+		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "")); err != nil && verbose {
+			fmt.Fprintf(os.Stderr, "history: %v\n", err)
+		}
+	}
+	m := tui.New(cfg, interval, verbose, observer)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	if _, err := p.Run(); err != nil {
 		if strings.Contains(err.Error(), "context canceled") {

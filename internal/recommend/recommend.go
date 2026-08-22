@@ -2,33 +2,34 @@ package recommend
 
 import (
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/history"
+	"github.com/ilyasmohaimel/frostgate/internal/ranking"
 )
 
 type Input struct {
-	Name         string
-	Status       string // up, degraded, down
-	Loss         float64
-	Median       time.Duration
-	Jitter       time.Duration
-	Download     float64
-	Priority     int
-	Availability float64 // from history 0-100
+	Name         string        `json:"name"`
+	Status       string        `json:"status"` // up, degraded, down
+	Loss         float64       `json:"loss_pct"`
+	Median       time.Duration `json:"median_ns"`
+	Jitter       time.Duration `json:"jitter_ns"`
+	Download     float64       `json:"download_mbps,omitempty"`
+	Priority     int           `json:"priority"`
+	Availability float64       `json:"availability_pct,omitempty"` // from history 0-100
+	HistoryCount int           `json:"history_count,omitempty"`    // number of historical samples for THIS route
 }
 
 type Result struct {
-	BestOverall      Input
-	Reasons          []string
-	Preferred        *Input
-	Fastest          Input
-	MostStable       Input
-	BestFallback     *Input
-	Avoid            []Input
-	Confidence       string
-	ConfidenceDetail string
+	BestOverall      Input    `json:"best_overall"`
+	Reasons          []string `json:"reasons"`
+	Preferred        *Input   `json:"preferred,omitempty"`
+	Fastest          Input    `json:"fastest"`
+	MostStable       Input    `json:"most_stable"`
+	BestFallback     *Input   `json:"best_fallback,omitempty"`
+	Avoid            []Input  `json:"avoid"`
+	Confidence       string   `json:"confidence"`
+	ConfidenceDetail string   `json:"confidence_detail"`
 }
 
 func Recommend(inputs []Input, historyCount int) Result {
@@ -42,69 +43,47 @@ func Recommend(inputs []Input, historyCount int) Result {
 			healthy = append(healthy, in)
 		}
 	}
-	// If no healthy, best overall is least bad down?
+	// A down route is never a recommendation, even when every route is down.
 	if len(healthy) == 0 {
-		// pick least loss down
-		sort.Slice(inputs, func(i, j int) bool {
-			if inputs[i].Loss != inputs[j].Loss {
-				return inputs[i].Loss < inputs[j].Loss
-			}
-			return inputs[i].Median < inputs[j].Median
-		})
 		return Result{
-			BestOverall: inputs[0],
-			Reasons:     []string{"no healthy route, least loss"},
-			Confidence:  confidence(historyCount),
+			Avoid:            append([]Input(nil), inputs...),
+			Confidence:       "low",
+			ConfidenceDetail: "No usable route measurements",
 		}
 	}
 
-	// Score healthy: lower loss is most important, then download, then median, then jitter, then priority as tie-break
-	// Use explainable rules, not just numeric score
-	scored := make([]Input, len(healthy))
-	copy(scored, healthy)
-	sort.Slice(scored, func(i, j int) bool {
-		// 1. loss bucket: 0% vs >0% vs >5% etc
-		// For simplicity, lower loss wins
-		if scored[i].Loss != scored[j].Loss {
-			// If loss difference >5%, lower wins regardless of speed
-			if (scored[i].Loss == 0) != (scored[j].Loss == 0) {
-				return scored[i].Loss < scored[j].Loss
-			}
-			// Both have some loss or both zero, compare loss
-			if scored[i].Loss < scored[j].Loss-5 {
-				return true
-			}
-			if scored[j].Loss < scored[i].Loss-5 {
-				return false
-			}
+	// Order healthy candidates using the shared ranking policy (single
+	// source of truth for ordering across probe/benchmark/recommend/compare).
+	cands := make([]ranking.Candidate, len(healthy))
+	for i, in := range healthy {
+		cands[i] = ranking.Candidate{
+			Name:            in.Name,
+			IsProxy:         true,
+			Status:          in.Status,
+			LossPct:         in.Loss,
+			Median:          in.Median,
+			Jitter:          in.Jitter,
+			DownloadMbps:    in.Download,
+			Priority:        in.Priority,
+			AvailabilityPct: in.Availability,
+			HistoryCount:    in.HistoryCount,
 		}
-		// 2. download: if difference >20 Mbps, higher wins
-		if scored[i].Download > 0 && scored[j].Download > 0 {
-			if scored[i].Download > scored[j].Download+20 {
-				return true
-			}
-			if scored[j].Download > scored[i].Download+20 {
-				return false
-			}
-		} else if scored[i].Download > 0 && scored[j].Download == 0 {
-			return true
-		} else if scored[j].Download > 0 && scored[i].Download == 0 {
-			return false
+	}
+	sorted := ranking.Sort(cands)
+	scored := make([]Input, len(sorted))
+	for i, c := range sorted {
+		scored[i] = Input{
+			Name:         c.Name,
+			Status:       c.Status,
+			Loss:         c.LossPct,
+			Median:       c.Median,
+			Jitter:       c.Jitter,
+			Download:     c.DownloadMbps,
+			Priority:     c.Priority,
+			Availability: c.AvailabilityPct,
+			HistoryCount: c.HistoryCount,
 		}
-		// 3. median: if difference >30ms, lower wins
-		if scored[i].Median < scored[j].Median-30*time.Millisecond {
-			return true
-		}
-		if scored[j].Median < scored[i].Median-30*time.Millisecond {
-			return false
-		}
-		// 4. jitter: lower wins if median close
-		if scored[i].Jitter != scored[j].Jitter {
-			return scored[i].Jitter < scored[j].Jitter
-		}
-		// 5. priority as tie-break: lower priority value wins if close
-		return scored[i].Priority < scored[j].Priority
-	})
+	}
 
 	best := scored[0]
 	reasons := []string{}
@@ -166,6 +145,12 @@ func Recommend(inputs []Input, historyCount int) Result {
 		}
 	}
 
+	// Confidence derives from the recommended route's OWN history evidence,
+	// not from the global history row count.
+	confCount := best.HistoryCount
+	if confCount == 0 {
+		confCount = historyCount
+	}
 	return Result{
 		BestOverall:      best,
 		Reasons:          reasons,
@@ -174,8 +159,8 @@ func Recommend(inputs []Input, historyCount int) Result {
 		MostStable:       mostStable,
 		BestFallback:     fallback,
 		Avoid:            avoid,
-		Confidence:       confidence(historyCount),
-		ConfidenceDetail: fmt.Sprintf("Based on %d measurements", historyCount),
+		Confidence:       confidence(confCount),
+		ConfidenceDetail: fmt.Sprintf("Based on %d measurements for %s", confCount, best.Name),
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
 
@@ -28,7 +29,7 @@ func Run(cfgPath string, verbose bool) []Check {
 	resolved := config.ResolveConfigPath(cfgPath)
 	out = append(out, Check{Name: "Config path", Status: "PASS", Detail: resolved})
 	if _, err := os.Stat(resolved); err != nil {
-		out = append(out, Check{Name: "Config file", Status: "FAIL", Detail: err.Error()})
+		out = append(out, Check{Name: "Config file", Status: "FAIL", Detail: redact.Error(err)})
 		return out
 	}
 	out = append(out, Check{Name: "Config file", Status: "PASS", Detail: "exists"})
@@ -45,22 +46,40 @@ func Run(cfgPath string, verbose bool) []Check {
 
 	cfg, err := config.Load(resolved)
 	if err != nil {
-		out = append(out, Check{Name: "Config parse", Status: "FAIL", Detail: err.Error()})
+		out = append(out, Check{Name: "Config parse", Status: "FAIL", Detail: redact.Error(err)})
 		return out
 	}
 	out = append(out, Check{Name: "Config parse", Status: "PASS", Detail: fmt.Sprintf("%d endpoints", len(cfg.Endpoints))})
 
 	// Test URL
 	if _, err := url.ParseRequestURI(cfg.SingBox.TestURL); err != nil {
-		out = append(out, Check{Name: "Test URL", Status: "FAIL", Detail: err.Error()})
+		out = append(out, Check{Name: "Test URL", Status: "FAIL", Detail: redact.Error(err)})
 	} else {
-		out = append(out, Check{Name: "Test URL", Status: "PASS", Detail: cfg.SingBox.TestURL})
+		out = append(out, Check{Name: "Test URL", Status: "PASS", Detail: redact.String(cfg.SingBox.TestURL)})
+	}
+
+	// Benchmark proxy configuration (required for proxy throughput)
+	hasSBEndpoints := false
+	for _, ep := range cfg.Endpoints {
+		if ep.Type == config.ProbeSingBox {
+			hasSBEndpoints = true
+			break
+		}
+	}
+	if hasSBEndpoints {
+		if cfg.SingBox.BenchmarkProxy == "" {
+			out = append(out, Check{Name: "Benchmark proxy", Status: "WARN", Detail: "singbox.benchmark_proxy not configured — download benchmarks will report N/A"})
+		} else if !config.IsLoopbackHost(hostOnly(cfg.SingBox.BenchmarkProxy)) {
+			out = append(out, Check{Name: "Benchmark proxy", Status: "FAIL", Detail: fmt.Sprintf("%s is not a loopback address", cfg.SingBox.BenchmarkProxy)})
+		} else {
+			out = append(out, Check{Name: "Benchmark proxy", Status: "PASS", Detail: cfg.SingBox.BenchmarkProxy})
+		}
 	}
 
 	// DNS check
 	if verbose {
 		if err := checkDNS(); err != nil {
-			out = append(out, Check{Name: "DNS", Status: "FAIL", Detail: err.Error()})
+			out = append(out, Check{Name: "DNS", Status: "FAIL", Detail: redact.Error(err)})
 		} else {
 			out = append(out, Check{Name: "DNS", Status: "PASS", Detail: "lookup ok"})
 		}
@@ -98,18 +117,18 @@ func Run(cfgPath string, verbose bool) []Check {
 				host = u.Host
 			}
 			if !isLoopback(host) {
-				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: fmt.Sprintf("controller %s is not loopback", cfg.SingBox.Controller)})
+				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: fmt.Sprintf("controller %s is not loopback", redact.String(cfg.SingBox.Controller))})
 			} else {
-				out = append(out, Check{Name: "Controller bind", Status: "PASS", Detail: cfg.SingBox.Controller})
+				out = append(out, Check{Name: "Controller bind", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
 			_, cerr := client.GetProxies(ctx)
 			cancel()
 			if cerr != nil {
-				out = append(out, Check{Name: "Controller", Status: "FAIL", Detail: cerr.Error()})
+				out = append(out, Check{Name: "Controller", Status: "FAIL", Detail: redact.Error(cerr)})
 			} else {
-				out = append(out, Check{Name: "Controller", Status: "PASS", Detail: cfg.SingBox.Controller})
+				out = append(out, Check{Name: "Controller", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
 				// check each outbound
 				ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
 				proxies, err := client.GetProxies(ctx2)
@@ -179,6 +198,16 @@ func isLoopback(host string) bool {
 		return isLoopback(h)
 	}
 	return false
+}
+
+func hostOnly(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	if i := strings.LastIndex(addr, ":"); i != -1 && !strings.Contains(addr, "]") {
+		return addr[:i]
+	}
+	return addr
 }
 
 func getSystemdStatus(unit string) string {

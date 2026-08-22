@@ -31,6 +31,12 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      - name: Installer integration
+        run: sh scripts/test-install.sh
+
+      - name: Installer syntax
+        run: sh -n install.sh
+
       - name: Build
         run: go build ./...
 

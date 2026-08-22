@@ -44,8 +44,8 @@ func TestJSONSchema(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if doc["schema_version"] != float64(2) {
-		t.Errorf("schema_version %v want 2", doc["schema_version"])
+	if doc["schema_version"] != float64(3) {
+		t.Errorf("schema_version %v want 3", doc["schema_version"])
 	}
 	if _, ok := doc["timestamp"]; !ok {
 		t.Error("missing timestamp")
@@ -84,8 +84,71 @@ func TestNDJSONLine(t *testing.T) {
 	if err := json.Unmarshal(line, &doc); err != nil {
 		t.Fatalf("unmarshal ndjson: %v", err)
 	}
-	if doc["schema_version"] != float64(2) {
+	if doc["schema_version"] != float64(3) {
 		t.Error("wrong schema")
+	}
+}
+
+func TestJSONDirectVsBestProxy(t *testing.T) {
+	results := []probe.Result{
+		mkResult("server-tcp", config.ProbeTCP, probe.StatusUp, 1*time.Millisecond, 0),
+		mkResult("direct", config.ProbeHTTP, probe.StatusUp, 23*time.Millisecond, 0),
+		mkResult("reality", config.ProbeSingBox, probe.StatusUp, 180*time.Millisecond, 0),
+		mkResult("hysteria", config.ProbeSingBox, probe.StatusUp, 171*time.Millisecond, 0),
+	}
+	var buf bytes.Buffer
+	if err := JSON(&buf, results); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	direct, ok := doc["direct"].(map[string]any)
+	if !ok || direct["name"] != "direct" {
+		t.Errorf("direct field wrong: %v", doc["direct"])
+	}
+	bp, ok := doc["best_proxy"].(map[string]any)
+	if !ok || bp["name"] != "hysteria" {
+		t.Errorf("best_proxy should be hysteria (lower median), got %v", doc["best_proxy"])
+	}
+	if doc["best"] != "server-tcp" {
+		t.Errorf("legacy best should remain overall best, got %v", doc["best"])
+	}
+}
+
+func TestJSONNoProxy(t *testing.T) {
+	results := []probe.Result{mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0)}
+	var buf bytes.Buffer
+	if err := JSON(&buf, results); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	json.Unmarshal(buf.Bytes(), &doc)
+	if _, ok := doc["best_proxy"]; ok {
+		t.Errorf("best_proxy must be absent with no proxy routes")
+	}
+}
+
+func TestTableDirectAndBestProxy(t *testing.T) {
+	results := []probe.Result{
+		mkResult("direct", config.ProbeHTTP, probe.StatusUp, 23*time.Millisecond, 0),
+		mkResult("hysteria", config.ProbeSingBox, probe.StatusUp, 171*time.Millisecond, 0),
+	}
+	s := Table(results)
+	if !strings.Contains(s, "Direct baseline:") {
+		t.Errorf("missing direct baseline line: %q", s)
+	}
+	if !strings.Contains(s, "Best proxy: hysteria") {
+		t.Errorf("missing best proxy line: %q", s)
+	}
+}
+
+func TestTableNoProxyConfigured(t *testing.T) {
+	results := []probe.Result{mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0)}
+	s := Table(results)
+	if strings.Contains(s, "Best proxy") {
+		t.Errorf("no-proxy table must use legacy best route view: %q", s)
 	}
 }
 
@@ -117,15 +180,18 @@ func TestTableDownCase(t *testing.T) {
 }
 
 func TestJSONNoSecretInError(t *testing.T) {
-	// even if ErrMsg contains secret-like string, we don't filter but ensure we don't add secret field
+	secret := "fixture-secret-token"
 	results := []probe.Result{
-		{Endpoint: config.Endpoint{Name: "a", Type: config.ProbeSingBox, Outbound: "real"}, Status: probe.StatusDown, ErrMsg: "some error", Category: "proxy-test"},
+		{Endpoint: config.Endpoint{Name: "a", Type: config.ProbeSingBox, Outbound: "real"}, Status: probe.StatusDown, ErrMsg: "Get \"https://provider.example/path?token=" + secret + "\": timeout", Category: "proxy-test"},
 	}
 	var buf bytes.Buffer
 	JSON(&buf, results)
 	s := buf.String()
-	if strings.Contains(s, "Controller") {
-		t.Log("ok")
+	if strings.Contains(s, secret) {
+		t.Fatal("JSON leaked a URL query token")
+	}
+	if table := Table(results); strings.Contains(table, secret) {
+		t.Fatal("human table leaked a URL query token")
 	}
 	// Ensure outbound is present but not secret
 	var doc map[string]any

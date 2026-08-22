@@ -196,6 +196,53 @@ endpoints:
 	}
 }
 
+func TestDayDuration(t *testing.T) {
+	path := writeTemp(t, `
+history:
+  retention: 17d
+endpoints:
+  - name: a
+    host: example.com
+    port: 443
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.History.Retention.Duration != 17*24*time.Hour {
+		t.Fatalf("retention=%v want 17d", cfg.History.Retention.Duration)
+	}
+}
+
+func TestBenchmarkProxyMustBeLoopback(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:2080", "localhost:2080", "[::1]:2080"} {
+		path := writeTemp(t, `
+singbox:
+  benchmark_proxy: "`+addr+`"
+endpoints:
+  - name: a
+    host: example.com
+    port: 443
+`)
+		if _, err := Load(path); err != nil {
+			t.Fatalf("valid benchmark proxy %q rejected: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"0.0.0.0:2080", "203.0.113.10:2080", "127.0.0.1"} {
+		path := writeTemp(t, `
+singbox:
+  benchmark_proxy: "`+addr+`"
+endpoints:
+  - name: a
+    host: example.com
+    port: 443
+`)
+		if _, err := Load(path); err == nil {
+			t.Fatalf("unsafe benchmark proxy %q accepted", addr)
+		}
+	}
+}
+
 func TestPriority(t *testing.T) {
 	path := writeTemp(t, `
 endpoints:

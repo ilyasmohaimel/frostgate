@@ -27,10 +27,11 @@ singbox:
   # secret: ""                  # or set FROSTGATE_SINGBOX_SECRET env
   # secret_file: ~/.config/frostgate/controller-secret
   test_url: https://www.gstatic.com/generate_204
+  benchmark_proxy: 127.0.0.1:2080
 
 benchmark:
   download_bytes: 8388608       # ~8 MiB per route
-  download_url: https://speed.cloudflare.com/__down?bytes=8000000
+  download_url: https://speed.cloudflare.com/__down
 
 history:
   enabled: true
@@ -50,6 +51,7 @@ endpoints:
   - name: direct-baseline
     type: http
     url: https://www.gstatic.com/generate_204
+    expected_status: 204
     priority: 100
 
   - name: primary-reality
@@ -61,11 +63,6 @@ endpoints:
     type: singbox
     outbound: backup-hysteria2
     priority: 20
-
-  - name: xhttp-fallback
-    type: singbox
-    outbound: xhttp-fallback
-    priority: 30
 
   # Optional basic reachability diagnostics (layer 1):
   # - name: server-tcp

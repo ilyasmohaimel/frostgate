@@ -2,11 +2,20 @@ package route
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
+)
+
+var (
+	ErrRouteNameEmpty   = errors.New("route name is empty")
+	ErrRouteNameTooLong = errors.New("route name too long")
+	ErrRouteNameControl = errors.New("route name contains control characters")
+	ErrRouteNameSlash   = errors.New("route name contains slash")
+	ErrRouteNameInvalid = errors.New("route name contains invalid characters")
 )
 
 type ImportedRoute struct {
@@ -21,13 +30,13 @@ type ImportedRoute struct {
 }
 
 func FingerprintVLESS(v *setup.VLESSOutbound) string {
-	canonical := fmt.Sprintf("vless:%s:%d:%s:reality:%s:%s:%s:%s:%s:%s", v.Server, v.ServerPort, v.UUID, v.SNI, v.PBK, v.SID, v.FP, v.Flow, v.SpiderX)
+	canonical := fmt.Sprintf("vless:%s:%d:%s:reality:%s:%s:%s:%s:%s:%s:%s", v.Server, v.ServerPort, v.UUID, v.SNI, v.PBK, v.SID, v.FP, v.Flow, v.SpiderX, v.PacketEncoding)
 	h := sha256.Sum256([]byte(canonical))
 	return fmt.Sprintf("%x", h[:])
 }
 
 func FingerprintHysteria(h *setup.Hysteria2Outbound) string {
-	canonical := fmt.Sprintf("hysteria2:%s:%d:%s:%s:%s:%t:%s", h.Server, h.ServerPort, h.Password, h.ObfsPassword, h.SNI, h.Insecure, h.PinSHA256)
+	canonical := fmt.Sprintf("hysteria2:%s:%d:%s:%s:%s:%s:%t:%s", h.Server, h.ServerPort, h.Password, h.ObfsType, h.ObfsPassword, h.SNI, h.Insecure, h.PinSHA256)
 	hash := sha256.Sum256([]byte(canonical))
 	return fmt.Sprintf("%x", hash[:])
 }

@@ -1,0 +1,296 @@
+package managedconfig
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
+)
+
+func tempDir(t *testing.T) string {
+	d, err := os.MkdirTemp("", "mc-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	return d
+}
+
+func canonical(t *testing.T, data []byte) string {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func genBytes(t *testing.T, dir string, vless []*setup.VLESSOutbound, hyst []*setup.Hysteria2Outbound) []byte {
+	t.Helper()
+	m := &Managed{Dir: dir}
+	for _, v := range vless {
+		m.AddVLESS(v)
+	}
+	for _, h := range hyst {
+		m.AddHysteria(h)
+	}
+	b, err := m.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func writeConfig(t *testing.T, dir string, vless []*setup.VLESSOutbound, hyst []*setup.Hysteria2Outbound) []byte {
+	b := genBytes(t, dir, vless, hyst)
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestRoundTripVLESSReality(t *testing.T) {
+	d := tempDir(t)
+	v := &setup.VLESSOutbound{
+		Tag: "reality1", Server: "203.0.113.1", ServerPort: 443, UUID: "u", Flow: "xtls-rprx-vision",
+		SNI: "sni.example", FP: "chrome", PBK: "pub", SID: "sid", SpiderX: "/",
+	}
+	first := writeConfig(t, d, []*setup.VLESSOutbound{v}, nil)
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.VLESS) != 1 {
+		t.Fatalf("expected 1 vless, got %d", len(loaded.VLESS))
+	}
+	gv := loaded.VLESS[0]
+	if gv.SpiderX != "/" || gv.PBK != "pub" || gv.SID != "sid" || gv.FP != "chrome" || gv.Flow != "xtls-rprx-vision" {
+		t.Fatalf("vless fields lost: %+v", gv)
+	}
+	second, err := loaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical(t, first) != canonical(t, second) {
+		t.Fatalf("round-trip not stable:\n%s\n---\n%s", first, second)
+	}
+}
+
+func TestRoundTripPacketEncoding(t *testing.T) {
+	d := tempDir(t)
+	v := &setup.VLESSOutbound{Tag: "vpe", Server: "203.0.113.2", ServerPort: 443, UUID: "u", SNI: "s", PBK: "p", FP: "chrome", PacketEncoding: "xudp"}
+	writeConfig(t, d, []*setup.VLESSOutbound{v}, nil)
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.VLESS[0].PacketEncoding != "xudp" {
+		t.Fatalf("packet_encoding lost: %q", loaded.VLESS[0].PacketEncoding)
+	}
+}
+
+func TestRoundTripHysteriaSalamander(t *testing.T) {
+	d := tempDir(t)
+	h := &setup.Hysteria2Outbound{Tag: "h1", Server: "203.0.113.3", ServerPort: 8443, Password: "pw", ObfsType: "salamander", ObfsPassword: "ob", SNI: "h.example"}
+	writeConfig(t, d, nil, []*setup.Hysteria2Outbound{h})
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := loaded.Hysteria[0]
+	if gh.ObfsType != "salamander" || gh.ObfsPassword != "ob" || gh.SNI != "h.example" {
+		t.Fatalf("hysteria fields lost: %+v", gh)
+	}
+}
+
+func TestRoundTripHysteriaInsecure(t *testing.T) {
+	d := tempDir(t)
+	h := &setup.Hysteria2Outbound{Tag: "h2", Server: "203.0.113.4", ServerPort: 443, Password: "pw", Insecure: true}
+	writeConfig(t, d, nil, []*setup.Hysteria2Outbound{h})
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Hysteria[0].Insecure {
+		t.Fatalf("insecure lost")
+	}
+}
+
+func TestRoundTripMultipleRoutes(t *testing.T) {
+	d := tempDir(t)
+	v1 := &setup.VLESSOutbound{Tag: "v1", Server: "203.0.113.5", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}
+	v2 := &setup.VLESSOutbound{Tag: "v2", Server: "203.0.113.6", ServerPort: 443, UUID: "u2", SNI: "s2", PBK: "p2", FP: "chrome"}
+	h1 := &setup.Hysteria2Outbound{Tag: "h1", Server: "203.0.113.7", ServerPort: 8443, Password: "pw"}
+	first := writeConfig(t, d, []*setup.VLESSOutbound{v1, v2}, []*setup.Hysteria2Outbound{h1})
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.VLESS) != 2 || len(loaded.Hysteria) != 1 {
+		t.Fatalf("lost routes: v=%d h=%d", len(loaded.VLESS), len(loaded.Hysteria))
+	}
+	second, err := loaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical(t, first) != canonical(t, second) {
+		t.Fatalf("multi-route not stable")
+	}
+}
+
+func TestAddToExisting(t *testing.T) {
+	d := tempDir(t)
+	v1 := &setup.VLESSOutbound{Tag: "v1", Server: "203.0.113.8", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}
+	first := writeConfig(t, d, []*setup.VLESSOutbound{v1}, nil)
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.AddVLESS(&setup.VLESSOutbound{Tag: "v2", Server: "203.0.113.9", ServerPort: 443, UUID: "u2", SNI: "s2", PBK: "p2", FP: "chrome"})
+	second, err := loaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical(t, first) == canonical(t, second) {
+		t.Fatalf("adding vless produced no change")
+	}
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.VLESS) != 2 {
+		t.Fatalf("add vless failed: %d", len(reloaded.VLESS))
+	}
+	reloaded.AddHysteria(&setup.Hysteria2Outbound{Tag: "h1", Server: "203.0.113.10", ServerPort: 8443, Password: "pw"})
+	third, err := reloaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), third, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	final, _ := Load(d)
+	if len(final.VLESS) != 2 || len(final.Hysteria) != 1 {
+		t.Fatalf("subscription batch add failed: v=%d h=%d", len(final.VLESS), len(final.Hysteria))
+	}
+}
+
+func TestRoundTripPreservesExtraConfig(t *testing.T) {
+	d := tempDir(t)
+	raw := []byte(`{
+  "dns": {"servers": [{"tag": "custom-dns", "address": "https://example.com/dns-query"}]},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "socks", "tag": "user-extra", "server": "203.0.113.20", "server_port": 1080},
+    {"type": "vless", "tag": "managed", "server": "203.0.113.10", "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "flow": "xtls-rprx-vision", "packet_encoding": "xudp", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "example-key", "short_id": "abcd", "spider_x": "/"}}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := loaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(generated, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["dns"]; !ok {
+		t.Fatal("non-managed top-level DNS configuration was lost")
+	}
+	foundExtra := false
+	for _, rawOutbound := range doc["outbounds"].([]any) {
+		outbound := rawOutbound.(map[string]any)
+		if outbound["tag"] == "user-extra" && outbound["type"] == "socks" {
+			foundExtra = true
+		}
+	}
+	if !foundExtra {
+		t.Fatal("non-managed outbound was lost")
+	}
+}
+
+func TestSaveTransactionSuccess(t *testing.T) {
+	d := tempDir(t)
+	m := &Managed{Dir: d, VLESS: []*setup.VLESSOutbound{{Tag: "v1", Server: "203.0.113.11", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}}}
+	var reloaded, restarted, activeCalled, readyCalled int
+	runner := &SidecarRunner{
+		Validator:       func([]byte) error { return nil },
+		DaemonReload:    func() error { reloaded++; return nil },
+		Restart:         func() error { restarted++; return nil },
+		IsActive:        func() (bool, error) { activeCalled++; return true, nil },
+		ControllerReady: func([]string) (bool, error) { readyCalled++; return true, nil },
+	}
+	if err := m.SaveTransaction(runner); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	if reloaded != 1 || restarted != 1 || activeCalled != 1 || readyCalled != 1 {
+		t.Fatalf("runner not fully invoked: %d %d %d %d", reloaded, restarted, activeCalled, readyCalled)
+	}
+	if _, err := os.Stat(filepath.Join(d, "sing-box.json")); err != nil {
+		t.Fatalf("config not written: %v", err)
+	}
+}
+
+func TestSaveTransactionRollbackOnRestartFail(t *testing.T) {
+	d := tempDir(t)
+	orig := []byte("original-config")
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Managed{Dir: d, VLESS: []*setup.VLESSOutbound{{Tag: "v1", Server: "203.0.113.12", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}}}
+	runner := &SidecarRunner{
+		DaemonReload: func() error { return nil },
+		Restart:      func() error { return os.ErrPermission },
+	}
+	if err := m.SaveTransaction(runner); err == nil {
+		t.Fatal("expected error on restart failure")
+	}
+	got, _ := os.ReadFile(filepath.Join(d, "sing-box.json"))
+	if string(got) != string(orig) {
+		t.Fatalf("rollback failed: config changed to %q", got)
+	}
+}
+
+func TestSaveTransactionRollbackOnInactive(t *testing.T) {
+	d := tempDir(t)
+	orig := []byte("original-config")
+	_ = os.WriteFile(filepath.Join(d, "sing-box.json"), orig, 0o600)
+	m := &Managed{Dir: d}
+	runner := &SidecarRunner{Restart: func() error { return nil }, IsActive: func() (bool, error) { return false, nil }}
+	if err := m.SaveTransaction(runner); err == nil {
+		t.Fatal("expected error when service inactive")
+	}
+	got, _ := os.ReadFile(filepath.Join(d, "sing-box.json"))
+	if string(got) != string(orig) {
+		t.Fatal("rollback failed on inactive")
+	}
+}
+
+func TestSaveTransactionRollbackOnControllerMissing(t *testing.T) {
+	d := tempDir(t)
+	orig := []byte("original-config")
+	_ = os.WriteFile(filepath.Join(d, "sing-box.json"), orig, 0o600)
+	m := &Managed{Dir: d, VLESS: []*setup.VLESSOutbound{{Tag: "v1", Server: "203.0.113.13", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}}}
+	runner := &SidecarRunner{
+		Restart:         func() error { return nil },
+		IsActive:        func() (bool, error) { return true, nil },
+		ControllerReady: func([]string) (bool, error) { return false, nil },
+	}
+	if err := m.SaveTransaction(runner); err == nil {
+		t.Fatal("expected error when controller missing outbound")
+	}
+}

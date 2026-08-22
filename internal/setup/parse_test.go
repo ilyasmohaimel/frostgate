@@ -55,6 +55,15 @@ func TestParseVLESSMissingTag(t *testing.T) {
 	}
 }
 
+func TestParseVLESSRejectsUnsupportedTransports(t *testing.T) {
+	for _, transport := range []string{"ws", "grpc", "http", "quic", "kcp"} {
+		link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&sni=example.com&pbk=example-key&type=" + transport
+		if _, err := ParseVLESSShareLink(link, "route"); err == nil || !strings.Contains(err.Error(), "unsupported VLESS transport") {
+			t.Fatalf("transport %q must be rejected, got %v", transport, err)
+		}
+	}
+}
+
 func TestParseHysteria2Valid(t *testing.T) {
 	link := "hysteria2://test-password-123@203.0.113.10:443?obfs=salamander&obfs-password=test-obfs-456&sni=example.com&insecure=1"
 	h, err := ParseHysteria2ShareLink(link, "hyst")
@@ -97,6 +106,15 @@ func TestParseHysteria2SalamanderMissingObfsPass(t *testing.T) {
 	_, err := ParseHysteria2ShareLink("hysteria2://pass@1.1.1.1:443?obfs=salamander&sni=x", "tag")
 	if err == nil {
 		t.Fatal("expected obfs-password error")
+	}
+}
+
+func TestParseHysteria2RejectsCertificatePins(t *testing.T) {
+	for _, key := range []string{"pinSHA256", "pin"} {
+		link := "hysteria2://example-password@203.0.113.10:443?sni=example.com&" + key + "=example-pin"
+		if _, err := ParseHysteria2ShareLink(link, "route"); err == nil || !strings.Contains(err.Error(), "pin") {
+			t.Fatalf("%s must be rejected, got %v", key, err)
+		}
 	}
 }
 

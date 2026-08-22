@@ -8,16 +8,17 @@ import (
 )
 
 type VLESSOutbound struct {
-	Tag        string
-	Server     string
-	ServerPort int
-	UUID       string
-	Flow       string
-	SNI        string
-	FP         string
-	PBK        string
-	SID        string
-	SpiderX    string
+	Tag            string
+	Server         string
+	ServerPort     int
+	UUID           string
+	Flow           string
+	SNI            string
+	FP             string
+	PBK            string
+	SID            string
+	SpiderX        string
+	PacketEncoding string
 }
 
 type Hysteria2Outbound struct {
@@ -25,6 +26,7 @@ type Hysteria2Outbound struct {
 	Server       string
 	ServerPort   int
 	Password     string
+	ObfsType     string
 	ObfsPassword string
 	SNI          string
 	Insecure     bool

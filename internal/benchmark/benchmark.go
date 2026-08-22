@@ -12,10 +12,14 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-const DefaultDownloadURL = "https://speed.cloudflare.com/__down?bytes=8000000"
+const DefaultDownloadURL = "https://speed.cloudflare.com/__down"
 const DefaultBytes = 8 * 1024 * 1024
 
-func buildDownloadURL(raw string, bytes int64) (string, error) {
+// buildDownloadURL returns the download URL with the configured byte count
+// applied authoritatively as the `bytes` query parameter. Any pre-existing
+// `bytes` value in the URL is replaced, while unrelated query parameters are
+// preserved. When bytes <= 0 the URL is left untouched.
+func BuildDownloadURL(raw string, bytes int64) (string, error) {
 	if raw == "" {
 		raw = DefaultDownloadURL
 	}
@@ -23,8 +27,8 @@ func buildDownloadURL(raw string, bytes int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	q := u.Query()
-	if q.Get("bytes") == "" && bytes > 0 {
+	if bytes > 0 {
+		q := u.Query()
 		q.Set("bytes", fmt.Sprintf("%d", bytes))
 		u.RawQuery = q.Encode()
 	}
@@ -35,7 +39,7 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if bytes == 0 {
 		bytes = DefaultBytes
 	}
-	u, err := buildDownloadURL(downloadURL, bytes)
+	u, err := BuildDownloadURL(downloadURL, bytes)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -78,7 +82,7 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if bytes == 0 {
 		bytes = DefaultBytes
 	}
-	u, err := buildDownloadURL(downloadURL, bytes)
+	u, err := BuildDownloadURL(downloadURL, bytes)
 	if err != nil {
 		return 0, 0, err
 	}

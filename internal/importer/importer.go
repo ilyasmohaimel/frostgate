@@ -25,6 +25,10 @@ type Skipped struct {
 	Line   string
 }
 
+// UserAgent is version-neutral on purpose: it must never embed a release
+// string that goes stale between versions.
+const UserAgent = "frostgate"
+
 func FetchSubscription(ctx context.Context, subURL string) ([]byte, error) {
 	return FetchSubscriptionWithOpts(ctx, subURL, false)
 }
@@ -52,7 +56,7 @@ func FetchSubscriptionWithOpts(ctx context.Context, subURL string, allowInsecure
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "frostgate/0.4.0")
+	req.Header.Set("User-Agent", UserAgent)
 	origIsHTTPS := u.Scheme == "https"
 	client := &http.Client{
 		Timeout: 15 * time.Second,

@@ -2,13 +2,17 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ilyasmohaimel/frostgate/internal/benchmark"
 )
 
 type Duration struct {
@@ -30,12 +34,23 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 		}
 		return err
 	}
-	parsed, err := time.ParseDuration(s)
+	parsed, err := parseDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
 	}
 	d.Duration = parsed
 	return nil
+}
+
+func parseDuration(s string) (time.Duration, error) {
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.ParseInt(strings.TrimSuffix(s, "d"), 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
 }
 
 type ProbeType string
@@ -59,10 +74,11 @@ type Defaults struct {
 }
 
 type SingBoxConfig struct {
-	Controller string `yaml:"controller"`
-	Secret     string `yaml:"secret,omitempty"`
-	SecretFile string `yaml:"secret_file,omitempty"`
-	TestURL    string `yaml:"test_url,omitempty"`
+	Controller     string `yaml:"controller"`
+	Secret         string `yaml:"secret,omitempty"`
+	SecretFile     string `yaml:"secret_file,omitempty"`
+	TestURL        string `yaml:"test_url,omitempty"`
+	BenchmarkProxy string `yaml:"benchmark_proxy,omitempty"`
 }
 
 type Endpoint struct {
@@ -81,6 +97,7 @@ type Endpoint struct {
 	HealthyLatency Duration  `yaml:"healthy_latency,omitempty"`
 	MaxJitter      Duration  `yaml:"max_jitter,omitempty"`
 	MaxLoss        *float64  `yaml:"max_loss,omitempty"`
+	ExpectedStatus int       `yaml:"expected_status,omitempty"`
 }
 
 func (e Endpoint) Addr() string {
@@ -183,19 +200,29 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) error {
+	if cfg.Benchmark.DownloadBytes < 0 {
+		return fmt.Errorf("benchmark.download_bytes must be positive")
+	}
 	if cfg.Benchmark.DownloadBytes == 0 {
 		cfg.Benchmark.DownloadBytes = 8 * 1024 * 1024
 	}
 	if cfg.Benchmark.DownloadURL == "" {
-		cfg.Benchmark.DownloadURL = DefaultTestURL
-		// Actually benchmark default is speed.cloudflare
-		cfg.Benchmark.DownloadURL = "https://speed.cloudflare.com/__down?bytes=8000000"
+		cfg.Benchmark.DownloadURL = "https://speed.cloudflare.com/__down"
+	}
+	if err := validateHTTPURL("benchmark.download_url", cfg.Benchmark.DownloadURL); err != nil {
+		return err
+	}
+	if cfg.History.Retention.Duration < 0 {
+		return fmt.Errorf("history.retention must be positive")
 	}
 	if cfg.History.Retention.Duration == 0 {
 		cfg.History.Retention.Duration = 90 * 24 * time.Hour
 	}
 	if cfg.History.WatchInterval.Duration == 0 {
 		cfg.History.WatchInterval.Duration = 5 * time.Minute
+	}
+	if cfg.History.WatchInterval.Duration < 0 {
+		return fmt.Errorf("history.watch_interval must be positive")
 	}
 	if cfg.History.Enabled == nil {
 		def := true
@@ -217,19 +244,37 @@ func applyDefaults(cfg *Config) error {
 	if cfg.Defaults.MaxJitter.Duration == 0 {
 		cfg.Defaults.MaxJitter.Duration = DefaultMaxJitter
 	}
+	if cfg.Defaults.Timeout.Duration < 0 || cfg.Defaults.Samples < 0 || cfg.Defaults.SampleInterval.Duration < 0 || cfg.Defaults.HealthyLatency.Duration < 0 || cfg.Defaults.MaxJitter.Duration < 0 {
+		return fmt.Errorf("default durations and samples must be non-negative")
+	}
+	if cfg.Defaults.MaxLoss != nil && (*cfg.Defaults.MaxLoss < 0 || *cfg.Defaults.MaxLoss > 100) {
+		return fmt.Errorf("defaults.max_loss must be 0-100")
+	}
 	if cfg.SingBox.Controller == "" {
 		cfg.SingBox.Controller = DefaultSingBoxController
 	}
 	if cfg.SingBox.TestURL == "" {
 		cfg.SingBox.TestURL = DefaultTestURL
-	} else {
-		if _, err := url.ParseRequestURI(cfg.SingBox.TestURL); err != nil {
-			return fmt.Errorf("singbox.test_url invalid: %w", err)
-		}
+	}
+	if err := validateHTTPURL("singbox.test_url", cfg.SingBox.TestURL); err != nil {
+		return err
 	}
 	if cfg.SingBox.Controller != "" {
-		if _, err := url.ParseRequestURI(cfg.SingBox.Controller); err != nil {
-			return fmt.Errorf("singbox.controller invalid: %w", err)
+		if err := validateHTTPURL("singbox.controller", cfg.SingBox.Controller); err != nil {
+			return err
+		}
+	}
+	if cfg.SingBox.BenchmarkProxy != "" {
+		if err := validateBenchmarkProxy(cfg.SingBox.BenchmarkProxy); err != nil {
+			return err
+		}
+	}
+	for i, dest := range cfg.NetworkCheck.Destinations {
+		if dest.URL == "" {
+			return fmt.Errorf("network_check.destinations[%d].url is required", i)
+		}
+		if err := validateHTTPURL(fmt.Sprintf("network_check.destinations[%d].url", i), dest.URL); err != nil {
+			return err
 		}
 	}
 	// resolve secret file if set
@@ -277,8 +322,8 @@ func normalize(e *Endpoint, cfg *Config) error {
 		}
 	case ProbeHTTP:
 		if e.URL != "" {
-			if _, err := url.ParseRequestURI(e.URL); err != nil {
-				return fmt.Errorf("invalid url %q: %w", e.URL, err)
+			if err := validateHTTPURL("url", e.URL); err != nil {
+				return err
 			}
 			if e.Host != "" || e.Port != 0 || e.Path != "" {
 				return fmt.Errorf("http probe with url must not have host/port/path")
@@ -325,6 +370,26 @@ func normalize(e *Endpoint, cfg *Config) error {
 	if e.MaxLoss != nil && (*e.MaxLoss < 0 || *e.MaxLoss > 100) {
 		return fmt.Errorf("max_loss must be 0-100")
 	}
+	if e.ExpectedStatus < 0 || e.ExpectedStatus > 599 {
+		return fmt.Errorf("expected_status must be 100-599")
+	}
+	if e.ExpectedStatus > 0 && e.ExpectedStatus < 100 {
+		return fmt.Errorf("expected_status must be 100-599")
+	}
+	return nil
+}
+
+func validateHTTPURL(field, raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return fmt.Errorf("%s invalid: %w", field, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s must use http or https", field)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s must include a host", field)
+	}
 	return nil
 }
 
@@ -334,6 +399,45 @@ func expandPath(p string) string {
 		return filepath.Join(home, p[2:])
 	}
 	return p
+}
+
+// IsLoopbackHost reports whether the host part of an address is a loopback
+// address suitable for the Frostgate-managed benchmark listener. Public, LAN
+// and wildcard addresses are rejected.
+func IsLoopbackHost(h string) bool {
+	return h == "127.0.0.1" || h == "::1" || h == "localhost"
+}
+
+func validateBenchmarkProxy(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("singbox.benchmark_proxy must be host:port: %q", addr)
+	}
+	if !IsLoopbackHost(host) {
+		return fmt.Errorf("singbox.benchmark_proxy must be a loopback address (127.0.0.1/::1/localhost), got %q", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("singbox.benchmark_proxy has invalid port: %q", addr)
+	}
+	return nil
+}
+
+// BenchmarkProxyAddr returns the configured benchmark proxy address. An empty
+// string means throughput benchmarking via a proxy listener is not available
+// and callers must report Download: N/A rather than guessing a port.
+func (c *Config) BenchmarkProxyAddr() string {
+	return c.SingBox.BenchmarkProxy
+}
+
+// BenchmarkDownloadURL returns the download URL with the configured byte count
+// applied authoritatively as the `bytes` query parameter.
+func (c *Config) BenchmarkDownloadURL() string {
+	u, err := benchmark.BuildDownloadURL(c.Benchmark.DownloadURL, c.Benchmark.DownloadBytes)
+	if err != nil {
+		return c.Benchmark.DownloadURL
+	}
+	return u
 }
 
 func ResolveConfigPath(explicit string) string {

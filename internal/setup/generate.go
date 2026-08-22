@@ -98,7 +98,11 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			// omit flow if empty? but keep as is; sing-box allows empty
 		}
 		// packet_encoding xudp is common for VLESS
-		ob["packet_encoding"] = "xudp"
+		if v.PacketEncoding != "" {
+			ob["packet_encoding"] = v.PacketEncoding
+		} else {
+			ob["packet_encoding"] = "xudp"
+		}
 		outbounds = append(outbounds, ob)
 	}
 	for _, h := range hysteriaOutbounds {
@@ -121,8 +125,12 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			"tls":         tlsCfg,
 		}
 		if h.ObfsPassword != "" {
+			obfsType := h.ObfsType
+			if obfsType == "" {
+				obfsType = "salamander"
+			}
 			ob["obfs"] = map[string]any{
-				"type":     "salamander",
+				"type":     obfsType,
 				"password": h.ObfsPassword,
 			}
 		}
@@ -173,9 +181,10 @@ func GenerateFrostgateConfig(vlessTags, hysteriaTags []string, testURL, controll
 	if secretFile != "" {
 		out += "  secret_file: " + secretFile + "\n"
 	}
-	out += "  test_url: " + testURL + "\n\nendpoints:\n"
+	out += "  test_url: " + testURL + "\n"
+	out += "  benchmark_proxy: 127.0.0.1:2080\n\nendpoints:\n"
 	// direct baseline always
-	out += "  - name: direct\n    type: http\n    url: " + testURL + "\n    priority: 100\n"
+	out += "  - name: direct\n    type: http\n    url: " + testURL + "\n    expected_status: 204\n    priority: 100\n"
 	priority := 10
 	for _, tag := range vlessTags {
 		out += fmt.Sprintf("  - name: %s\n    type: singbox\n    outbound: %s\n    priority: %d\n", tag, tag, priority)

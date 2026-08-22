@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 )
 
 var (
@@ -64,10 +65,11 @@ func Table(results []probe.Result) string {
 			if r.Category != "" {
 				detail = r.Category
 			} else if r.ErrMsg != "" {
-				if len(r.ErrMsg) > 30 {
-					detail = r.ErrMsg[:30]
+				safe := redact.String(r.ErrMsg)
+				if len(safe) > 30 {
+					detail = safe[:30]
 				} else {
-					detail = r.ErrMsg
+					detail = safe
 				}
 			}
 		} else if r.Metrics.Median > 0 {
@@ -84,6 +86,29 @@ func Table(results []probe.Result) string {
 		)
 	}
 	out := t.String() + "\n\n"
+	if probe.HasProxy(results) {
+		if d, ok := probe.DirectBaseline(results); ok {
+			lat := "—"
+			if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+				lat = formatLatency(d.Metrics.Median)
+			}
+			out += dimStyle.Render("Direct baseline:") + " " + plainStatus(d.Status) + " " + lat + "\n"
+		}
+		if b, ok := probe.BestProxy(results); ok {
+			median := formatLatency(b.Metrics.Median)
+			if b.Metrics.Succeeded == 0 {
+				median = "—"
+			}
+			out += bestStyle.Render("Best proxy: "+b.Endpoint.Name) + fmt.Sprintf(" (%s)", median)
+		} else {
+			out += dimStyle.Render("Best proxy: none configured")
+		}
+		diag := diagnosis(results)
+		if diag != "" {
+			out += "\n" + dimStyle.Render(diag)
+		}
+		return out
+	}
 	if best, ok := probe.Best(results); ok {
 		median := formatLatency(best.Metrics.Median)
 		if best.Metrics.Succeeded == 0 {
@@ -102,6 +127,17 @@ func Table(results []probe.Result) string {
 		}
 	}
 	return out
+}
+
+func plainStatus(s probe.Status) string {
+	switch s {
+	case probe.StatusUp:
+		return "UP"
+	case probe.StatusDegraded:
+		return "DEGRADED"
+	default:
+		return "DOWN"
+	}
 }
 
 func shortReason(r probe.Result) string {
@@ -209,7 +245,7 @@ func toLower(s string) string {
 	return string(b)
 }
 
-type jsonResult struct {
+type JSONResult struct {
 	Name      string  `json:"name"`
 	Type      string  `json:"type"`
 	Status    string  `json:"status"`
@@ -231,86 +267,71 @@ type jsonResult struct {
 type jsonDoc struct {
 	SchemaVersion int          `json:"schema_version"`
 	Timestamp     string       `json:"timestamp"`
-	Results       []jsonResult `json:"results"`
+	Direct        *JSONResult  `json:"direct,omitempty"`
+	BestProxy     *JSONResult  `json:"best_proxy,omitempty"`
 	Best          string       `json:"best,omitempty"`
+	Results       []JSONResult `json:"results"`
 	Diagnosis     string       `json:"diagnosis,omitempty"`
+}
+
+func ToJSONResult(r probe.Result) JSONResult {
+	jr := JSONResult{
+		Name:      r.Endpoint.Name,
+		Type:      string(r.Endpoint.Type),
+		Status:    string(r.Status),
+		Category:  r.Category,
+		Attempted: r.Metrics.Attempted,
+		Succeeded: r.Metrics.Succeeded,
+		Failed:    r.Metrics.Failed,
+		LossPct:   r.Metrics.LossPct,
+		MedianMs:  r.Metrics.Median.Milliseconds(),
+		JitterMs:  r.Metrics.Jitter.Milliseconds(),
+		Priority:  r.Endpoint.Priority,
+		Error:     redact.String(r.ErrMsg),
+	}
+	if r.Endpoint.Outbound != "" {
+		jr.Outbound = r.Endpoint.Outbound
+	}
+	if r.Metrics.Succeeded > 0 {
+		jr.MinMs = r.Metrics.Min.Milliseconds()
+		jr.MaxMs = r.Metrics.Max.Milliseconds()
+		jr.MeanMs = r.Metrics.Mean.Milliseconds()
+	}
+	return jr
+}
+
+func buildDoc(results []probe.Result, now string) jsonDoc {
+	doc := jsonDoc{
+		SchemaVersion: 3,
+		Timestamp:     now,
+	}
+	for _, r := range results {
+		doc.Results = append(doc.Results, ToJSONResult(r))
+	}
+	if d, ok := probe.DirectBaseline(results); ok {
+		jr := ToJSONResult(d)
+		doc.Direct = &jr
+	}
+	if b, ok := probe.BestProxy(results); ok {
+		jr := ToJSONResult(b)
+		doc.BestProxy = &jr
+	}
+	// Legacy field: overall best route of any type (unchanged semantics).
+	if best, ok := probe.Best(results); ok {
+		doc.Best = best.Endpoint.Name
+	}
+	doc.Diagnosis = diagnosis(results)
+	return doc
 }
 
 func JSON(w io.Writer, results []probe.Result) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	doc := jsonDoc{
-		SchemaVersion: 2,
-		Timestamp:     now,
-	}
-	for _, r := range results {
-		jr := jsonResult{
-			Name:      r.Endpoint.Name,
-			Type:      string(r.Endpoint.Type),
-			Status:    string(r.Status),
-			Category:  r.Category,
-			Attempted: r.Metrics.Attempted,
-			Succeeded: r.Metrics.Succeeded,
-			Failed:    r.Metrics.Failed,
-			LossPct:   r.Metrics.LossPct,
-			MedianMs:  r.Metrics.Median.Milliseconds(),
-			JitterMs:  r.Metrics.Jitter.Milliseconds(),
-			Priority:  r.Endpoint.Priority,
-			Error:     r.ErrMsg,
-		}
-		if r.Endpoint.Outbound != "" {
-			jr.Outbound = r.Endpoint.Outbound
-		}
-		if r.Metrics.Succeeded > 0 {
-			jr.MinMs = r.Metrics.Min.Milliseconds()
-			jr.MaxMs = r.Metrics.Max.Milliseconds()
-			jr.MeanMs = r.Metrics.Mean.Milliseconds()
-		}
-		// redact secrets - ErrMsg should already be categorized and not contain secrets, but ensure we don't leak controller token
-		doc.Results = append(doc.Results, jr)
-	}
-	if best, ok := probe.Best(results); ok {
-		doc.Best = best.Endpoint.Name
-	}
-	doc.Diagnosis = diagnosis(results)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(doc)
+	return enc.Encode(buildDoc(results, now))
 }
 
 func NDJSONLine(results []probe.Result) ([]byte, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	doc := jsonDoc{
-		SchemaVersion: 2,
-		Timestamp:     now,
-	}
-	for _, r := range results {
-		jr := jsonResult{
-			Name:      r.Endpoint.Name,
-			Type:      string(r.Endpoint.Type),
-			Status:    string(r.Status),
-			Category:  r.Category,
-			Attempted: r.Metrics.Attempted,
-			Succeeded: r.Metrics.Succeeded,
-			Failed:    r.Metrics.Failed,
-			LossPct:   r.Metrics.LossPct,
-			MedianMs:  r.Metrics.Median.Milliseconds(),
-			JitterMs:  r.Metrics.Jitter.Milliseconds(),
-			Priority:  r.Endpoint.Priority,
-			Error:     r.ErrMsg,
-		}
-		if r.Endpoint.Outbound != "" {
-			jr.Outbound = r.Endpoint.Outbound
-		}
-		if r.Metrics.Succeeded > 0 {
-			jr.MinMs = r.Metrics.Min.Milliseconds()
-			jr.MaxMs = r.Metrics.Max.Milliseconds()
-			jr.MeanMs = r.Metrics.Mean.Milliseconds()
-		}
-		doc.Results = append(doc.Results, jr)
-	}
-	if best, ok := probe.Best(results); ok {
-		doc.Best = best.Endpoint.Name
-	}
-	doc.Diagnosis = diagnosis(results)
-	return json.Marshal(doc)
+	return json.Marshal(buildDoc(results, now))
 }

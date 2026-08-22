@@ -6,16 +6,17 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/health"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
+	"github.com/ilyasmohaimel/frostgate/internal/ranking"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
+	"sync"
 )
 
 type Status = health.Status
@@ -45,22 +46,37 @@ var httpClient = &http.Client{
 }
 
 func Run(ctx context.Context, cfg *config.Config) []Result {
-	results := make([]Result, len(cfg.Endpoints))
+	results := make([]Result, 0, len(cfg.Endpoints))
+	var mu sync.Mutex
 	sem := semaphore.NewWeighted(32)
 
 	g, ctx := errgroup.WithContext(ctx)
-	for i, ep := range cfg.Endpoints {
+	for i := range cfg.Endpoints {
 		if err := sem.Acquire(ctx, 1); err != nil {
 			break
 		}
-		i, ep := i, ep
+		i := i
 		g.Go(func() error {
 			defer sem.Release(1)
-			results[i] = ProbeEndpoint(ctx, cfg, ep)
+			// Only started endpoints are recorded; endpoints that never
+			// began (e.g. context cancelled before scheduling) are not
+			// returned as phantom zero-value results.
+			r := ProbeEndpoint(ctx, cfg, cfg.Endpoints[i])
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
 			return nil
 		})
 	}
 	_ = g.Wait()
+	// Defensive: never rank or return phantom entries with no name.
+	kept := results[:0]
+	for _, r := range results {
+		if r.Endpoint.Name != "" {
+			kept = append(kept, r)
+		}
+	}
+	results = kept
 	Rank(results)
 	return results
 }
@@ -71,19 +87,27 @@ func ProbeEndpoint(ctx context.Context, cfg *config.Config, e config.Endpoint) R
 	interval := cfg.SampleIntervalFor(e)
 
 	var s []metrics.Sample
-	for i := 0; i < samples; i++ {
+	collecting := true
+	for i := 0; i < samples && collecting; i++ {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				s = append(s, metrics.Sample{Success: false, Err: ctx.Err(), ErrCategory: categorizeError(ctx.Err())})
-				break
+				// Cancellation while waiting between samples: stop
+				// immediately. Do NOT append a synthetic failed attempt and
+				// do NOT launch another probe.
+				collecting = false
+				continue
 			case <-time.After(interval):
 			}
 		}
-		sample := probeOnce(ctx, cfg, e, timeout)
-		s = append(s, sample)
 		if ctx.Err() != nil {
-			break
+			collecting = false
+			continue
+		}
+		s = append(s, probeOnce(ctx, cfg, e, timeout))
+		if ctx.Err() != nil {
+			collecting = false
+			continue
 		}
 	}
 
@@ -143,7 +167,7 @@ func probeOnce(ctx context.Context, cfg *config.Config, e config.Endpoint, timeo
 	case config.ProbeTLS:
 		err = probeTLS(ctx, e)
 	case config.ProbeHTTP:
-		err = probeHTTP(ctx, e)
+		err = probeHTTP(ctx, e, e.ExpectedStatus)
 	case config.ProbeSingBox:
 		err = probeSingBox(ctx, cfg, e, timeout)
 	default:
@@ -197,7 +221,7 @@ func probeTLS(ctx context.Context, e config.Endpoint) error {
 	return conn.Close()
 }
 
-func probeHTTP(ctx context.Context, e config.Endpoint) error {
+func probeHTTP(ctx context.Context, e config.Endpoint, expectedStatus int) error {
 	urlStr := e.EffectiveURL()
 	if urlStr == "" {
 		return fmt.Errorf("http probe missing url or host/port")
@@ -215,8 +239,15 @@ func probeHTTP(ctx context.Context, e config.Endpoint) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("server error: %s", resp.Status)
+	if expectedStatus != 0 {
+		if resp.StatusCode != expectedStatus {
+			return fmt.Errorf("expected status %d, got %d", expectedStatus, resp.StatusCode)
+		}
+		return nil
+	}
+	// Generic policy: 200-399 is success, 400+ is failure.
+	if resp.StatusCode >= 400 || resp.StatusCode < 200 {
+		return fmt.Errorf("http status %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -249,43 +280,36 @@ func Classify(err error, latency, timeout time.Duration) Status {
 	return StatusUp
 }
 
-func statusRank(s Status) int { return health.Rank(s) }
-
+// Rank orders results using the shared ranking policy (single source of
+// truth alongside recommend/compare/benchmark). Direct is included in the
+// ordering as a diagnostic baseline; per-route "best proxy" separation is
+// handled at the reporting/recommendation layer.
 func Rank(results []Result) {
-	sort.SliceStable(results, func(i, j int) bool {
-		return less(results[i], results[j])
-	})
-}
-
-func less(a, b Result) bool {
-	ra := statusRank(a.Status)
-	rb := statusRank(b.Status)
-	if ra != rb {
-		return ra < rb
+	if len(results) == 0 {
+		return
 	}
-	// reliability: lower loss wins
-	if a.Metrics.LossPct != b.Metrics.LossPct {
-		return a.Metrics.LossPct < b.Metrics.LossPct
-	}
-	// priority: lower value wins (documented)
-	if a.Endpoint.Priority != b.Endpoint.Priority {
-		return a.Endpoint.Priority < b.Endpoint.Priority
-	}
-	// median latency
-	if a.Metrics.Median != b.Metrics.Median {
-		// if one has 0 median due to all failed, treat as large
-		if a.Metrics.Median == 0 && b.Metrics.Median != 0 {
-			return false
+	cands := make([]ranking.Candidate, len(results))
+	for i, r := range results {
+		cands[i] = ranking.Candidate{
+			Name:     r.Endpoint.Name,
+			IsProxy:  r.Endpoint.Type == config.ProbeSingBox,
+			Status:   string(r.Status),
+			LossPct:  r.Metrics.LossPct,
+			Median:   r.Metrics.Median,
+			Jitter:   r.Metrics.Jitter,
+			Priority: r.Endpoint.Priority,
 		}
-		if b.Metrics.Median == 0 && a.Metrics.Median != 0 {
-			return true
-		}
-		return a.Metrics.Median < b.Metrics.Median
 	}
-	if a.Metrics.Jitter != b.Metrics.Jitter {
-		return a.Metrics.Jitter < b.Metrics.Jitter
+	sorted := ranking.Sort(cands)
+	byName := make(map[string]Result, len(results))
+	for _, r := range results {
+		byName[r.Endpoint.Name] = r
 	}
-	return a.Endpoint.Name < b.Endpoint.Name
+	ordered := make([]Result, len(results))
+	for i, c := range sorted {
+		ordered[i] = byName[c.Name]
+	}
+	copy(results, ordered)
 }
 
 func Best(results []Result) (Result, bool) {
@@ -295,4 +319,59 @@ func Best(results []Result) (Result, bool) {
 		}
 	}
 	return Result{}, false
+}
+
+// HasProxy reports whether any proxy (singbox) route exists in results.
+func HasProxy(results []Result) bool {
+	for _, r := range results {
+		if r.Endpoint.Type == config.ProbeSingBox {
+			return true
+		}
+	}
+	return false
+}
+
+// DirectBaseline returns the first non-proxy result. Direct is a diagnostic
+// baseline, never a "best proxy" candidate.
+func DirectBaseline(results []Result) (Result, bool) {
+	for _, r := range results {
+		if r.Endpoint.Type == config.ProbeSingBox {
+			continue
+		}
+		name := strings.ToLower(r.Endpoint.Name)
+		if name == "direct" || name == "direct-baseline" || name == "baseline" || strings.Contains(name, "direct") || strings.Contains(name, "baseline") {
+			return r, true
+		}
+	}
+	for _, r := range results {
+		if r.Endpoint.Type == config.ProbeHTTP {
+			return r, true
+		}
+	}
+	for _, r := range results {
+		if r.Endpoint.Type != config.ProbeSingBox {
+			return r, true
+		}
+	}
+	return Result{}, false
+}
+
+// BestProxy returns the highest-ranked usable proxy route using the shared
+// ranking policy. ok is false when no proxy route exists or none is usable.
+func BestProxy(results []Result) (Result, bool) {
+	var proxies []Result
+	for _, r := range results {
+		if r.Endpoint.Type == config.ProbeSingBox {
+			proxies = append(proxies, r)
+		}
+	}
+	if len(proxies) == 0 {
+		return Result{}, false
+	}
+	Rank(proxies)
+	best := proxies[0]
+	if !best.OK() {
+		return Result{}, false
+	}
+	return best, true
 }

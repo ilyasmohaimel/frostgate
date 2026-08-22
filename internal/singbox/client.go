@@ -82,6 +82,19 @@ func (c *Client) CheckOutbound(ctx context.Context, tag string) error {
 	return nil
 }
 
+// Outbounds returns the list of outbound tags known to the controller.
+func (c *Client) Outbounds(ctx context.Context) ([]string, error) {
+	proxies, err := c.GetProxies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(proxies))
+	for name := range proxies {
+		out = append(out, name)
+	}
+	return out, nil
+}
+
 func (c *Client) GetProxy(ctx context.Context, name string) (map[string]json.RawMessage, error) {
 	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(name))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

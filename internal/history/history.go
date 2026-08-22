@@ -38,6 +38,11 @@ func HistoryDir() string {
 	return filepath.Dir(HistoryPath())
 }
 
+// StatDB reports whether a history database file exists on disk.
+func StatDB() (os.FileInfo, error) {
+	return os.Stat(HistoryPath())
+}
+
 type DB struct {
 	db *bbolt.DB
 }
@@ -152,6 +157,7 @@ func (d *DB) Prune(retention time.Duration) error {
 // Summary holds aggregated stats for a route
 type Summary struct {
 	Route        string
+	Type         string // probe type of the route, e.g. singbox/http
 	Count        int
 	Availability float64
 	Median       time.Duration
@@ -171,6 +177,7 @@ func Summarize(records []Record) []Summary {
 		if len(recs) == 0 {
 			continue
 		}
+		routeType := recs[0].Type
 		// Sort by timestamp for trend
 		for i := 0; i < len(recs); i++ {
 			for j := i + 1; j < len(recs); j++ {
@@ -244,6 +251,7 @@ func Summarize(records []Record) []Summary {
 		}
 		out = append(out, Summary{
 			Route:        route,
+			Type:         routeType,
 			Count:        len(recs),
 			Availability: avail,
 			Median:       median,

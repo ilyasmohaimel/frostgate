@@ -38,7 +38,7 @@ frostgate --help
 frostgate setup
 ```
 
-Installs to `~/.local/bin/frostgate` (no `sudo`, no VPS contact). Detects OS/kernel/arch/distro/shell/existing install locally (no telemetry). Verifies `SHA256SUMS` when available with `sha256sum`/`shasum`/`openssl`.
+Installs to `~/.local/bin/frostgate` (no `sudo`, no VPS contact). Detects OS/kernel/arch/distro/shell/existing install locally (no telemetry). Binary installs are fail-closed: `SHA256SUMS` must be present and must verify with `sha256sum`, `shasum`, or `openssl`; the downloaded binary must also pass `--version` before it can replace an existing installation.
 
 On `linux-amd64` / `linux-arm64` uses prebuilt static binary. On `darwin`/other, `install.sh` falls back to `go install`.
 
@@ -49,7 +49,7 @@ go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest
 # binary in $(go env GOPATH)/bin or ~/go/bin
 ```
 
-If `go install @latest` fails with `sumdb 404` right after release: `GOSUMDB=off GOPROXY=direct go install ...@latest`.
+If `go install @latest` fails immediately after a release, retry after the Go module proxy has indexed the tag and inspect `go env GOPROXY GOSUMDB`. Do not disable the checksum database.
 
 ### Manual binary
 
@@ -63,7 +63,7 @@ chmod +x ~/.local/bin/frostgate
 # sha256sum ~/.local/bin/frostgate
 ```
 
-Only `linux-amd64` and `linux-arm64` have prebuilt binaries in v0.4.0. macOS/Windows prebuilt binaries are **planned, not yet first-class**. macOS users should use `go install`; Windows users should use WSL (treated as Linux).
+Only `linux-amd64` and `linux-arm64` have prebuilt binaries. macOS/Windows prebuilt binaries are **planned, not yet first-class**. macOS users should use `go install`; Windows users should use WSL (treated as Linux).
 
 ### Verify PATH
 
@@ -104,15 +104,14 @@ frostgate add 'hysteria2://YOUR_LINK'
 
 Frostgate will:
 
-- parse it (VLESS + REALITY + Vision, Hysteria2/salamander, IPv4/IPv6, fragment name, URL encoding, `hy2://`)
+- parse it (VLESS + REALITY + RAW/TCP, including Vision; Hysteria2/salamander; IPv4/IPv6; fragment names; URL encoding; `hy2://`)
 - validate required fields (UUID, server, port, REALITY pbk/sni, Hysteria password, etc.)
 - derive a sensible route name (from `#fragment` or protocol)
 - allow `--name my-reality` override
 - dedupe via fingerprint (won't add same route 17 times if name changes)
-- backup `~/.config/frostgate/` to `backup-<timestamp>/`
-- update private `sing-box.json` + `config.yaml` (0600)
-- `sing-box check`
-- reload only the Frostgate sidecar (`127.0.0.1:9090`, never `0.0.0.0`)
+- transactionally snapshot, validate, and atomically install the private managed `sing-box.json`; update `config.yaml` with mode `0600`
+- run `sing-box check`, restart only the Frostgate sidecar, and verify its controller/outbounds
+- roll back the managed configuration if validation, restart, service health, or controller verification fails
 - test the new route end-to-end
 - report `latency/loss/jitter`
 
@@ -149,8 +148,8 @@ frostgate import 'https://provider.example/subscription'
 
 Frostgate:
 
-- fetches with timeout, 2 MiB limit, 5-redirect limit, `User-Agent: frostgate/0.4.0`, `https` by default
-- rejects `file://`, `data:`, `javascript:`; `http://` is allowed with context but `https` is preferred (no token logging)
+- fetches with timeout, 2 MiB limit, 5-redirect limit, version-neutral `User-Agent: frostgate`, and `https` by default
+- rejects `file://`, `data:`, and `javascript:`; plain HTTP requires the explicit `--allow-insecure-http` flag (subscription URLs/tokens are never logged)
 - does **not** store the subscription URL (one-time import)
 - decodes base64 subscriptions, parses Clash YAML and sing-box JSON where conversion is reliable
 - deduplicates, validates, writes private sidecar config, reloads, tests and ranks
@@ -219,11 +218,11 @@ Share link is never echoed.
 frostgate benchmark
 ```
 
-Measures **per route** (traffic really goes through that outbound via `127.0.0.1:2080` → `frostgate-selector`):
+Measures **per route** (traffic really goes through the loopback listener configured by `singbox.benchmark_proxy` → `frostgate-selector`):
 
 - status / loss / median / jitter / **real download Mbps**
 
-~8 MiB per route by default (`https://speed.cloudflare.com/__down?bytes=8000000`), configurable via `benchmark.download_bytes` / `download_url`. Expect ~8 MB per route; README documents this. Large lists (e.g. 100 routes → ~800 MiB) prompt for confirmation `[y/N]` in interactive mode.
+The default is 8 MiB per route from `https://speed.cloudflare.com/__down`. Configure `benchmark.download_url` and `benchmark.download_bytes`; Frostgate authoritatively sets the request's `bytes` query parameter. Approximate transfer is `download_bytes × usable routes` (8 MiB × 100 routes is about 800 MiB). Large route lists prompt for confirmation `[y/N]` in interactive mode. External controllers without a configured loopback `singbox.benchmark_proxy` report proxy throughput as `N/A` instead of guessing port 2080.
 
 ```
 FROSTGATE BENCHMARK
@@ -312,7 +311,7 @@ frostgate network-check
 Checks:
 
 - default connectivity / IPv4 / IPv6 / HTTPS / captive portal (204)
-- system DNS vs trusted DoH (Cloudflare) — reports `Answers differ` not `POISONED` (CDNs legitimately differ)
+- system DNS vs trusted DoH (Cloudflare) — `MATCH`, `DIFFER`, or `UNAVAILABLE`
 - UDP where meaningful (but `QUIC: not directly tested` if not reliable)
 - configured proxy routes
 - destination reachability (configurable): `https://github.com/`, `https://www.wikipedia.org/`, `https://www.google.com/generate_204`, `neutral` target
@@ -351,7 +350,7 @@ Recommendation
 Use Hysteria2 on this network: fastest healthy route today.
 ```
 
-Destinations are configurable via `network_check.destinations`.
+Destinations are configurable via `network_check.destinations`. `DIFFER` is a signal only: CDN/geographic resolver behavior can legitimately produce different sets, so it is not proof of DNS poisoning or censorship.
 
 ---
 
@@ -406,7 +405,7 @@ Storage: `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/frostgate/hist
 
 Stores: `timestamp/route/type/status/loss/median/min/max/mean/jitter/download/network/error-category` — **never** `UUID/password/VLESS URL/subscription URL/REALITY key/controller secret`.
 
-Automatically records normal `frostgate` runs, `benchmark`, `network-check`. Watch mode rate-limits to one snapshot per `5m` (configurable via `history.watch_interval`).
+Automatically records normal `frostgate` runs, `benchmark`, and watch/TUI snapshots. Set `history.enabled: false` for zero history filesystem access. `history.retention` controls automatic pruning (default `90d`), and `history.watch_interval` rate-limits continuous-mode writes (default `5m`).
 
 ```
 LAST 24 HOURS
@@ -509,7 +508,7 @@ frostgate history --json
 frostgate recommend --json
 ```
 
-`schema_version: 2` (+ `download_mbps`/`network`/`recommendation` where relevant). Never includes secrets. If this is a breaking change, schema version is incremented.
+Core probe and NDJSON documents use `schema_version: 3`, with explicit `direct` and `best_proxy` objects while retaining the legacy `best` field where applicable. `Direct baseline` is the non-proxy connectivity reference; it never competes for `Best proxy`. JSON never includes secrets, and human warnings/progress go to stderr in JSON modes.
 
 ---
 
@@ -567,10 +566,11 @@ singbox:
   controller: http://127.0.0.1:9090
   secret_file: ~/.config/frostgate/controller-secret
   test_url: https://www.gstatic.com/generate_204
+  benchmark_proxy: 127.0.0.1:2080
 
 benchmark:
   download_bytes: 8388608        # ~8 MiB per route
-  download_url: https://speed.cloudflare.com/__down?bytes=8000000
+  download_url: https://speed.cloudflare.com/__down
 
 history:
   enabled: true
@@ -590,6 +590,7 @@ endpoints:
   - name: direct
     type: http
     url: https://www.gstatic.com/generate_204
+    expected_status: 204
     priority: 100
   - name: primary-reality
     type: singbox
@@ -605,7 +606,7 @@ Manual config is the **advanced path** — most users should prefer `frostgate s
 
 Link: `outbound: primary-reality` must exactly match `"tag": "primary-reality"` in `sing-box.json`.
 
-For end-to-end latency, Frostgate uses controller `GET /proxies/<tag>/delay?url=...`. For throughput, it switches `PUT /proxies/frostgate-selector` and downloads via `127.0.0.1:2080` (loopback only) when using the managed sidecar. If you bring your own controller without that selector/mixed inbound, `Download: N/A` with a `doctor` hint — throughput is not faked.
+For end-to-end latency, Frostgate uses controller `GET /proxies/<tag>/delay?url=...`. For throughput, it switches `PUT /proxies/frostgate-selector` and downloads via `singbox.benchmark_proxy` (loopback only). If you bring your own controller without that selector/listener, omit `benchmark_proxy`: throughput becomes `N/A` with a `doctor` hint and is never faked.
 
 ---
 
@@ -716,7 +717,7 @@ curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/instal
 frostgate --version
 ```
 
-Go users: `go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest` (or `@vX.Y.Z`). Checksums: `SHA256SUMS` is published with `v0.4.0` (`frostgate-linux-amd64`, `frostgate-linux-arm64`).
+Go users: `go install github.com/ilyasmohaimel/frostgate/cmd/frostgate@latest` (or `@vX.Y.Z`). Each release publishes `SHA256SUMS` for `frostgate-linux-amd64` and `frostgate-linux-arm64`.
 
 ```
 sha256sum ~/.local/bin/frostgate
@@ -746,9 +747,11 @@ systemctl --user daemon-reload 2>/dev/null || true
 - `network-check` gives signals, not mathematical proof of censorship.
 - Speed results depend on benchmark target/network conditions; `history` is local.
 - Subscription formats vary — unsupported protocols are skipped with summary, not hidden.
-- `frostgate test`/`import` parsing supports `vless://`, `hysteria2://`, `hy2://` (REALITY/Vision common params); others (Trojan, SS, VMess) are reported as unsupported.
+- VLESS support is deliberately limited to REALITY over RAW/TCP; Vision (`xtls-rprx-vision`) is supported. VLESS `ws`, `grpc`, `http`, `quic`, and `kcp` transports are rejected rather than silently mistranslated.
+- `frostgate test`/`import` parsing supports `vless://`, `hysteria2://`, and `hy2://`; Trojan, Shadowsocks, and VMess are reported as unsupported.
+- Hysteria2 password, SNI, salamander obfs, obfs password, and `tls.insecure` are supported. Certificate pin parameters (`pinSHA256`/`pin`) are currently rejected because sing-box pin preservation is not implemented.
 - Frostgate does not route normal device traffic, does not auto-failover (planned), no web dashboard.
-- Windows/macOS prebuilt binaries are not first-class in v0.4.0 (planned: Windows + macOS Intel/Apple Silicon).
+- Windows/macOS prebuilt binaries are not first-class yet (planned: Windows + macOS Intel/Apple Silicon).
 
 ---
 

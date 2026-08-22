@@ -175,15 +175,20 @@ func TestFetchAllowHTTPWithFlag(t *testing.T) {
 }
 
 func TestFetchDowngradeBlocked(t *testing.T) {
+	httpTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("must not be fetched"))
+	}))
+	defer httpTarget.Close()
 	srvHTTPS := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "http://example.com/", http.StatusFound)
+		http.Redirect(w, r, httpTarget.URL, http.StatusFound)
 	}))
 	defer srvHTTPS.Close()
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = srvHTTPS.Client().Transport
+	defer func() { http.DefaultTransport = originalTransport }()
 	_, err := FetchSubscriptionWithOpts(nilContext(), srvHTTPS.URL, false)
-	if err == nil {
-		// Downgrade should be blocked, but our test server redirects to http://example.com which is not our server
-		// We just check that it tries to downgrade and is blocked
-		// If it succeeds to fetch example.com, it would not be our test; but we check error contains downgrade
+	if err == nil || !strings.Contains(err.Error(), "downgrade") {
+		t.Fatalf("HTTPS-to-HTTP downgrade must be blocked, got %v", err)
 	}
 }
 
@@ -208,4 +213,19 @@ func TestMixedSupportedUnsupported(t *testing.T) {
 func nilContext() context.Context {
 	// helper to get context.Background without import
 	return context.Background()
+}
+
+func TestUserAgentIsVersionNeutral(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte("vless://uuid@host:443?security=reality&sni=a&pbk=b#t"))
+	}))
+	defer srv.Close()
+	if _, err := FetchSubscriptionWithOpts(context.Background(), srv.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	if got != "frostgate" || strings.Contains(got, "0.4") {
+		t.Fatalf("actual request UA must be version-neutral, got %q", got)
+	}
 }

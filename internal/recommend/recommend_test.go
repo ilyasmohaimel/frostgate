@@ -49,6 +49,16 @@ func TestDownNeverRecommended(t *testing.T) {
 	}
 }
 
+func TestAllDownProducesNoRecommendation(t *testing.T) {
+	res := Recommend([]Input{
+		{Name: "A", Status: "down", Loss: 100, Priority: 10},
+		{Name: "B", Status: "down", Loss: 100, Priority: 20},
+	}, 20)
+	if res.BestOverall.Name != "" || len(res.Avoid) != 2 {
+		t.Fatalf("all-down routes must not be recommended: %+v", res)
+	}
+}
+
 func TestDegradedOnlyIfNoHealthy(t *testing.T) {
 	inputs := []Input{
 		{Name: "Degraded", Status: "degraded", Loss: 5, Median: 200 * time.Millisecond, Priority: 10},
@@ -72,6 +82,25 @@ func TestHistoryConfidence(t *testing.T) {
 	high := Recommend([]Input{{Name: "A", Status: "up", Loss: 0, Median: 100 * time.Millisecond}}, 60)
 	if high.Confidence != "high" {
 		t.Errorf("high")
+	}
+}
+
+func TestPerRouteConfidence(t *testing.T) {
+	// Global history is large but the WINNER has almost no evidence of its own:
+	// confidence must come from the winner's own count, not global rows.
+	inputs := []Input{
+		{Name: "fresh", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Priority: 10, HistoryCount: 3},
+		{Name: "old", Status: "up", Loss: 0, Median: 500 * time.Millisecond, Priority: 20, HistoryCount: 90},
+	}
+	res := Recommend(inputs, 93)
+	if res.BestOverall.Name != "fresh" {
+		t.Fatalf("best %q want fresh", res.BestOverall.Name)
+	}
+	if res.Confidence != "low" {
+		t.Errorf("confidence %q want low (winner has 3 samples)", res.Confidence)
+	}
+	if res.ConfidenceDetail != "Based on 3 measurements for fresh" {
+		t.Errorf("detail %q", res.ConfidenceDetail)
 	}
 }
 

@@ -188,7 +188,7 @@ install_via_binary() {
     url="https://github.com/$REPO/releases/latest/download/${bin_name}"
     sums_url="https://github.com/$REPO/releases/latest/download/SHA256SUMS"
   else
-    # VERSION may be v0.4.0 or 0.4.0
+    # VERSION may be prefixed with v or provided as a bare semantic version.
     ver="$VERSION"
     case "$ver" in
       v*) ;;
@@ -236,7 +236,14 @@ install_via_binary() {
     return 1
   fi
   chmod +x "$tmp"
-  # Atomic move — existing binary stays intact until verify passes
+  # Verify the downloaded binary actually runs BEFORE replacing anything,
+  # so a broken download can never clobber a working installation.
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    echo "downloaded binary failed --version — keeping existing installation intact" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  # Atomic move — existing binary stays intact until every gate passes
   mv -f "$tmp" "$INSTALL_DIR/$BINARY"
   rm -f "$tmp_sums"
   trap - EXIT

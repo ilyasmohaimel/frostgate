@@ -4,54 +4,56 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
 
 type Layer struct {
-	Name   string
-	Status string // PASS, FAIL, SKIP
-	Detail string
-	Hint   string
+	Name   string `json:"name"`
+	Status string `json:"status"` // PASS, FAIL, SKIP, WARN
+	Detail string `json:"detail,omitempty"`
+	Hint   string `json:"hint,omitempty"`
 }
 
-func DiagnoseAll(cfg *config.Config) []Layer {
+// Options carries optional context for diagnosis. Managed metadata lets the
+// engine inspect the real server fields (host/port/SNI) without ever printing
+// secrets.
+type Options struct {
+	Managed *managedconfig.Managed
+}
+
+func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
 	var out []Layer
-	// Local network
 	out = append(out, checkLocalNetwork())
-	// DNS
-	out = append(out, checkDNS())
-	// Direct internet
+	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
-	// sing-box binary
 	out = append(out, checkSingBox())
-	// sing-box sidecar/service
 	out = append(out, checkSidecar())
-	// controller
 	out = append(out, checkController(cfg))
-	// For each outbound, check exists and end-to-end
 	for _, ep := range cfg.Endpoints {
-		if ep.Type == config.ProbeSingBox {
-			out = append(out, checkOutbound(cfg, ep))
-			out = append(out, checkEndToEnd(cfg, ep))
-		} else if ep.Type == config.ProbeTCP || ep.Type == config.ProbeTLS {
+		switch ep.Type {
+		case config.ProbeSingBox:
+			out = append(out, diagnoseProxyRoute(cfg, ep, opts)...)
+		case config.ProbeTCP, config.ProbeTLS:
 			out = append(out, checkServerReachability(ep))
 		}
 	}
-	// Comparison
-	out = append(out, checkComparison(cfg))
 	return out
 }
 
-func DiagnoseRoute(cfg *config.Config, routeName string) []Layer {
+func DiagnoseRoute(cfg *config.Config, routeName string, opts Options) []Layer {
 	var target *config.Endpoint
-	for i, ep := range cfg.Endpoints {
-		if ep.Name == routeName {
+	for i := range cfg.Endpoints {
+		if cfg.Endpoints[i].Name == routeName {
 			target = &cfg.Endpoints[i]
 			break
 		}
@@ -61,28 +63,74 @@ func DiagnoseRoute(cfg *config.Config, routeName string) []Layer {
 	}
 	var out []Layer
 	out = append(out, checkLocalNetwork())
-	out = append(out, checkDNS())
+	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
 	out = append(out, checkSingBox())
 	out = append(out, checkSidecar())
 	out = append(out, checkController(cfg))
 	if target.Type == config.ProbeSingBox {
-		out = append(out, checkOutbound(cfg, *target))
-		out = append(out, checkEndToEnd(cfg, *target))
+		out = append(out, diagnoseProxyRoute(cfg, *target, opts)...)
 	} else {
 		out = append(out, checkServerReachability(*target))
-		// also test direct HTTP if http
-		if target.Type == config.ProbeHTTP {
-			out = append(out, checkHTTPDirect(*target))
-		}
 	}
-	// Backup info
-	out = append(out, checkBackupRoutes(cfg, routeName))
+	out = append(out, checkBackupRoutes(cfg, routeName)...)
 	return out
 }
 
+// diagnoseProxyRoute emits evidence-based layers for a singbox-backed route.
+// VLESS+REALITY RAW/TCP routes get measured DNS and TCP layers; Hysteria2 gets
+// honest wording because UDP reachability cannot be proven with a generic
+// dial. Secrets from managed metadata are never included in details.
+func diagnoseProxyRoute(cfg *config.Config, ep config.Endpoint, opts Options) []Layer {
+	var out []Layer
+	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+	switch {
+	case vlessMeta(opts, ep.Outbound) != nil:
+		v := vlessMeta(opts, ep.Outbound)
+		out = append(out, checkDNSForHost(ep.Name, v.Server))
+		out = append(out, checkTCPServer(ep.Name, v.Server, v.ServerPort))
+		out = append(out, checkOutbound(client, ep.Name, ep.Outbound))
+		out = append(out, checkEndToEnd(client, cfg, ep, "vless"))
+	case hysteriaMeta(opts, ep.Outbound) != nil:
+		out = append(out, Layer{
+			Name:   fmt.Sprintf("Server %s", ep.Name),
+			Status: "SKIP",
+			Detail: "Low-level server reachability: not independently verified (UDP/QUIC)",
+		})
+		out = append(out, checkOutbound(client, ep.Name, ep.Outbound))
+		out = append(out, checkEndToEnd(client, cfg, ep, "hysteria2"))
+	default:
+		out = append(out, checkOutbound(client, ep.Name, ep.Outbound))
+		out = append(out, checkEndToEnd(client, cfg, ep, "generic"))
+	}
+	return out
+}
+
+func vlessMeta(opts Options, tag string) *setup.VLESSOutbound {
+	if opts.Managed == nil {
+		return nil
+	}
+	for _, v := range opts.Managed.VLESS {
+		if v != nil && v.Tag == tag {
+			return v
+		}
+	}
+	return nil
+}
+
+func hysteriaMeta(opts Options, tag string) *setup.Hysteria2Outbound {
+	if opts.Managed == nil {
+		return nil
+	}
+	for _, h := range opts.Managed.Hysteria {
+		if h != nil && h.Tag == tag {
+			return h
+		}
+	}
+	return nil
+}
+
 func checkLocalNetwork() Layer {
-	// Check if we can get default route? Simple: check interface
 	ifaces, err := net.Interfaces()
 	if err != nil || len(ifaces) == 0 {
 		return Layer{Name: "Local network", Status: "FAIL", Detail: "no interfaces"}
@@ -90,18 +138,82 @@ func checkLocalNetwork() Layer {
 	return Layer{Name: "Local network", Status: "PASS", Detail: "interfaces ok"}
 }
 
-func checkDNS() Layer {
-	ips, err := net.LookupHost("www.gstatic.com")
+func checkDNS(cfg *config.Config) Layer {
+	host := "www.gstatic.com"
+	for _, ep := range cfg.Endpoints {
+		if ep.Type != config.ProbeHTTP {
+			continue
+		}
+		if u, err := url.Parse(ep.EffectiveURL()); err == nil && u.Hostname() != "" {
+			host = u.Hostname()
+			break
+		}
+	}
+	if net.ParseIP(host) != nil {
+		return Layer{Name: "DNS", Status: "PASS", Detail: "not required for IP literal"}
+	}
+	ips, err := net.LookupHost(host)
 	if err != nil || len(ips) == 0 {
 		return Layer{Name: "DNS", Status: "FAIL", Detail: errString(err)}
 	}
 	return Layer{Name: "DNS", Status: "PASS", Detail: "lookup ok"}
 }
 
+func checkDNSForHost(routeName, host string) Layer {
+	if host == "" {
+		return Layer{Name: fmt.Sprintf("DNS %s", routeName), Status: "SKIP", Detail: "no server host"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var r net.Resolver
+	addrs, err := r.LookupHost(ctx, host)
+	if err != nil || len(addrs) == 0 {
+		return Layer{
+			Name:   fmt.Sprintf("DNS %s", routeName),
+			Status: "FAIL",
+			Detail: fmt.Sprintf("cannot resolve %q", host),
+			Hint:   "check DNS or server hostname",
+		}
+	}
+	return Layer{
+		Name:   fmt.Sprintf("DNS %s", routeName),
+		Status: "PASS",
+		Detail: fmt.Sprintf("resolved %d address(es)", len(addrs)),
+	}
+}
+
+// checkTCPServer measures an actual TCP connection to server:port. The
+// "reachable" claim is only made after a real successful dial.
+func checkTCPServer(routeName, host string, port int) Layer {
+	name := fmt.Sprintf("Server TCP %s", routeName)
+	if host == "" || port == 0 {
+		return Layer{Name: name, Status: "SKIP", Detail: "no server address"}
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	start := time.Now()
+	d := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := d.Dial("tcp", addr)
+	if err != nil {
+		return Layer{
+			Name:   name,
+			Status: "FAIL",
+			Detail: fmt.Sprintf("tcp/%d connect failed", port),
+			Hint:   "server down, wrong port, or firewall",
+		}
+	}
+	conn.Close()
+	ms := time.Since(start).Milliseconds()
+	return Layer{
+		Name:   name,
+		Status: "PASS",
+		Detail: fmt.Sprintf("tcp/%d reachable (%dms)", port, ms),
+	}
+}
+
 func checkDirect(cfg *config.Config) Layer {
-	// Find direct baseline endpoint
 	var direct *config.Endpoint
-	for _, ep := range cfg.Endpoints {
+	for i := range cfg.Endpoints {
+		ep := cfg.Endpoints[i]
 		if ep.Type == config.ProbeHTTP && strings.Contains(strings.ToLower(ep.Name), "direct") {
 			direct = &ep
 			break
@@ -114,7 +226,7 @@ func checkDirect(cfg *config.Config) Layer {
 	defer cancel()
 	res := probe.ProbeEndpoint(ctx, cfg, *direct)
 	if res.Status == "down" {
-		return Layer{Name: "Direct internet", Status: "FAIL", Detail: res.Category + " " + res.ErrMsg, Hint: "local internet or DNS may be down"}
+		return Layer{Name: "Direct internet", Status: "FAIL", Detail: strings.TrimSpace(res.Category + " " + redact.String(res.ErrMsg)), Hint: "local internet or DNS may be down"}
 	}
 	return Layer{Name: "Direct internet", Status: "PASS", Detail: fmt.Sprintf("%dms", res.Metrics.Median.Milliseconds())}
 }
@@ -124,8 +236,7 @@ func checkSingBox() Layer {
 	if err != nil {
 		return Layer{Name: "sing-box binary", Status: "FAIL", Detail: "not found in PATH"}
 	}
-	ver := getVersion(path)
-	return Layer{Name: "sing-box binary", Status: "PASS", Detail: ver}
+	return Layer{Name: "sing-box binary", Status: "PASS", Detail: getVersion(path)}
 }
 
 func getVersion(path string) string {
@@ -147,14 +258,12 @@ func getVersion(path string) string {
 }
 
 func checkSidecar() Layer {
-	// Check if frostgate-singbox service is active
 	cmd := exec.Command("systemctl", "--user", "is-active", "frostgate-singbox.service")
 	out, _ := cmd.Output()
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
 		return Layer{Name: "sing-box sidecar", Status: "PASS", Detail: "frostgate-singbox active"}
 	}
-	// Check if controller is reachable anyway (maybe manual run)
 	return Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "service not active (maybe manual run)"}
 }
 
@@ -162,8 +271,7 @@ func checkController(cfg *config.Config) Layer {
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err := client.GetProxies(ctx)
-	if err != nil {
+	if _, err := client.GetProxies(ctx); err != nil {
 		if strings.Contains(err.Error(), "unauthorized") {
 			return Layer{Name: "Controller", Status: "FAIL", Detail: "unauthorized (bad secret)"}
 		}
@@ -172,25 +280,89 @@ func checkController(cfg *config.Config) Layer {
 	return Layer{Name: "Controller", Status: "PASS", Detail: cfg.SingBox.Controller}
 }
 
-func checkOutbound(cfg *config.Config, ep config.Endpoint) Layer {
-	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+func checkOutbound(client *singbox.Client, routeName, outbound string) Layer {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := client.CheckOutbound(ctx, ep.Outbound); err != nil {
-		return Layer{Name: fmt.Sprintf("Outbound %s", ep.Name), Status: "FAIL", Detail: errString(err)}
+	if err := client.CheckOutbound(ctx, outbound); err != nil {
+		return Layer{Name: fmt.Sprintf("Outbound %s", routeName), Status: "FAIL", Detail: errString(err)}
 	}
-	return Layer{Name: fmt.Sprintf("Outbound %s", ep.Name), Status: "PASS", Detail: fmt.Sprintf("outbound %q exists", ep.Outbound)}
+	return Layer{Name: fmt.Sprintf("Outbound %s", routeName), Status: "PASS", Detail: fmt.Sprintf("outbound %q exists", outbound)}
 }
 
-func checkEndToEnd(cfg *config.Config, ep config.Endpoint) Layer {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutFor(ep))
+func checkEndToEnd(client *singbox.Client, cfg *config.Config, ep config.Endpoint, kind string) Layer {
+	timeout := cfg.TimeoutFor(ep)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	_, err := client.Delay(ctx, ep.Outbound, cfg.SingBox.TestURL, cfg.TimeoutFor(ep))
+	d, err := client.Delay(ctx, ep.Outbound, cfg.SingBox.TestURL, timeout)
 	if err != nil {
-		return Layer{Name: fmt.Sprintf("End-to-end %s", ep.Name), Status: "FAIL", Detail: errString(err), Hint: "server reachable but proxy path failed — check REALITY/Hysteria auth, server routing, or filtering"}
+		hint := ""
+		switch kind {
+		case "hysteria2":
+			hint = "check Hysteria2 password/obfs/SNI or server availability"
+		default:
+			hint = "server may be reachable but REALITY/auth path failed — verify PBK/SID or filtering"
+		}
+		return Layer{
+			Name:   endToEndName(kind, ep),
+			Status: "FAIL",
+			Detail: errString(err),
+			Hint:   hint,
+		}
 	}
-	return Layer{Name: fmt.Sprintf("End-to-end %s", ep.Name), Status: "PASS", Detail: "proxy URL test passed"}
+	label := "proxy URL test passed"
+	if kind == "hysteria2" {
+		label = "End-to-end Hysteria2: PASS"
+	}
+	return Layer{
+		Name:   endToEndName(kind, ep),
+		Status: "PASS",
+		Detail: fmt.Sprintf("%s (%dms)", label, d.Milliseconds()),
+	}
+}
+
+func endToEndName(kind string, ep config.Endpoint) string {
+	if kind == "hysteria2" {
+		return fmt.Sprintf("End-to-end Hysteria2 %s", ep.Name)
+	}
+	return fmt.Sprintf("End-to-end %s", ep.Name)
+}
+
+func checkBackupRoutes(cfg *config.Config, routeName string) []Layer {
+	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+	var out []Layer
+	found := false
+	for _, other := range cfg.Endpoints {
+		if other.Name == routeName || other.Type != config.ProbeSingBox {
+			continue
+		}
+		found = true
+		timeout := cfg.TimeoutFor(other)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		d, err := client.Delay(ctx, other.Outbound, cfg.SingBox.TestURL, timeout)
+		cancel()
+		if err != nil {
+			reason := errString(err)
+			if strings.Contains(reason, "timeout") {
+				reason = "timeout"
+			}
+			out = append(out, Layer{
+				Name:   fmt.Sprintf("Backup %s", other.Name),
+				Status: "FAIL",
+				Detail: reason,
+				Hint:   "this backup cannot carry traffic right now",
+			})
+			continue
+		}
+		out = append(out, Layer{
+			Name:   fmt.Sprintf("Backup %s", other.Name),
+			Status: "PASS",
+			Detail: fmt.Sprintf("%dms", d.Milliseconds()),
+		})
+	}
+	if !found {
+		return []Layer{{Name: "Backup", Status: "SKIP", Detail: "no other proxy routes"}}
+	}
+	return out
 }
 
 func checkServerReachability(ep config.Endpoint) Layer {
@@ -205,53 +377,16 @@ func checkServerReachability(ep config.Endpoint) Layer {
 		return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "FAIL", Detail: errString(err)}
 	}
 	conn.Close()
-	return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "PASS", Detail: "tcp/443 reachable"}
-}
-
-func checkHTTPDirect(ep config.Endpoint) Layer {
-	// For http endpoints, we already have probe logic
-	return Layer{Name: fmt.Sprintf("HTTP %s", ep.Name), Status: "SKIP", Detail: "use end-to-end for http"}
-}
-
-func checkComparison(cfg *config.Config) Layer {
-	// Check if at least one backup works when primary fails
-	hasUp := false
-	hasDown := false
-	for _, ep := range cfg.Endpoints {
-		// Simplified: we don't have recent probe results here, so skip
-		_ = ep
-	}
-	_ = hasUp
-	_ = hasDown
-	return Layer{Name: "Comparison", Status: "SKIP", Detail: "run frostgate diagnose <route> for per-route"}
-}
-
-func checkBackupRoutes(cfg *config.Config, routeName string) Layer {
-	// Find if any other route is healthy
-	// For now, just list
-	var others []string
-	for _, ep := range cfg.Endpoints {
-		if ep.Name != routeName {
-			others = append(others, ep.Name)
-		}
-	}
-	if len(others) == 0 {
-		return Layer{Name: "Backup", Status: "SKIP", Detail: "no other routes"}
-	}
-	return Layer{Name: "Backup", Status: "PASS", Detail: fmt.Sprintf("alternatives: %s", strings.Join(others, ", "))}
+	return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "PASS", Detail: "server reachable"}
 }
 
 func errString(err error) string {
 	if err == nil {
 		return ""
 	}
-	s := err.Error()
+	s := redact.Error(err)
 	if len(s) > 80 {
 		s = s[:80]
-	}
-	// Redact secrets: remove any vless:// or hysteria2:// content
-	if strings.Contains(s, "vless://") || strings.Contains(s, "hysteria2://") {
-		return "proxy error [redacted]"
 	}
 	return s
 }

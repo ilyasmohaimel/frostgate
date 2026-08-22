@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/report"
 )
 
@@ -22,6 +23,10 @@ type Model struct {
 	lastTick time.Time
 	quitting bool
 	verbose  bool
+	// onSnapshot is invoked after every completed probe snapshot (scheduled
+	// tick or manual refresh). The application layer uses it to feed the
+	// history recorder; the TUI itself never touches storage.
+	onSnapshot func([]probe.Result)
 }
 
 type tickMsg time.Time
@@ -36,12 +41,14 @@ var (
 	helpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
-func New(cfg *config.Config, interval time.Duration, verbose bool) Model {
+// New builds the TUI model. onSnapshot may be nil.
+func New(cfg *config.Config, interval time.Duration, verbose bool, onSnapshot func([]probe.Result)) Model {
 	return Model{
-		cfg:      cfg,
-		interval: interval,
-		verbose:  verbose,
-		lastTick: time.Now(),
+		cfg:        cfg,
+		interval:   interval,
+		verbose:    verbose,
+		lastTick:   time.Now(),
+		onSnapshot: onSnapshot,
 	}
 }
 
@@ -88,6 +95,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.results = msg.results
 			m.err = nil
 			m.lastTick = time.Now()
+			if m.onSnapshot != nil {
+				m.onSnapshot(msg.results)
+			}
 		}
 		return m, nil
 	}
@@ -110,10 +120,29 @@ func (m Model) View() string {
 	if len(m.results) == 0 {
 		b += subStyle.Render("probing...") + "\n"
 	} else {
-		// Use report table but without best summary duplication? We'll use our own rendering for compact TUI
 		b += renderTable(m.results, m.width)
 		b += "\n"
-		if best, ok := probe.Best(m.results); ok {
+		if probe.HasProxy(m.results) {
+			if d, ok := probe.DirectBaseline(m.results); ok {
+				lat := "—"
+				if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+					lat = formatDur(d.Metrics.Median)
+				}
+				state := "DOWN"
+				switch d.Status {
+				case probe.StatusUp:
+					state = "UP"
+				case probe.StatusDegraded:
+					state = "DEGRADED"
+				}
+				b += subStyle.Render(fmt.Sprintf("Direct baseline: %s %s", state, lat)) + "\n"
+			}
+			if best, ok := probe.BestProxy(m.results); ok {
+				b += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42")).Render("Best proxy: "+best.Endpoint.Name) + subStyle.Render(fmt.Sprintf("  median %s  loss %.0f%%", formatDur(best.Metrics.Median), best.Metrics.LossPct)) + "\n"
+			} else {
+				b += lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("Best proxy: none usable") + "\n"
+			}
+		} else if best, ok := probe.Best(m.results); ok {
 			b += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42")).Render("Best route: "+best.Endpoint.Name) + subStyle.Render(fmt.Sprintf("  median %s  loss %.0f%%", formatDur(best.Metrics.Median), best.Metrics.LossPct)) + "\n"
 		} else {
 			b += lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("all routes down") + "\n"
@@ -159,7 +188,7 @@ func renderTable(results []probe.Result, width int) string {
 			if r.Category != "" {
 				detail = r.Category
 			} else if r.ErrMsg != "" {
-				detail = truncate(r.ErrMsg, 24)
+				detail = truncate(redact.String(r.ErrMsg), 24)
 			}
 		}
 		line := fmt.Sprintf("%-20s %-9s %4s %7s %7s  %s", truncate(r.Endpoint.Name, 20), state, loss, median, jitter, detail)
