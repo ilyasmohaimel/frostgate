@@ -30,7 +30,7 @@ type RouteThroughput struct {
 // BenchRoutes measures throughput for each route by switching the selector to
 // that route and measuring via the local SOCKS listener. The original
 // selection is captured up front and always restored when the function
-// returns — on success, on measurement errors, and on context cancellation.
+// returns, including after measurement errors and context cancellation.
 //
 // measure is injected so tests can observe which route was actually active.
 func BenchRoutes(

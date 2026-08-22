@@ -174,6 +174,9 @@ func TestTableDownCase(t *testing.T) {
 	if !strings.Contains(s, "all routes down") {
 		t.Errorf("expected all routes down, got %q", s)
 	}
+	if !strings.Contains(s, "hint: all routes down; check internet and proxy config") {
+		t.Errorf("expected plain diagnosis hint, got %q", s)
+	}
 	if !strings.Contains(s, "timeout") {
 		t.Errorf("expected category timeout in table, got %q", s)
 	}

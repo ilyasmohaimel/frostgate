@@ -182,10 +182,10 @@ func diagnosis(results []probe.Result) string {
 	// If direct is present, use it for diagnosis
 	if direct != nil {
 		if !directUp && allDown {
-			return "hint: direct baseline + all proxies down — local internet/DNS may be down"
+			return "hint: direct baseline + all proxies down; local internet/DNS may be down"
 		}
 		if directUp && allDown {
-			return "hint: direct works but all proxy routes fail — proxy/VPS or control path likely issue"
+			return "hint: direct works but all proxy routes fail; proxy/VPS or control path likely issue"
 		}
 		if directUp {
 			// check if TCP reachable but proxy fails? We don't have separate server reachability vs proxy health in same result currently.
@@ -201,12 +201,12 @@ func diagnosis(results []probe.Result) string {
 				}
 			}
 			if hasDown && anyUp {
-				return "hint: direct OK, some proxy routes degraded — check those transports"
+				return "hint: direct OK, some proxy routes degraded; check those transports"
 			}
 		}
 	} else {
 		if allDown {
-			return "hint: all routes down — check internet and proxy config"
+			return "hint: all routes down; check internet and proxy config"
 		}
 	}
 	return ""

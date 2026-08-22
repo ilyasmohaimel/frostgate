@@ -142,6 +142,11 @@ func TestVLESSDeadServerFailsTCP(t *testing.T) {
 	if tcp == nil || tcp.Status != "FAIL" {
 		t.Fatalf("closed port must FAIL measured TCP: %+v", tcp)
 	}
+	e2e := findLayer(layers, "End-to-end vless-a")
+	wantHint := "server may be reachable, but REALITY/auth failed; check PBK, SID, or filtering"
+	if e2e == nil || e2e.Hint != wantHint {
+		t.Fatalf("end-to-end failure hint: %+v", e2e)
+	}
 }
 
 func TestHysteriaHonestWording(t *testing.T) {

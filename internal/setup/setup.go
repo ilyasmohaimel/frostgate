@@ -73,7 +73,7 @@ func RunInteractive(opts Options) error {
 			return addRouteFlow(opts, dir)
 		case "r":
 			// fall through to full setup but will backup
-			fmt.Println("Reconfiguring — existing will be backed up")
+			fmt.Println("Reconfiguring; existing config will be backed up")
 			backupExisting(dir)
 		case "x":
 			confirm := prompt(opts.Stdin, "Type YES to reset and delete existing config: ")
@@ -89,7 +89,7 @@ func RunInteractive(opts Options) error {
 			os.Remove(existingSecret)
 			fmt.Println("Existing config removed")
 		default:
-			fmt.Println("Cancelled — no changes")
+			fmt.Println("Cancelled; no changes made")
 			return nil
 		}
 	}
@@ -114,7 +114,7 @@ func RunInteractive(opts Options) error {
 			}
 			sbPath, _ = exec.LookPath("sing-box")
 		} else {
-			fmt.Println("Continuing without sing-box — only direct checks will work until sing-box is installed")
+			fmt.Println("Continuing without sing-box. Only direct checks will work until it is installed.")
 		}
 	}
 	if sbPath != "" {

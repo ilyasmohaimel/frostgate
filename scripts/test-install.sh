@@ -332,6 +332,13 @@ ok=0
   grep -q 'complete -c frostgate' "$FISH_CONFIG/fish/completions/frostgate.fish" && ok=1
 check "detected fish installs a user completion file" $ok
 
+# Every installer path above is captured. User-facing prose must not use em dashes.
+ok=1
+if grep -q '—' "$WORK"/out.*.log "$WORK"/err.*.log 2>/dev/null; then
+  ok=0
+fi
+check "installer output contains no em-dash prose" $ok
+
 say ""
 say "installer harness: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Frostgate installer — installs only the Frostgate binary, never private config or VPS credentials.
+# Frostgate installer: installs only the Frostgate binary, never private config or VPS credentials.
 # Source: https://github.com/ilyasmohaimel/frostgate
 # No telemetry, all detection is local.
 set -eu
@@ -37,7 +37,7 @@ case "$OS" in
   linux) OS="linux" ;;
   darwin) OS="darwin" ;;
   windows) OS="windows" ;;
-  *) echo "unsupported OS: $OS_RAW ($OS) — only linux is first-class for prebuilt binaries; darwin can use go install" >&2; ;;
+  *) echo "unsupported OS: $OS_RAW ($OS). Prebuilt binaries support Linux; Darwin can use go install" >&2; ;;
 esac
 
 case "$ARCH" in
@@ -49,7 +49,7 @@ esac
 
 echo "Detected: OS=$OS kernel=$KERNEL arch=$ARCH distro=$DISTRO shell=$SHELL_NAME" >&2
 if [ "$IS_WSL" = "1" ]; then
-  echo "WSL detected — treating as Linux" >&2
+  echo "WSL detected; treating as Linux" >&2
   OS="linux"
 fi
 
@@ -122,17 +122,17 @@ verify_checksum() {
   sums_file="$2"
   expected_name="$3"
   if [ ! -f "$sums_file" ]; then
-    echo "SHA256SUMS not available — failing closed (no verification)" >&2
+    echo "SHA256SUMS not available; failing closed (no verification)" >&2
     return 1
   fi
   line="$(grep -E " $expected_name\$|\\*$expected_name\$" "$sums_file" 2>/dev/null | head -n1 || true)"
   if [ -z "$line" ]; then
-    echo "no checksum entry for $expected_name in SHA256SUMS — failing closed" >&2
+    echo "no checksum entry for $expected_name in SHA256SUMS; failing closed" >&2
     return 1
   fi
   expected="$(printf "%s" "$line" | awk '{print $1}')"
   if [ -z "$expected" ]; then
-    echo "cannot parse checksum — failing closed" >&2
+    echo "cannot parse checksum; failing closed" >&2
     return 1
   fi
   actual=""
@@ -143,7 +143,7 @@ verify_checksum() {
   elif command -v openssl >/dev/null 2>&1; then
     actual="$(openssl dgst -sha256 "$bin_file" | awk '{print $NF}')"
   else
-    echo "no sha256sum/shasum/openssl found — failing closed" >&2
+    echo "no sha256sum/shasum/openssl found; failing closed" >&2
     return 1
   fi
   if [ "$actual" = "$expected" ]; then
@@ -163,7 +163,7 @@ install_via_binary() {
       echo "macOS detected: prebuilt darwin binaries are not yet published (planned)." >&2
       echo "Use: go install github.com/$REPO/cmd/frostgate@latest  (requires Go)" >&2
       if command -v go >/dev/null 2>&1; then
-        echo "Go found — falling back to go install" >&2
+        echo "Go found; falling back to go install" >&2
         return 1
       fi
       echo "Install Go from https://go.dev/dl/ then rerun, or wait for future macOS binaries." >&2
@@ -201,7 +201,7 @@ install_via_binary() {
   mkdir -p "$INSTALL_DIR"
   tmp="$(mktemp "${INSTALL_DIR}/.${BINARY}.XXXXXX")"
   tmp_sums="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"
-  # cleanup on failure — but keep existing binary intact
+  # Cleanup on failure: keep the existing binary intact.
   trap 'rm -f "$tmp" "$tmp_sums"' EXIT
   success=0
   if command -v curl >/dev/null 2>&1; then
@@ -232,18 +232,18 @@ install_via_binary() {
     return 1
   fi
   if ! verify_checksum "$tmp" "$tmp_sums" "$bin_name"; then
-    echo "checksum verification failed — existing installation kept intact" >&2
+    echo "checksum verification failed; existing installation kept intact" >&2
     return 1
   fi
   chmod +x "$tmp"
   # Verify the downloaded binary actually runs BEFORE replacing anything,
   # so a broken download can never clobber a working installation.
   if ! "$tmp" --version >/dev/null 2>&1; then
-    echo "downloaded binary failed --version — keeping existing installation intact" >&2
+    echo "downloaded binary failed --version; keeping existing installation intact" >&2
     rm -f "$tmp"
     return 1
   fi
-  # Atomic move — existing binary stays intact until every gate passes
+  # Atomic move: the existing binary stays intact until every gate passes.
   mv -f "$tmp" "$INSTALL_DIR/$BINARY"
   rm -f "$tmp_sums"
   trap - EXIT
@@ -324,6 +324,6 @@ if [ -x "$INSTALL_DIR/$BINARY" ]; then
   echo "Installed $($INSTALL_DIR/$BINARY --version 2>/dev/null || echo "$BINARY") at $INSTALL_DIR/$BINARY" >&2
   echo "Next: frostgate setup" >&2
 else
-  echo "installation may have landed in GOPATH/bin — check PATH" >&2
+  echo "installation may have landed in GOPATH/bin; check PATH" >&2
 fi
 echo "Verify with: $BINARY --version && $BINARY --help" >&2

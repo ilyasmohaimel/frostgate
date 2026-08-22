@@ -116,8 +116,8 @@ func TestDestinationMatrix(t *testing.T) {
 
 func TestMatrixNoSelectorMutation(t *testing.T) {
 	// Any PUT to this fake fails 404; if network-check tried to switch a
-	// selector the singbox client would error — here we simply prove no PUT
-	// is ever issued.
+	// selector the singbox client would error. This test proves no PUT is ever
+	// issued.
 	var puts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {

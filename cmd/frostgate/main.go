@@ -354,7 +354,7 @@ func handleAdd(args []string) int {
 		cancel()
 		if res.Status == "down" {
 			fmt.Printf("end-to-end test failed: %s\n", sanitizeError(fmt.Errorf("%s", res.Category)))
-			fmt.Println("Route added but test failed — check diagnose")
+			fmt.Println("Route added, but test failed. Run frostgate diagnose.")
 			return 1
 		}
 		fmt.Printf("\n%s\nLatency: %dms\nLoss: %.0f%%\nJitter: %dms\n", tag, res.Metrics.Median.Milliseconds(), res.Metrics.LossPct, res.Metrics.Jitter.Milliseconds())

@@ -300,7 +300,7 @@ func checkEndToEnd(client *singbox.Client, cfg *config.Config, ep config.Endpoin
 		case "hysteria2":
 			hint = "check Hysteria2 password/obfs/SNI or server availability"
 		default:
-			hint = "server may be reachable but REALITY/auth path failed — verify PBK/SID or filtering"
+			hint = "server may be reachable, but REALITY/auth failed; check PBK, SID, or filtering"
 		}
 		return Layer{
 			Name:   endToEndName(kind, ep),

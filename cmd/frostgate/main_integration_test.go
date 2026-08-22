@@ -38,7 +38,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	integrationBinary = filepath.Join(dir, "frostgate")
-	cmd := exec.Command("go", "build", "-ldflags", "-X main.version=v0.4.2-test", "-o", integrationBinary, "./cmd/frostgate")
+	cmd := exec.Command("go", "build", "-ldflags", "-X main.version=test", "-o", integrationBinary, "./cmd/frostgate")
 	cmd.Dir = root
 	if out, buildErr := cmd.CombinedOutput(); buildErr != nil {
 		fmt.Fprintf(os.Stderr, "build integration binary: %v\n%s", buildErr, out)
@@ -371,7 +371,7 @@ func TestActualCLIJSONContracts(t *testing.T) {
 	env := f.env()
 
 	stdout, _, code := runCLI(t, env, "--version")
-	if code != 0 || strings.TrimSpace(string(stdout)) != "frostgate v0.4.2-test" {
+	if code != 0 || strings.TrimSpace(string(stdout)) != "frostgate test" {
 		t.Fatalf("--version: code=%d stdout=%q", code, stdout)
 	}
 	_, stderr, code := runCLI(t, env, "--help")
