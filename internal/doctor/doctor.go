@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
@@ -68,7 +69,11 @@ func Run(cfgPath string, verbose bool) []Check {
 	}
 	if hasSBEndpoints {
 		if cfg.SingBox.BenchmarkProxy == "" {
-			out = append(out, Check{Name: "Benchmark proxy", Status: "WARN", Detail: "singbox.benchmark_proxy not configured — download benchmarks will report N/A"})
+			if addr, ok := managedBenchmarkProxy(filepath.Dir(resolved), cfg); ok {
+				out = append(out, Check{Name: "Benchmark proxy", Status: "PASS", Detail: fmt.Sprintf("managed listener %s", addr)})
+			} else {
+				out = append(out, Check{Name: "Benchmark proxy", Status: "WARN", Detail: "singbox.benchmark_proxy not configured; proxy downloads will report N/A"})
+			}
 		} else if !config.IsLoopbackHost(hostOnly(cfg.SingBox.BenchmarkProxy)) {
 			out = append(out, Check{Name: "Benchmark proxy", Status: "FAIL", Detail: fmt.Sprintf("%s is not a loopback address", cfg.SingBox.BenchmarkProxy)})
 		} else {
@@ -161,6 +166,10 @@ func Run(cfgPath string, verbose bool) []Check {
 	}
 
 	return out
+}
+
+func managedBenchmarkProxy(dir string, cfg *config.Config) (string, bool) {
+	return managedconfig.DiscoverBenchmarkProxy(dir)
 }
 
 func checkDNS() error {

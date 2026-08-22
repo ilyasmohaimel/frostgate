@@ -143,6 +143,77 @@ func TestRoundTripMultipleRoutes(t *testing.T) {
 	}
 }
 
+func TestBenchmarkProxyDiscoversManagedInbound(t *testing.T) {
+	d := tempDir(t)
+	v := &setup.VLESSOutbound{Tag: "route-a", Server: "203.0.113.10", ServerPort: 443, UUID: "u", SNI: "example.com", PBK: "key", FP: "chrome"}
+	writeConfig(t, d, []*setup.VLESSOutbound{v}, nil)
+	m, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, ok := m.BenchmarkProxy()
+	if !ok || addr != "127.0.0.1:2080" {
+		t.Fatalf("managed benchmark inbound not discovered: %q, %t", addr, ok)
+	}
+}
+
+func TestEnsureBenchmarkProxyMigratesLegacyManagedConfig(t *testing.T) {
+	d := tempDir(t)
+	legacy := []byte(`{
+  "experimental": {"clash_api": {"external_controller": "127.0.0.1:9090", "secret": "fixture-secret"}},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"},
+    {"type": "vless", "tag": "route-a", "server": "203.0.113.10", "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "fixture-key", "short_id": "abcd"}}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := false
+	runner := &SidecarRunner{
+		Validator: func([]byte) error { return nil },
+		Restart:   func() error { restarted = true; return nil },
+		IsActive:  func() (bool, error) { return true, nil },
+		ControllerReady: func(expected []string) (bool, error) {
+			return len(expected) == 1 && expected[0] == "route-a", nil
+		},
+	}
+	addr, migrated, err := EnsureBenchmarkProxy(d, "http://127.0.0.1:9090", []string{"route-a"}, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated || addr != "127.0.0.1:2080" || !restarted {
+		t.Fatalf("legacy benchmark migration failed: addr=%q migrated=%t restarted=%t", addr, migrated, restarted)
+	}
+	m, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := m.BenchmarkProxy(); !ok || got != addr {
+		t.Fatalf("migrated listener was not persisted: %q, %t", got, ok)
+	}
+}
+
+func TestEnsureBenchmarkProxyDoesNotGuessExternalController(t *testing.T) {
+	d := tempDir(t)
+	legacy := []byte(`{
+  "experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "vless", "tag": "route-a", "server": "203.0.113.10", "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "tls": {"enabled": true, "server_name": "example.com", "reality": {"enabled": true, "public_key": "fixture-key"}}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(d, "sing-box.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &SidecarRunner{Restart: func() error { t.Fatal("external config must not restart"); return nil }}
+	addr, migrated, err := EnsureBenchmarkProxy(d, "http://127.0.0.1:9999", []string{"route-a"}, runner)
+	if err != nil || addr != "" || migrated {
+		t.Fatalf("external controller was assigned a benchmark proxy: addr=%q migrated=%t err=%v", addr, migrated, err)
+	}
+}
+
 func TestAddToExisting(t *testing.T) {
 	d := tempDir(t)
 	v1 := &setup.VLESSOutbound{Tag: "v1", Server: "203.0.113.8", ServerPort: 443, UUID: "u1", SNI: "s1", PBK: "p1", FP: "chrome"}

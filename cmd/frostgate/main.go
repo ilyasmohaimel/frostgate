@@ -97,6 +97,8 @@ func run() int {
 			return handleRecommend(os.Args[2:])
 		case "history":
 			return handleHistory(os.Args[2:])
+		case "completion":
+			return handleCompletion(os.Args[2:])
 		case "help", "--help", "-h":
 			printHelp()
 			return 0
@@ -185,16 +187,24 @@ func run() int {
 }
 
 func printHelp() {
-	fmt.Fprintf(os.Stderr, "frostgate %s — Network Route Sentinel\n\n", version)
-	fmt.Fprintf(os.Stderr, "Usage:\n  frostgate [flags]\n  frostgate setup\n  frostgate add <link> [--name name]\n  frostgate import <url>\n  frostgate test <link>\n  frostgate benchmark [--network label] [--no-speed] [--json]\n  frostgate diagnose [route] [--json]\n  frostgate network-check [--json]\n  frostgate compare [--json]\n  frostgate recommend [--json]\n  frostgate history [--since duration] [--route name] [--network label] [--json]\n  frostgate doctor [--config path]\n\n")
-	fmt.Fprintf(os.Stderr, "Core:\n  frostgate                 fast health check\n  frostgate --watch         live TUI\n  frostgate --watch --json  NDJSON\n\n")
-	fmt.Fprintf(os.Stderr, "Setup:\n  frostgate setup                 wizard (creates private config)\n  frostgate add <link>            add one route (VLESS/Hysteria2)\n  frostgate import <url>          import subscription (one-time)\n  frostgate test <link>           temporary test, no save\n\n")
-	fmt.Fprintf(os.Stderr, "Analysis:\n  frostgate benchmark             health + download speed\n  frostgate diagnose [route]      layered diagnosis\n  frostgate network-check         current network signals\n  frostgate compare               compare --network runs\n  frostgate recommend             explainable best route\n  frostgate history               local history (no secrets)\n\n")
-	fmt.Fprintf(os.Stderr, "Diagnostics:\n  frostgate --doctor\n  frostgate --check\n  frostgate --version\n\n")
-	fmt.Fprintf(os.Stderr, "Flags:\n")
-	flag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, "\nExit codes: 0 all up  1 mixed/degraded  2 all down  3 config/error\n")
-	fmt.Fprintf(os.Stderr, "\nConfig discovery (first existing wins):\n  1. --config path\n  2. $XDG_CONFIG_HOME/frostgate/config.yaml\n  3. ~/.config/frostgate/config.yaml\n  4. ./frostgate.yaml\n")
+	fmt.Fprintf(os.Stderr, "frostgate %s\n\nUsage:\n  frostgate [flags]\n", version)
+	for _, spec := range commandSpecs {
+		fmt.Fprintf(os.Stderr, "  %s\n", spec.Usage)
+	}
+	fmt.Fprintln(os.Stderr, "\nCommands:")
+	for _, spec := range commandSpecs {
+		fmt.Fprintf(os.Stderr, "  %-15s %s\n", spec.Name, spec.Summary)
+	}
+	fmt.Fprintln(os.Stderr, "\nGlobal flags:")
+	for _, spec := range globalFlags {
+		value := ""
+		if spec.TakesValue {
+			value = " <value>"
+		}
+		fmt.Fprintf(os.Stderr, "  --%-13s %s\n", spec.Name+value, spec.Description)
+	}
+	fmt.Fprintln(os.Stderr, "\nExit codes: 0 all up  1 mixed/degraded  2 all down  3 config/error")
+	fmt.Fprintln(os.Stderr, "\nConfig lookup: --config, $XDG_CONFIG_HOME/frostgate/config.yaml, ~/.config/frostgate/config.yaml, ./frostgate.yaml")
 }
 
 // --- add ---
@@ -818,7 +828,7 @@ func handleBenchmark(args []string) int {
 	var bres []benchRes
 	downloads := map[string]float64{}
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	proxyAddr := cfg.BenchmarkProxyAddr()
+	proxyAddr, proxyUnavailableReason := benchmarkProxyAddr(cfg, filepath.Dir(cfgFile))
 	proxyConfigured := proxyAddr != ""
 	if !noSpeed {
 		measure := benchmark.MeasureSOCKSMbps
@@ -830,7 +840,7 @@ func handleBenchmark(args []string) int {
 				br := newBenchRes(r)
 				if r.Endpoint.Type == config.ProbeSingBox {
 					if r.Status != "down" {
-						br.DownloadNA = "benchmark_proxy not configured"
+						br.DownloadNA = proxyUnavailableReason
 					}
 				} else if probe.HasProxy(results) {
 					br.DownloadNA = "direct baseline"
@@ -931,24 +941,53 @@ func handleBenchmark(args []string) int {
 		}
 		fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", br.Result.Endpoint.Name, status, loss, median, jitter, down)
 	}
-	if bp, ok := probe.BestProxy(results); ok {
-		fmt.Printf("\nBest proxy: %s (%s)\n", bp.Endpoint.Name, fmtDuration(bp.Metrics.Median))
+	rec := recommendFromResults(cfg, results, func(name string) float64 { return downloads[name] })
+	if rec.BestOverall.Name != "" {
+		fmt.Printf("\nBest proxy: %s\n", rec.BestOverall.Name)
+		if why := compactReasons(rec.Reasons); why != "" {
+			fmt.Printf("Why: %s\n", why)
+		}
+		if rec.Preferred != nil {
+			fmt.Printf("Preferred: %s\n", rec.Preferred.Name)
+		}
 	} else if probe.HasProxy(results) {
 		fmt.Println("\nBest proxy: none usable")
 	}
-	rec := recommendFromResults(cfg, results, func(name string) float64 { return downloads[name] })
-	if rec.BestOverall.Name != "" {
-		fmt.Printf("\nBEST PROXY: %s\n", rec.BestOverall.Name)
-		for _, r := range rec.Reasons {
-			fmt.Printf("  ✓ %s\n", r)
-		}
-		if rec.Preferred != nil {
-			fmt.Printf("\nPreferred configured route:\n%s\n", rec.Preferred.Name)
-		}
-	} else if probe.HasProxy(results) {
-		fmt.Println("\nBest proxy: none configured")
-	}
 	return exitCode(results)
+}
+
+func compactReasons(reasons []string) string {
+	return strings.Join(reasons, " - ")
+}
+
+func benchmarkProxyAddr(cfg *config.Config, dir string) (string, string) {
+	if addr := cfg.BenchmarkProxyAddr(); addr != "" {
+		return addr, ""
+	}
+	if addr, ok := managedconfig.DiscoverBenchmarkProxy(dir); ok {
+		return addr, ""
+	}
+	seen := map[string]bool{}
+	var outbounds []string
+	for _, ep := range cfg.Endpoints {
+		if ep.Type == config.ProbeSingBox && ep.Outbound != "" && !seen[ep.Outbound] {
+			seen[ep.Outbound] = true
+			outbounds = append(outbounds, ep.Outbound)
+		}
+	}
+	addr, _, err := managedconfig.EnsureBenchmarkProxy(
+		dir,
+		cfg.SingBox.Controller,
+		outbounds,
+		managedconfig.DefaultSidecarRunner(cfg.SingBox.Controller, cfg.SingBox.Secret),
+	)
+	if err != nil {
+		return "", "managed benchmark migration failed"
+	}
+	if addr != "" {
+		return addr, ""
+	}
+	return "", "benchmark_proxy not configured"
 }
 
 func fmtDuration(d time.Duration) string {
@@ -1534,36 +1573,38 @@ func handleRecommend(args []string) int {
 		return 0
 	}
 	fmt.Println("\nRECOMMENDATION")
-	fmt.Println("")
 	if d, ok := probe.DirectBaseline(results); ok {
 		lat := "—"
 		if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
 			lat = fmtDuration(d.Metrics.Median)
 		}
-		fmt.Printf("Direct baseline:\n%s %s\n\n", strings.ToUpper(string(d.Status)), lat)
+		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), lat)
 	}
 	if rec.BestOverall.Name == "" {
-		fmt.Println("Best proxy:\nnone configured")
+		fmt.Println("Best proxy: none usable")
 		fmt.Println("Confidence: insufficient data")
 		return 0
 	}
-	fmt.Printf("Best proxy:\n%s\n\n", rec.BestOverall.Name)
-	fmt.Println("Why:")
-	for _, r := range rec.Reasons {
-		fmt.Printf("✓ %s\n", r)
+	fmt.Printf("Best proxy: %s\n", rec.BestOverall.Name)
+	if why := compactReasons(rec.Reasons); why != "" {
+		fmt.Printf("Why: %s\n", why)
 	}
 	if rec.Preferred != nil {
-		fmt.Printf("\nPreferred configured route:\n%s\n", rec.Preferred.Name)
+		fmt.Printf("Preferred: %s\n", rec.Preferred.Name)
 	}
-	fmt.Printf("\nFastest:\n%s\n", rec.Fastest.Name)
-	fmt.Printf("\nMost stable:\n%s\n", rec.MostStable.Name)
+	if rec.Fastest.Name != "" && rec.Fastest.Name != rec.BestOverall.Name {
+		fmt.Printf("Fastest: %s\n", rec.Fastest.Name)
+	}
+	if rec.MostStable.Name != "" && rec.MostStable.Name != rec.BestOverall.Name {
+		fmt.Printf("Most stable: %s\n", rec.MostStable.Name)
+	}
 	if len(rec.Avoid) > 0 {
-		fmt.Println("\nAvoid:")
+		fmt.Println("Avoid:")
 		for _, a := range rec.Avoid {
 			fmt.Printf("- %s (%.0f%% loss)\n", a.Name, a.Loss)
 		}
 	}
-	fmt.Printf("\nConfidence: %s\n%s\n", rec.Confidence, rec.ConfidenceDetail)
+	fmt.Printf("Confidence: %s (%s)\n", rec.Confidence, rec.ConfidenceDetail)
 	return 0
 }
 

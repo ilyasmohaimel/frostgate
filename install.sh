@@ -269,6 +269,45 @@ else
   fi
 fi
 
+install_completion() {
+  [ -x "$INSTALL_DIR/$BINARY" ] || return 0
+  shell_base="$(basename "$SHELL_NAME" 2>/dev/null || printf '%s' "$SHELL_NAME")"
+  case "$shell_base" in
+    fish)
+      completion_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+      completion_name="frostgate.fish"
+      completion_shell="fish"
+      ;;
+    bash)
+      completion_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+      completion_name="frostgate"
+      completion_shell="bash"
+      ;;
+    zsh)
+      # Install only into an existing user completion directory. zsh fpath is
+      # user-managed, so creating an unrelated directory would not activate it.
+      completion_dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+      completion_name="_frostgate"
+      completion_shell="zsh"
+      [ -d "$completion_dir" ] || return 0
+      ;;
+    *) return 0 ;;
+  esac
+  if ! mkdir -p "$completion_dir" 2>/dev/null; then
+    return 0
+  fi
+  completion_tmp="$(mktemp "$completion_dir/.frostgate.XXXXXX" 2>/dev/null || true)"
+  [ -n "$completion_tmp" ] || return 0
+  if "$INSTALL_DIR/$BINARY" completion "$completion_shell" > "$completion_tmp" 2>/dev/null && [ -s "$completion_tmp" ]; then
+    if mv -f "$completion_tmp" "$completion_dir/$completion_name"; then
+      echo "shell completion installed: $completion_dir/$completion_name" >&2
+      return 0
+    fi
+  fi
+  rm -f "$completion_tmp"
+  return 0
+}
+
 # PATH check
 case ":${PATH:-}:" in
   *":$INSTALL_DIR:"*) ;;
@@ -280,20 +319,11 @@ esac
 
 # Verify installed binary
 if [ -x "$INSTALL_DIR/$BINARY" ]; then
+  install_completion
   echo "" >&2
-  echo "Frostgate $($INSTALL_DIR/$BINARY --version 2>/dev/null || echo "installed") installed successfully." >&2
-  echo "" >&2
-  echo "Path:" >&2
-  echo "  $INSTALL_DIR/$BINARY" >&2
-  echo "" >&2
-  echo "Next:" >&2
-  echo "  frostgate setup" >&2
-  echo "" >&2
-  echo "Then:" >&2
-  echo "  frostgate" >&2
-  echo "  frostgate benchmark" >&2
-  echo "" >&2
+  echo "Installed $($INSTALL_DIR/$BINARY --version 2>/dev/null || echo "$BINARY") at $INSTALL_DIR/$BINARY" >&2
+  echo "Next: frostgate setup" >&2
 else
   echo "installation may have landed in GOPATH/bin — check PATH" >&2
 fi
-echo "done. Verify with: $BINARY --version && $BINARY --help" >&2
+echo "Verify with: $BINARY --version && $BINARY --help" >&2

@@ -98,7 +98,7 @@ func RunInteractive(opts Options) error {
 	if err := EnsureConfigDir(dir); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
-	fmt.Printf("✓ config directory ready (%s, 0700)\n", dir)
+	fmt.Printf("config directory ready: %s (0700)\n", dir)
 
 	// sing-box detection
 	sbPath, err := exec.LookPath("sing-box")
@@ -119,7 +119,7 @@ func RunInteractive(opts Options) error {
 	}
 	if sbPath != "" {
 		ver := getSingBoxVersion(sbPath)
-		fmt.Printf("✓ sing-box found: %s (%s)\n", ver, sbPath)
+		fmt.Printf("sing-box found: %s (%s)\n", ver, sbPath)
 	}
 
 	// Choose setup type
@@ -303,7 +303,7 @@ func importFlow(opts Options, dir string) error {
 				continue
 			}
 			vlessOut = append(vlessOut, v)
-			fmt.Printf("✓ added VLESS %s\n", tag)
+			fmt.Printf("added VLESS: %s\n", tag)
 		} else if strings.HasPrefix(linkLower, "hysteria2://") || strings.HasPrefix(linkLower, "hy2://") {
 			h, err := ParseHysteria2ShareLink(link, tag)
 			if err != nil {
@@ -311,7 +311,7 @@ func importFlow(opts Options, dir string) error {
 				continue
 			}
 			hystOut = append(hystOut, h)
-			fmt.Printf("✓ added Hysteria2 %s\n", tag)
+			fmt.Printf("added Hysteria2: %s\n", tag)
 		} else {
 			fmt.Printf("Unsupported link (must be vless:// or hysteria2://)\n")
 			continue
@@ -348,7 +348,7 @@ func importFlow(opts Options, dir string) error {
 	var secret string
 	if data, err := os.ReadFile(secretFile); err == nil {
 		secret = strings.TrimSpace(string(data))
-		fmt.Println("✓ using existing controller secret")
+		fmt.Println("using existing controller secret")
 	} else {
 		s, err := GenerateSecret()
 		if err != nil {
@@ -358,7 +358,7 @@ func importFlow(opts Options, dir string) error {
 		if err := WriteSecretFile(secretFile, secret); err != nil {
 			return err
 		}
-		fmt.Println("✓ generated controller secret (0600)")
+		fmt.Println("generated controller secret (0600)")
 	}
 
 	// Generate sing-box config
@@ -370,7 +370,7 @@ func importFlow(opts Options, dir string) error {
 	if err := WriteFileSecure(singBoxPath, singBoxData); err != nil {
 		return err
 	}
-	fmt.Printf("✓ wrote %s (0600)\n", singBoxPath)
+	fmt.Printf("wrote %s (0600)\n", singBoxPath)
 
 	// Validate sing-box
 	if sbPath, err := exec.LookPath("sing-box"); err == nil {
@@ -379,7 +379,7 @@ func importFlow(opts Options, dir string) error {
 			fmt.Printf("sing-box check failed: %s\n", string(out))
 			return fmt.Errorf("sing-box check failed")
 		}
-		fmt.Println("✓ sing-box check passed")
+		fmt.Println("sing-box check passed")
 	}
 
 	// Generate Frostgate config
@@ -410,7 +410,7 @@ func importFlow(opts Options, dir string) error {
 	if err := WriteFileSecure(fgPath, []byte(fgContent)); err != nil {
 		return err
 	}
-	fmt.Printf("✓ wrote %s (0600)\n", fgPath)
+	fmt.Printf("wrote %s (0600)\n", fgPath)
 
 	// Sidecar service
 	if runtime.GOOS == "linux" {
@@ -419,7 +419,7 @@ func importFlow(opts Options, dir string) error {
 			if err := installSystemdService(dir); err != nil {
 				fmt.Printf("Failed to install service: %v\n", err)
 			} else {
-				fmt.Println("✓ systemd service installed and started")
+				fmt.Println("systemd service installed and started")
 			}
 		}
 	}
@@ -434,20 +434,17 @@ func importFlow(opts Options, dir string) error {
 	fmt.Println("\nFrostgate setup complete.")
 	fmt.Println("\nRoutes:")
 	for _, t := range vlessTags {
-		fmt.Printf("  ✓ %s\n", t)
+		fmt.Printf("  %s\n", t)
 	}
 	for _, t := range hystTags {
-		fmt.Printf("  ✓ %s\n", t)
+		fmt.Printf("  %s\n", t)
 	}
 	if addDirect {
-		fmt.Printf("  ✓ direct\n")
+		fmt.Printf("  direct\n")
 	}
-	fmt.Println("\nsing-box:")
-	fmt.Println("  ✓ running (if service installed) or run: sing-box run -c ~/.config/frostgate/sing-box.json")
-	fmt.Println("\nController:")
-	fmt.Println("  ✓ 127.0.0.1 only")
-	fmt.Println("\nConfig:")
-	fmt.Printf("  %s\n", fgPath)
+	fmt.Println("\nsing-box: run `sing-box run -c ~/.config/frostgate/sing-box.json` if no service was installed")
+	fmt.Println("Controller: loopback only")
+	fmt.Printf("Config: %s\n", fgPath)
 	fmt.Println("\nTry:")
 	fmt.Println("  frostgate")
 	fmt.Println("  frostgate --watch")
@@ -507,7 +504,7 @@ func existingControllerFlow(opts Options, dir string) error {
 	fgPath := filepath.Join(dir, "config.yaml")
 	EnsureConfigDir(dir)
 	WriteFileSecure(fgPath, []byte(fgContent))
-	fmt.Printf("✓ wrote %s\n", fgPath)
+	fmt.Printf("wrote %s\n", fgPath)
 	return runValidation(dir)
 }
 
@@ -521,7 +518,7 @@ func directOnlyFlow(opts Options, dir string) error {
 	EnsureConfigDir(dir)
 	fgPath := filepath.Join(dir, "config.yaml")
 	WriteFileSecure(fgPath, []byte(content))
-	fmt.Printf("✓ wrote %s (direct only)\n", fgPath)
+	fmt.Printf("wrote %s (direct only)\n", fgPath)
 	return runValidation(dir)
 }
 
@@ -647,7 +644,7 @@ func addRouteFlow(opts Options, dir string) error {
 	fgContent := GenerateFrostgateConfig(vlessTags, hystTags, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", secretFile)
 	fgPath := filepath.Join(dir, "config.yaml")
 	WriteFileSecure(fgPath, []byte(fgContent))
-	fmt.Printf("✓ added route %s\n", tag)
+	fmt.Printf("added route: %s\n", tag)
 	return runValidation(dir)
 }
 
@@ -716,7 +713,7 @@ func runValidation(dir string) error {
 		fmt.Printf("config check failed: %v\n", err)
 		return err
 	}
-	fmt.Printf("✓ config check passed (%d endpoints)\n", len(cfg.Endpoints))
+	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))
 	// frostgate --doctor via internal doctor
 	// Use doctor.Run
 	// Import doctor
@@ -726,7 +723,7 @@ func runValidation(dir string) error {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			fmt.Printf("frostgate --check failed: %s\n", string(out))
 		} else {
-			fmt.Printf("✓ frostgate check passed\n")
+			fmt.Printf("frostgate check passed\n")
 		}
 	}
 	return nil

@@ -35,6 +35,14 @@ mkdir -p "$FIXTURE"
 
 cat > "$FIXTURE/good-binary" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = completion ]; then
+  case "${2:-}" in
+    fish) printf '%s\n' 'complete -c frostgate -f' ;;
+    bash) printf '%s\n' 'complete -F _frostgate frostgate' ;;
+    zsh) printf '%s\n' '#compdef frostgate' ;;
+  esac
+  exit 0
+fi
 echo "frostgate vTEST"
 exit 0
 EOF
@@ -311,6 +319,18 @@ run_installer "PATH=$SHIMS:/usr/bin:/bin" \
 ok=0
 "$WORK/notonpath-bin/frostgate" --version >/dev/null 2>&1 && grep -q "not in PATH" "$WORK/err.7.log" && ok=1
 check "PATH warning emitted when INSTALL_DIR not in PATH" $ok
+
+# --- Case 11: detected fish gets a user completion file without affecting install ---
+reset_env
+SUMS="$WORK/sums.11"; make_sums "$GOOD_SUM" "$SUMS"
+FISH_CONFIG="$WORK/fish-config"
+run_installer "$BASE_ENV" \
+  "INSTALL_DIR=$WORK/bin" "SHELL=/usr/bin/fish" "XDG_CONFIG_HOME=$FISH_CONFIG" \
+  "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
+ok=0
+[ -x "$WORK/bin/frostgate" ] && [ -f "$FISH_CONFIG/fish/completions/frostgate.fish" ] && \
+  grep -q 'complete -c frostgate' "$FISH_CONFIG/fish/completions/frostgate.fish" && ok=1
+check "detected fish installs a user completion file" $ok
 
 say ""
 say "installer harness: $PASS passed, $FAIL failed"

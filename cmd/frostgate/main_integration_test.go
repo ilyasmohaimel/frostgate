@@ -57,6 +57,7 @@ type cliFixture struct {
 	destinationHits atomic.Int32
 	downloadBytes   int64
 	secretToken     string
+	controllerURL   string
 	close           func()
 }
 
@@ -110,6 +111,7 @@ func newCLIFixture(t *testing.T) *cliFixture {
 			http.NotFound(w, r)
 		}
 	}))
+	f.controllerURL = controller.URL
 
 	socksAddr, stopSOCKS := startSOCKSRelay(t)
 	xdgConfig := filepath.Join(f.home, "xdg-config")
@@ -251,6 +253,117 @@ func TestConfigContractAffectsRuntime(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.home, "xdg-data", "frostgate", "history.db")); !os.IsNotExist(err) {
 		t.Fatalf("disabled history created a DB after runtime commands: %v", err)
 	}
+}
+
+func TestBenchmarkDiscoversManagedProxyFromPreV042Config(t *testing.T) {
+	f := newCLIFixture(t)
+	configData, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := extractBenchmarkProxy(configData)
+	_, proxyPort, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configData = bytes.Replace(configData, []byte("  benchmark_proxy: "+proxyAddr+"\n"), nil, 1)
+	if err := os.WriteFile(f.configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	managed := []byte(`{
+  "experimental": {"clash_api": {"external_controller": "` + strings.TrimPrefix(f.controllerURL, "http://") + `"}},
+  "inbounds": [{"type": "mixed", "tag": "frostgate-mixed", "listen": "127.0.0.1", "listen_port": ` + proxyPort + `}],
+  "route": {"rules": [{"inbound": "frostgate-mixed", "outbound": "frostgate-selector"}], "final": "direct"},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "selector", "tag": "frostgate-selector", "outbounds": ["proxy-out"]},
+    {"type": "vless", "tag": "proxy-out", "server": "203.0.113.10", "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "tls": {"enabled": true, "server_name": "example.com", "reality": {"enabled": true, "public_key": "fixture-key"}}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(f.configPath), "sing-box.json"), managed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--json")
+	doc := requireJSON(t, stdout).(map[string]any)
+	for _, raw := range doc["results"].([]any) {
+		entry := raw.(map[string]any)
+		result := entry["result"].(map[string]any)
+		if result["name"] != "proxy-display-name" {
+			continue
+		}
+		if entry["download_mbps"].(float64) <= 0 || entry["download_na"] != nil {
+			t.Fatalf("managed benchmark listener was not used: %v", entry)
+		}
+		if f.benchmarkHits.Load() == 0 {
+			t.Fatal("managed benchmark listener did not carry the download request")
+		}
+		return
+	}
+	t.Fatal("proxy result missing")
+}
+
+func TestBenchmarkDoesNotGuessProxyForExternalController(t *testing.T) {
+	f := newCLIFixture(t)
+	configData, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := extractBenchmarkProxy(configData)
+	configData = bytes.Replace(configData, []byte("  benchmark_proxy: "+proxyAddr+"\n"), nil, 1)
+	if err := os.WriteFile(f.configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	external := []byte(`{
+  "experimental": {"clash_api": {"external_controller": "127.0.0.1:9999"}},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "vless", "tag": "proxy-out", "server": "203.0.113.10", "server_port": 443, "uuid": "11111111-1111-4111-8111-111111111111", "tls": {"enabled": true, "server_name": "example.com", "reality": {"enabled": true, "public_key": "fixture-key"}}}
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(f.configPath), "sing-box.json"), external, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--json")
+	doc := requireJSON(t, stdout).(map[string]any)
+	for _, raw := range doc["results"].([]any) {
+		entry := raw.(map[string]any)
+		result := entry["result"].(map[string]any)
+		if result["name"] == "proxy-display-name" {
+			if entry["download_na"] != "benchmark_proxy not configured" || entry["download_mbps"].(float64) != 0 {
+				t.Fatalf("external controller was assigned a guessed listener: %v", entry)
+			}
+			if f.benchmarkHits.Load() != 0 {
+				t.Fatal("external controller benchmark made a throughput request")
+			}
+			return
+		}
+	}
+	t.Fatal("proxy result missing")
+}
+
+func TestBenchmarkHumanOutputIsCompact(t *testing.T) {
+	f := newCLIFixture(t)
+	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--no-speed")
+	output := string(stdout)
+	if strings.Contains(output, "✓") || strings.Contains(output, "BEST PROXY:") {
+		t.Fatalf("benchmark retained decorative formatting:\n%s", output)
+	}
+	if strings.Count(output, "Best proxy:") != 1 {
+		t.Fatalf("benchmark duplicated its proxy summary:\n%s", output)
+	}
+	if !strings.Contains(output, "Why: ") || !strings.Contains(output, " - ") {
+		t.Fatalf("benchmark reasons are not compact:\n%s", output)
+	}
+}
+
+func extractBenchmarkProxy(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "benchmark_proxy:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "benchmark_proxy:"))
+		}
+	}
+	return ""
 }
 
 func TestActualCLIJSONContracts(t *testing.T) {
