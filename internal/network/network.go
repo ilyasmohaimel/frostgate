@@ -42,7 +42,9 @@ func checkIPv4() Check {
 	if err != nil {
 		return Check{Name: "IPv4", Status: "FAIL", Detail: redact.Error(err)}
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		return Check{Name: "IPv4", Status: "FAIL", Detail: redact.Error(err)}
+	}
 	return Check{Name: "IPv4", Status: "PASS", Detail: "tcp 1.1.1.1:80 ok"}
 }
 
@@ -54,14 +56,19 @@ func checkIPv6() Check {
 	if err != nil {
 		return Check{Name: "IPv6", Status: "UNAVAILABLE", Detail: "no IPv6 route"}
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		return Check{Name: "IPv6", Status: "UNAVAILABLE", Detail: "IPv6 connection close failed"}
+	}
 	return Check{Name: "IPv6", Status: "PASS", Detail: "tcp [2606:4700:4700::1111]:80 ok"}
 }
 
 func checkHTTPS() Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://www.gstatic.com/generate_204", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.gstatic.com/generate_204", nil)
+	if err != nil {
+		return Check{Name: "HTTPS", Status: "FAIL", Detail: redact.Error(err)}
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -77,7 +84,10 @@ func checkHTTPS() Check {
 func checkCaptive() Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://www.gstatic.com/generate_204", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.gstatic.com/generate_204", nil)
+	if err != nil {
+		return Check{Name: "Captive portal", Status: "SKIP", Detail: redact.Error(err)}
+	}
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -89,7 +99,10 @@ func checkCaptive() Check {
 		return Check{Name: "Captive portal", Status: "SKIP", Detail: redact.Error(err)}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if readErr != nil {
+		return Check{Name: "Captive portal", Status: "SKIP", Detail: redact.Error(readErr)}
+	}
 	if resp.StatusCode == 204 && len(body) == 0 {
 		return Check{Name: "Captive portal", Status: "PASS", Detail: "NO (204 empty)"}
 	}
@@ -207,9 +220,12 @@ func FetchDoHAnswers(ctx context.Context, client *http.Client, dohBase, host str
 			return nil, err
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		resp.Body.Close()
+		closeErr := resp.Body.Close()
 		if err != nil {
 			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
 		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("doh status %d", resp.StatusCode)
@@ -278,7 +294,10 @@ func checkDestination(u string) Check {
 	name := redact.String(u)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return Check{Name: name, Status: "FAIL", Detail: redact.Error(err)}
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {

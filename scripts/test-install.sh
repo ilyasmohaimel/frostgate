@@ -106,7 +106,7 @@ url=""
 out=""
 prev=""
 for a in "$@"; do
-  case "$prev" in -O) out="$a" ;; esac
+  case "$prev" in -O|-qO) out="$a" ;; esac
   prev="$a"
 done
 for a in "$@"; do
@@ -138,15 +138,25 @@ case "$1" in
     esac
     exit 0 ;;
   install)
-    mkdir -p "${FT_GOBIN:?}"
-    cp "${FT_GO_SRC:?}" "$FT_GOBIN/frostgate"
-    chmod +x "$FT_GOBIN/frostgate"
+    target="${GOBIN:-${FT_GOBIN:?}}"
+    mkdir -p "$target"
+    cp "${FT_GO_SRC:?}" "$target/frostgate"
+    chmod +x "$target/frostgate"
     exit 0 ;;
 esac
 exit 0
 EOF
 
 chmod +x "$SHIMS/curl" "$SHIMS/wget" "$GOSHIMS/go"
+ln -sf "$SHIMS/curl" "$GOSHIMS/curl"
+ln -sf "$SHIMS/wget" "$GOSHIMS/wget"
+
+# Restricted PATH that exercises wget rather than curl.
+WGETSHIMS="$WORK/wgetshims"
+mkdir -p "$WGETSHIMS"
+for tool in sh bash grep awk sed head tail cat mktemp chmod mv cp rm uname tr env mkdir sleep dirname basename sha256sum shasum openssl wget; do
+  [ -e "$SHIMS/$tool" ] && ln -sf "$SHIMS/$tool" "$WGETSHIMS/$tool"
+done
 
 # Restricted PATH without any checksum utility.
 NOCHECKSUM_PATH="$WORK/nocksum"
@@ -170,6 +180,8 @@ run_installer() { # each arg: VAR=VALUE exported for the run
     export HOME="$WORK/home"
     sh "$INSTALL_SH"
   ) > "$WORK/out.$CASE_N.log" 2> "$WORK/err.$CASE_N.log"
+  LAST_OUT="$WORK/out.$CASE_N.log"
+  LAST_ERR="$WORK/err.$CASE_N.log"
 }
 
 reset_env() {
@@ -179,6 +191,7 @@ reset_env() {
 
 BASE_ENV="PATH=$SHIMS"
 GO_ENV="PATH=$GOSHIMS:/usr/bin:/bin"
+WGET_ENV="PATH=$WGETSHIMS"
 
 # --- Case 1: valid binary + checksum -> success replaces binary ---
 reset_env
@@ -194,6 +207,17 @@ if cmp -s "$WORK/bin/frostgate" "$FIXTURE/good-binary" && \
 fi
 check "valid binary installs and --version works" $ok
 
+# --- Case 1b: wget download path verifies and installs identically ---
+reset_env
+SUMS="$WORK/sums.1b"; make_sums "$GOOD_SUM" "$SUMS"
+run_installer "$WGET_ENV" \
+  "INSTALL_DIR=$WORK/bin" \
+  "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary"
+ok=0
+cmp -s "$WORK/bin/frostgate" "$FIXTURE/good-binary" && \
+  grep -q "checksum verified" "$LAST_ERR" && ok=1
+check "wget binary path verifies and installs" $ok
+
 # --- Case 2: checksum mismatch -> fail closed, old binary preserved ---
 reset_env
 printf '#!/bin/sh\necho frostgate vOLD\n' > "$WORK/bin/frostgate"
@@ -204,8 +228,26 @@ run_installer "$BASE_ENV" \
   "INSTALL_DIR=$WORK/bin" \
   "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
 ok=0
-cmp -s "$WORK/old.copy" "$WORK/bin/frostgate" && grep -q "checksum mismatch" "$WORK/err.2.log" && ok=1
+cmp -s "$WORK/old.copy" "$WORK/bin/frostgate" && grep -q "checksum mismatch" "$LAST_ERR" && ok=1
 check "checksum mismatch fails closed and preserves old binary byte-for-byte" $ok
+
+# --- Case 2b: an integrity failure must not fall back to go install ---
+reset_env
+printf '#!/bin/sh\necho frostgate vOLD\n' > "$WORK/bin/frostgate"
+chmod +x "$WORK/bin/frostgate"
+cp "$WORK/bin/frostgate" "$WORK/old2b.copy"
+SUMS="$WORK/sums.2b"; make_sums "$BAD_SUM" "$SUMS"
+GOSUMDB_LOG="$WORK/gosumdb.2b.log"; : > "$GOSUMDB_LOG"
+run_installer "$GO_ENV" \
+  "INSTALL_DIR=$WORK/bin" \
+  "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" \
+  "FT_GO_SRC=$FIXTURE/good-binary" "FT_GOSUMDB_LOG=$GOSUMDB_LOG"
+ok=0
+cmp -s "$WORK/old2b.copy" "$WORK/bin/frostgate" && \
+  grep -q "checksum mismatch" "$LAST_ERR" && \
+  ! grep -q "installing via go install" "$LAST_ERR" && \
+  [ ! -s "$GOSUMDB_LOG" ] && ok=1
+check "integrity failure never falls back to go or replaces old binary" $ok
 
 # --- Case 3: missing SHA256SUMS -> fail closed ---
 reset_env
@@ -216,7 +258,7 @@ run_installer "$BASE_ENV" \
   "INSTALL_DIR=$WORK/bin" \
   "FT_MODE=no-sums" "FT_SUMS=/nonexistent" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
 ok=0
-cmp -s "$WORK/old3.copy" "$WORK/bin/frostgate" && grep -qi "fail" "$WORK/err.3.log" && ok=1
+cmp -s "$WORK/old3.copy" "$WORK/bin/frostgate" && grep -qi "fail" "$LAST_ERR" && ok=1
 check "missing SHA256SUMS fails closed preserving old binary" $ok
 
 # --- Case 4: sums exist but no entry for our binary ---
@@ -227,7 +269,7 @@ run_installer "$BASE_ENV" \
   "INSTALL_DIR=$WORK/bin" \
   "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
 ok=0
-grep -q "no checksum entry" "$WORK/err.4.log" && [ ! -e "$WORK/bin/frostgate" ] && ok=1
+grep -q "no checksum entry" "$LAST_ERR" && [ ! -e "$WORK/bin/frostgate" ] && ok=1
 check "missing checksum entry fails closed" $ok
 
 # --- Case 5: no checksum utility -> fail closed ---
@@ -287,6 +329,21 @@ ok=0
 grep -q "^off$" "$GOSUMDB_LOG" && ok=0
 check "go fallback installs and does not disable GOSUMDB" $ok
 
+# --- Case 7b: a bad Go fallback binary also preserves an old installation ---
+reset_env
+printf '#!/bin/sh\necho frostgate vOLD\n' > "$WORK/bin/frostgate"
+chmod +x "$WORK/bin/frostgate"
+cp "$WORK/bin/frostgate" "$WORK/old7b.copy"
+SUMS="$WORK/sums.7b"; make_sums "$GOOD_SUM" "$SUMS"
+run_installer "$GO_ENV" \
+  "INSTALL_DIR=$WORK/bin" \
+  "FT_MODE=download-fail" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" \
+  "FT_GO_SRC=$FIXTURE/broken-binary" "FT_GOSUMDB_LOG=$WORK/gosumdb.7b.log"
+ok=0
+cmp -s "$WORK/old7b.copy" "$WORK/bin/frostgate" && \
+  grep -q "go binary verification failed" "$LAST_ERR" && ok=1
+check "bad go fallback binary is rejected before replacement" $ok
+
 # --- Case 8: downloaded binary failing --version keeps old binary ---
 reset_env
 printf '#!/bin/sh\necho frostgate vOLD\n' > "$WORK/bin/frostgate"
@@ -297,7 +354,7 @@ run_installer "$BASE_ENV" \
   "INSTALL_DIR=$WORK/bin" \
   "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/broken-binary" "FT_LOG=/dev/null"
 ok=0
-cmp -s "$WORK/old8.copy" "$WORK/bin/frostgate" && grep -q "failed --version" "$WORK/err.5.log" && ok=1
+cmp -s "$WORK/old8.copy" "$WORK/bin/frostgate" && grep -q "failed --version" "$LAST_ERR" && ok=1
 check "binary failing --version rejected before replace, old kept intact" $ok
 
 # --- Case 9: custom INSTALL_DIR honored ---
@@ -317,7 +374,7 @@ run_installer "PATH=$SHIMS:/usr/bin:/bin" \
   "INSTALL_DIR=$WORK/notonpath-bin" \
   "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
 ok=0
-"$WORK/notonpath-bin/frostgate" --version >/dev/null 2>&1 && grep -q "not in PATH" "$WORK/err.7.log" && ok=1
+"$WORK/notonpath-bin/frostgate" --version >/dev/null 2>&1 && grep -q "not in PATH" "$LAST_ERR" && ok=1
 check "PATH warning emitted when INSTALL_DIR not in PATH" $ok
 
 # --- Case 11: detected fish gets a user completion file without affecting install ---

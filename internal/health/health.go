@@ -21,6 +21,17 @@ type Thresholds struct {
 	DegradedLossPct float64
 }
 
+// Reason is a classification cause suitable for user-facing reporting. It is
+// derived with the status so tables cannot invent a conflicting explanation.
+type Reason string
+
+const (
+	ReasonUnavailable Reason = "unavailable"
+	ReasonLoss        Reason = "loss"
+	ReasonLatency     Reason = "slow"
+	ReasonJitter      Reason = "jitter"
+)
+
 func DefaultThresholds() Thresholds {
 	return Thresholds{
 		HealthyLatency:  800 * time.Millisecond,
@@ -31,27 +42,38 @@ func DefaultThresholds() Thresholds {
 }
 
 func Classify(m metrics.Metrics, th Thresholds) Status {
+	status, _ := ClassifyWithReasons(m, th)
+	return status
+}
+
+// ClassifyWithReasons applies the health policy and returns every observed
+// classification cause. Unknown jitter is intentionally not treated as 0 ms.
+func ClassifyWithReasons(m metrics.Metrics, th Thresholds) (Status, []Reason) {
 	if m.Attempted == 0 {
-		return StatusDown
+		return StatusDown, []Reason{ReasonUnavailable}
 	}
 	if m.Succeeded == 0 {
-		return StatusDown
+		return StatusDown, []Reason{ReasonUnavailable}
 	}
 	loss := m.LossPct
 
 	if loss > th.DegradedLossPct {
-		return StatusDown
+		return StatusDown, []Reason{ReasonLoss}
 	}
+	var reasons []Reason
 	if loss > th.MaxLossPct {
-		return StatusDegraded
+		reasons = append(reasons, ReasonLoss)
 	}
 	if m.Median > th.HealthyLatency {
-		return StatusDegraded
+		reasons = append(reasons, ReasonLatency)
 	}
-	if m.Jitter > th.MaxJitter {
-		return StatusDegraded
+	if m.JitterKnown && m.Jitter > th.MaxJitter {
+		reasons = append(reasons, ReasonJitter)
 	}
-	return StatusUp
+	if len(reasons) > 0 {
+		return StatusDegraded, reasons
+	}
+	return StatusUp, nil
 }
 
 func Rank(s Status) int {

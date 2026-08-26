@@ -14,6 +14,7 @@ type Input struct {
 	Loss         float64       `json:"loss_pct"`
 	Median       time.Duration `json:"median_ns"`
 	Jitter       time.Duration `json:"jitter_ns"`
+	JitterKnown  bool          `json:"jitter_known"`
 	Download     float64       `json:"download_mbps,omitempty"`
 	Priority     int           `json:"priority"`
 	Availability float64       `json:"availability_pct,omitempty"` // from history 0-100
@@ -63,6 +64,7 @@ func Recommend(inputs []Input, historyCount int) Result {
 			LossPct:         in.Loss,
 			Median:          in.Median,
 			Jitter:          in.Jitter,
+			JitterKnown:     in.JitterKnown,
 			DownloadMbps:    in.Download,
 			Priority:        in.Priority,
 			AvailabilityPct: in.Availability,
@@ -78,6 +80,7 @@ func Recommend(inputs []Input, historyCount int) Result {
 			Loss:         c.LossPct,
 			Median:       c.Median,
 			Jitter:       c.Jitter,
+			JitterKnown:  c.JitterKnown,
 			Download:     c.DownloadMbps,
 			Priority:     c.Priority,
 			Availability: c.AvailabilityPct,
@@ -96,16 +99,15 @@ func Recommend(inputs []Input, historyCount int) Result {
 	if best.Download > 0 {
 		reasons = append(reasons, fmt.Sprintf("%.0f Mbps", best.Download))
 	}
-	if best.Jitter > 0 {
-		// Jitter is meaningful only when every usable candidate has enough
-		// sample evidence to provide a non-zero aggregate. Otherwise a zero is
-		// ambiguous (often one successful sample), so avoid a superlative.
+	if best.JitterKnown {
+		// A zero jitter can be measured. A superlative is only truthful when
+		// every usable route has comparable jitter evidence.
 		lowest := true
 		for _, in := range healthy {
 			if in.Name == best.Name {
 				continue
 			}
-			if in.Jitter <= 0 || in.Jitter < best.Jitter {
+			if !in.JitterKnown || in.Jitter < best.Jitter {
 				lowest = false
 				break
 			}
@@ -122,7 +124,7 @@ func Recommend(inputs []Input, historyCount int) Result {
 
 	// Preferred: lowest priority value (most preferred) among healthy
 	var preferred *Input
-	minPrio := 1 << 30
+	minPrio := int(^uint(0) >> 1)
 	for _, in := range healthy {
 		if in.Priority < minPrio {
 			minPrio = in.Priority
@@ -141,11 +143,18 @@ func Recommend(inputs []Input, historyCount int) Result {
 			fastest = in
 		}
 	}
-	// Most stable: lowest jitter + low loss
+	// Most stable is selected only among routes with measured jitter. If no
+	// route has enough samples, retain the normal best route instead of
+	// accidentally rewarding unknown zero jitter.
 	mostStable := scored[0]
+	knownStable := false
 	for _, in := range healthy {
-		if in.Jitter < mostStable.Jitter && in.Loss <= mostStable.Loss {
+		if !in.JitterKnown {
+			continue
+		}
+		if !knownStable || in.Jitter < mostStable.Jitter || (in.Jitter == mostStable.Jitter && (in.Loss < mostStable.Loss || (in.Loss == mostStable.Loss && in.Name < mostStable.Name))) {
 			mostStable = in
+			knownStable = true
 		}
 	}
 	// Best fallback: second best
@@ -200,6 +209,7 @@ func FromSummary(s history.Summary, status string, download float64, priority in
 		Loss:         100 - s.Availability, // approximate
 		Median:       s.Median,
 		Jitter:       s.Jitter,
+		JitterKnown:  s.JitterKnown,
 		Download:     download,
 		Availability: s.Availability,
 		Priority:     priority,

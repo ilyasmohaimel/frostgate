@@ -37,9 +37,17 @@ func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
 	out = append(out, checkLocalNetwork())
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
-	out = append(out, checkSingBox())
-	out = append(out, checkSidecar(opts.SidecarService))
-	out = append(out, checkController(cfg))
+	if hasSingBoxEndpoints(cfg) {
+		out = append(out, checkSingBox())
+		out = append(out, checkSidecar(opts.SidecarService))
+		out = append(out, checkController(cfg))
+	} else {
+		out = append(out,
+			Layer{Name: "sing-box binary", Status: "SKIP", Detail: "no proxy routes configured"},
+			Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "no proxy routes configured"},
+			Layer{Name: "Controller", Status: "SKIP", Detail: "no proxy routes configured"},
+		)
+	}
 	for _, ep := range cfg.Endpoints {
 		switch ep.Type {
 		case config.ProbeSingBox:
@@ -66,9 +74,17 @@ func DiagnoseRoute(cfg *config.Config, routeName string, opts Options) []Layer {
 	out = append(out, checkLocalNetwork())
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
-	out = append(out, checkSingBox())
-	out = append(out, checkSidecar(opts.SidecarService))
-	out = append(out, checkController(cfg))
+	if hasSingBoxEndpoints(cfg) {
+		out = append(out, checkSingBox())
+		out = append(out, checkSidecar(opts.SidecarService))
+		out = append(out, checkController(cfg))
+	} else {
+		out = append(out,
+			Layer{Name: "sing-box binary", Status: "SKIP", Detail: "no proxy routes configured"},
+			Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "no proxy routes configured"},
+			Layer{Name: "Controller", Status: "SKIP", Detail: "no proxy routes configured"},
+		)
+	}
 	if target.Type == config.ProbeSingBox {
 		out = append(out, diagnoseProxyRoute(cfg, *target, opts)...)
 	} else {
@@ -76,6 +92,15 @@ func DiagnoseRoute(cfg *config.Config, routeName string, opts Options) []Layer {
 	}
 	out = append(out, checkBackupRoutes(cfg, routeName)...)
 	return out
+}
+
+func hasSingBoxEndpoints(cfg *config.Config) bool {
+	for _, ep := range cfg.Endpoints {
+		if ep.Type == config.ProbeSingBox {
+			return true
+		}
+	}
+	return false
 }
 
 // diagnoseProxyRoute emits evidence-based layers for a singbox-backed route.
@@ -202,7 +227,9 @@ func checkTCPServer(routeName, host string, port int) Layer {
 			Hint:   "server down, wrong port, or firewall",
 		}
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		return Layer{Name: name, Status: "FAIL", Detail: "tcp connection close failed", Hint: "local socket error"}
+	}
 	ms := time.Since(start).Milliseconds()
 	return Layer{
 		Name:   name,
@@ -244,8 +271,11 @@ func getVersion(path string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 	s := strings.TrimSpace(string(out))
+	if err != nil && s == "" {
+		return "found (version unavailable)"
+	}
 	if idx := strings.Index(s, "\n"); idx != -1 {
 		s = s[:idx]
 	}
@@ -263,10 +293,13 @@ func checkSidecar(service string) Layer {
 		service = "frostgate-singbox.service"
 	}
 	cmd := exec.Command("systemctl", "--user", "is-active", service)
-	out, _ := cmd.Output()
+	out, err := cmd.Output()
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
 		return Layer{Name: "sing-box sidecar", Status: "PASS", Detail: strings.TrimSuffix(service, ".service") + " active"}
+	}
+	if err != nil && s == "" {
+		return Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "systemd user service unavailable or inactive (maybe manual run)"}
 	}
 	return Layer{Name: "sing-box sidecar", Status: "SKIP", Detail: "service not active (maybe manual run)"}
 }
@@ -382,7 +415,9 @@ func checkServerReachability(ep config.Endpoint) Layer {
 	if err != nil {
 		return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "FAIL", Detail: errString(err)}
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "FAIL", Detail: "tcp connection close failed"}
+	}
 	return Layer{Name: fmt.Sprintf("Server %s", ep.Name), Status: "PASS", Detail: "server reachable"}
 }
 

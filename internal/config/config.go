@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ilyasmohaimel/frostgate/internal/benchmark"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 )
 
 type Duration struct {
@@ -47,6 +49,10 @@ func parseDuration(s string) (time.Duration, error) {
 		days, err := strconv.ParseInt(strings.TrimSuffix(s, "d"), 10, 64)
 		if err != nil {
 			return 0, err
+		}
+		const maxDays = int64(math.MaxInt64 / int64(24*time.Hour))
+		if days > maxDays || days < -maxDays {
+			return 0, fmt.Errorf("days out of range")
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
@@ -91,13 +97,35 @@ type Endpoint struct {
 	URL            string    `yaml:"url,omitempty"`
 	Outbound       string    `yaml:"outbound,omitempty"`
 	Priority       int       `yaml:"priority"`
-	Timeout        Duration  `yaml:"timeout,omitempty"`
-	Samples        int       `yaml:"samples,omitempty"`
-	SampleInterval Duration  `yaml:"sample_interval,omitempty"`
-	HealthyLatency Duration  `yaml:"healthy_latency,omitempty"`
-	MaxJitter      Duration  `yaml:"max_jitter,omitempty"`
-	MaxLoss        *float64  `yaml:"max_loss,omitempty"`
-	ExpectedStatus int       `yaml:"expected_status,omitempty"`
+	prioritySet    bool
+	Timeout        Duration `yaml:"timeout,omitempty"`
+	Samples        int      `yaml:"samples,omitempty"`
+	SampleInterval Duration `yaml:"sample_interval,omitempty"`
+	HealthyLatency Duration `yaml:"healthy_latency,omitempty"`
+	MaxJitter      Duration `yaml:"max_jitter,omitempty"`
+	MaxLoss        *float64 `yaml:"max_loss,omitempty"`
+	ExpectedStatus int      `yaml:"expected_status,omitempty"`
+}
+
+// UnmarshalYAML records whether priority was written by the user. The public
+// int field stays source-compatible while allowing an explicit priority: 0 to
+// override defaults.priority rather than being mistaken for an omission.
+func (e *Endpoint) UnmarshalYAML(value *yaml.Node) error {
+	type plain Endpoint
+	var decoded plain
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*e = Endpoint(decoded)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "priority" {
+				e.prioritySet = true
+				break
+			}
+		}
+	}
+	return nil
 }
 
 func (e Endpoint) Addr() string {
@@ -188,6 +216,12 @@ func Load(path string) (*Config, error) {
 	seen := make(map[string]struct{})
 	for i := range cfg.Endpoints {
 		ep := &cfg.Endpoints[i]
+		if redact.String(ep.Name) != ep.Name {
+			return nil, fmt.Errorf("endpoint name contains sensitive content")
+		}
+		if ep.Outbound != "" && redact.String(ep.Outbound) != ep.Outbound {
+			return nil, fmt.Errorf("endpoint %q outbound contains sensitive content", ep.Name)
+		}
 		if _, ok := seen[ep.Name]; ok {
 			return nil, fmt.Errorf("duplicate endpoint name %q", ep.Name)
 		}
@@ -200,6 +234,9 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) error {
+	if cfg.Defaults.DegradedLatency.Duration != 0 {
+		return fmt.Errorf("defaults.degraded_latency is unsupported; use healthy_latency and max_jitter/max_loss")
+	}
 	if cfg.Benchmark.DownloadBytes < 0 {
 		return fmt.Errorf("benchmark.download_bytes must be positive")
 	}
@@ -256,20 +293,40 @@ func applyDefaults(cfg *Config) error {
 	if cfg.SingBox.TestURL == "" {
 		cfg.SingBox.TestURL = DefaultTestURL
 	}
-	if err := validateHTTPURL("singbox.test_url", cfg.SingBox.TestURL); err != nil {
-		return err
-	}
-	if cfg.SingBox.Controller != "" {
+	if hasSingBoxEndpoint(cfg.Endpoints) {
+		if err := validateHTTPURL("singbox.test_url", cfg.SingBox.TestURL); err != nil {
+			return err
+		}
 		if err := validateHTTPURL("singbox.controller", cfg.SingBox.Controller); err != nil {
 			return err
 		}
-	}
-	if cfg.SingBox.BenchmarkProxy != "" {
-		if err := validateBenchmarkProxy(cfg.SingBox.BenchmarkProxy); err != nil {
-			return err
+		if cfg.SingBox.BenchmarkProxy != "" {
+			if err := validateBenchmarkProxy(cfg.SingBox.BenchmarkProxy); err != nil {
+				return err
+			}
+		}
+		// Resolve proxy credentials only when a proxy route can use them. A
+		// direct-only config must remain operational without sing-box or its
+		// secret file, including when stale sidecar settings are malformed.
+		if cfg.SingBox.SecretFile != "" {
+			expanded := expandPath(cfg.SingBox.SecretFile)
+			data, err := os.ReadFile(expanded)
+			if err != nil {
+				return fmt.Errorf("reading singbox secret file %s: %w", expanded, err)
+			}
+			s := strings.TrimSpace(string(data))
+			if s != "" {
+				cfg.SingBox.Secret = s
+			}
+		}
+		if env := os.Getenv("FROSTGATE_SINGBOX_SECRET"); env != "" {
+			cfg.SingBox.Secret = env
 		}
 	}
 	for i, dest := range cfg.NetworkCheck.Destinations {
+		if dest.Name != "" && redact.String(dest.Name) != dest.Name {
+			return fmt.Errorf("network_check.destinations[%d].name contains sensitive content", i)
+		}
 		if dest.URL == "" {
 			return fmt.Errorf("network_check.destinations[%d].url is required", i)
 		}
@@ -277,23 +334,16 @@ func applyDefaults(cfg *Config) error {
 			return err
 		}
 	}
-	// resolve secret file if set
-	if cfg.SingBox.SecretFile != "" {
-		expanded := expandPath(cfg.SingBox.SecretFile)
-		data, err := os.ReadFile(expanded)
-		if err != nil {
-			return fmt.Errorf("reading singbox secret file %s: %w", expanded, err)
-		}
-		s := strings.TrimSpace(string(data))
-		if s != "" {
-			cfg.SingBox.Secret = s
-		}
-	}
-	// env override: FROSTGATE_SINGBOX_SECRET env var wins if set
-	if env := os.Getenv("FROSTGATE_SINGBOX_SECRET"); env != "" {
-		cfg.SingBox.Secret = env
-	}
 	return nil
+}
+
+func hasSingBoxEndpoint(endpoints []Endpoint) bool {
+	for _, endpoint := range endpoints {
+		if endpoint.Type == ProbeSingBox {
+			return true
+		}
+	}
+	return false
 }
 
 func normalize(e *Endpoint, cfg *Config) error {
@@ -348,8 +398,9 @@ func normalize(e *Endpoint, cfg *Config) error {
 		}
 	}
 
-	// priority default already 0 if unset, keep as is; higher priority number = lower preference? Spec says lower or higher wins documented.
-	// We document lower wins (10 beats 20), but allow any int.
+	// Lower values are preferred only as a bounded close-result tie breaker.
+	// An explicit priority: 0 must remain distinct from an omitted priority.
+	e.Priority = cfg.PriorityFor(*e)
 
 	// validate per endpoint durations
 	if e.Timeout.Duration < 0 {
@@ -519,6 +570,19 @@ func (c *Config) MaxLossFor(e Endpoint) float64 {
 	}
 	if c.Defaults.MaxLoss != nil {
 		return *c.Defaults.MaxLoss
+	}
+	return 0
+}
+
+// PriorityFor applies defaults.priority only to endpoints which omitted
+// priority. Existing programmatic endpoints with non-zero values remain
+// explicit even though they did not pass through YAML unmarshalling.
+func (c *Config) PriorityFor(e Endpoint) int {
+	if e.prioritySet || e.Priority != 0 {
+		return e.Priority
+	}
+	if c.Defaults.Priority != nil {
+		return *c.Defaults.Priority
 	}
 	return 0
 }

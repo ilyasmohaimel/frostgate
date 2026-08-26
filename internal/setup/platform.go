@@ -3,6 +3,7 @@ package setup
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,12 +44,16 @@ func SingBoxReleaseURL(goos, goarch string) (string, error) {
 	return "https://github.com/SagerNet/sing-box/releases/download/v" + singBoxVersion + "/" + asset.Name, nil
 }
 
-func VerifySHA256(path, expected string) error {
+func VerifySHA256(path, expected string) (err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close %s: %w", path, closeErr))
+		}
+	}()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return fmt.Errorf("hash %s: %w", path, err)

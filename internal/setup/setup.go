@@ -3,6 +3,7 @@ package setup
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,11 +29,19 @@ type Options struct {
 	AddRoute func(dir, link, name string) error
 }
 
+var backupNow = time.Now
+
 func DefaultHomeDir() string {
+	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
+		return h
+	}
 	if h := os.Getenv("HOME"); h != "" {
 		return h
 	}
-	hd, _ := os.UserHomeDir()
+	hd, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
 	return hd
 }
 
@@ -102,29 +111,6 @@ func RunInteractive(opts Options) error {
 	}
 	fmt.Printf("config directory ready: %s (0700)\n", dir)
 
-	// sing-box detection
-	sbPath, err := exec.LookPath("sing-box")
-	if err != nil {
-		fmt.Println("\nsing-box not found in PATH")
-		fmt.Println("Frostgate uses sing-box as the protocol engine (no proxy protocols are reimplemented in Frostgate).")
-		install := prompt(opts.Stdin, "Install sing-box now? [Y/n]: ")
-		if !isNo(install) {
-			var installErr error
-			sbPath, installErr = tryInstallSingBox(opts)
-			if installErr != nil {
-				fmt.Printf("Automatic install failed: %v\n", installErr)
-				fmt.Println("Please install sing-box manually: https://sing-box.sagernet.org/installation/")
-				return installErr
-			}
-		} else {
-			fmt.Println("Continuing without sing-box. Only direct checks will work until it is installed.")
-		}
-	}
-	if sbPath != "" {
-		ver := getSingBoxVersion(sbPath)
-		fmt.Printf("sing-box found: %s (%s)\n", ver, sbPath)
-	}
-
 	// Choose setup type
 	fmt.Println("\nHow do you want to configure Frostgate?")
 	fmt.Println("  1) Import proxy route(s) (VLESS/Hysteria2 share links)")
@@ -136,6 +122,10 @@ func RunInteractive(opts Options) error {
 	}
 	switch choice {
 	case "1":
+		sbPath, err := prepareSingBoxForImport(opts)
+		if err != nil {
+			return err
+		}
 		return importFlow(opts, dir, sbPath)
 	case "2":
 		return existingControllerFlow(opts, dir)
@@ -143,8 +133,39 @@ func RunInteractive(opts Options) error {
 		return directOnlyFlow(opts, dir)
 	default:
 		fmt.Println("Invalid choice, defaulting to import")
+		sbPath, err := prepareSingBoxForImport(opts)
+		if err != nil {
+			return err
+		}
 		return importFlow(opts, dir, sbPath)
 	}
+}
+
+// prepareSingBoxForImport checks for the proxy engine only after the user
+// selected a proxy-import flow. Direct-only and external-controller setup do
+// not need it and must not prompt for, install, or configure sing-box.
+func prepareSingBoxForImport(opts Options) (string, error) {
+	sbPath, err := exec.LookPath("sing-box")
+	if err != nil {
+		fmt.Println("\nsing-box not found in PATH")
+		fmt.Println("Frostgate uses sing-box as the protocol engine (no proxy protocols are reimplemented in Frostgate).")
+		install := prompt(opts.Stdin, "Install sing-box now? [Y/n]: ")
+		if !isNo(install) {
+			sbPath, err = tryInstallSingBox(opts)
+			if err != nil {
+				fmt.Printf("Automatic install failed: %v\n", redact.Error(err))
+				fmt.Println("Please install sing-box manually: https://sing-box.sagernet.org/installation/")
+				return "", err
+			}
+		} else {
+			fmt.Println("Continuing without sing-box. Proxy routes cannot be tested until it is installed.")
+		}
+	}
+	if sbPath != "" {
+		ver := getSingBoxVersion(sbPath)
+		fmt.Printf("sing-box found: %s (%s)\n", ver, sbPath)
+	}
+	return sbPath, nil
 }
 
 func prompt(r *bufio.Reader, msg string) string {
@@ -159,10 +180,25 @@ func isNo(s string) bool {
 }
 
 func backupExisting(dir string) error {
-	ts := time.Now().Format("20060102T150405")
-	backupDir := filepath.Join(dir, "backup-"+ts)
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
-		return fmt.Errorf("create backup: %w", err)
+	ts := backupNow().Format("20060102T150405")
+	backupBase := filepath.Join(dir, "backup-"+ts)
+	backupDir := ""
+	for suffix := 0; suffix < 1000; suffix++ {
+		candidate := backupBase
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s-%d", backupBase, suffix)
+		}
+		err := os.Mkdir(candidate, 0o700)
+		if err == nil {
+			backupDir = candidate
+			break
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("create backup: %w", err)
+		}
+	}
+	if backupDir == "" {
+		return fmt.Errorf("create backup: too many backups with timestamp %s", ts)
 	}
 	for _, name := range []string{"config.yaml", "sing-box.json", "controller-secret"} {
 		src := filepath.Join(dir, name)
@@ -237,11 +273,15 @@ func tryInstallSingBox(opts Options) (string, error) {
 		}
 		bin := filepath.Join(tmpDir, strings.TrimSuffix(asset.Name, ".tar.gz"), "sing-box")
 		if _, err := os.Stat(bin); err != nil {
-			out, _ := exec.Command("find", tmpDir, "-name", "sing-box", "-type", "f").Output()
-			bin = strings.TrimSpace(string(out))
-			if bin == "" {
+			out, findErr := exec.Command("find", tmpDir, "-name", "sing-box", "-type", "f").Output()
+			if findErr != nil {
+				return "", fmt.Errorf("find sing-box binary in verified archive: %w", findErr)
+			}
+			matches := strings.Fields(string(out))
+			if len(matches) != 1 {
 				return "", fmt.Errorf("sing-box binary not found in verified archive")
 			}
+			bin = matches[0]
 		}
 		if err := exec.Command(bin, "version").Run(); err != nil {
 			return "", fmt.Errorf("downloaded sing-box failed version check: %w", err)
@@ -282,7 +322,10 @@ func getSingBoxVersion(path string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "unknown"
+	}
 	s := strings.TrimSpace(string(out))
 	if len(s) > 100 {
 		s = s[:100]
@@ -358,7 +401,6 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 			}
 		}
 	}
-
 	// Direct baseline offer
 	testURL := "https://www.gstatic.com/generate_204"
 	useDirect := prompt(opts.Stdin, fmt.Sprintf("Add direct baseline (%s)? [Y/n]: ", testURL))
@@ -372,6 +414,21 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 			addDirect = false
 		}
 	}
+	if len(vlessOut)+len(hystOut) == 0 {
+		if !addDirect {
+			return fmt.Errorf("at least one route or direct baseline is required")
+		}
+		content, err := yaml.Marshal(BuildDirectOnlyConfig(testURL))
+		if err != nil {
+			return fmt.Errorf("encode direct-only Frostgate config: %w", err)
+		}
+		fgPath := filepath.Join(dir, "config.yaml")
+		if err := WriteFileSecure(fgPath, content); err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s (direct only)\n", fgPath)
+		return runValidation(dir)
+	}
 
 	// Controller secret
 	secretFile := filepath.Join(dir, "controller-secret")
@@ -379,6 +436,8 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	if data, err := os.ReadFile(secretFile); err == nil {
 		secret = strings.TrimSpace(string(data))
 		fmt.Println("using existing controller secret")
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read existing controller secret: %w", err)
 	} else {
 		s, err := GenerateSecret()
 		if err != nil {
@@ -586,6 +645,16 @@ func installSystemdService(dir, binaryPath string) error {
 }
 
 func runValidation(dir string, knownSingBoxPath ...string) error {
+	fgPath := filepath.Join(dir, "config.yaml")
+	cfg, err := config.Load(fgPath)
+	if err != nil {
+		fmt.Printf("config check failed: %s\n", redact.Error(err))
+		return err
+	}
+	if !hasProxyEndpoints(cfg) {
+		fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))
+		return nil
+	}
 	sbPath := ""
 	if len(knownSingBoxPath) > 0 {
 		sbPath = knownSingBoxPath[0]
@@ -603,26 +672,39 @@ func runValidation(dir string, knownSingBoxPath ...string) error {
 			}
 		}
 	}
-	fgPath := filepath.Join(dir, "config.yaml")
-	cfg, err := config.Load(fgPath)
-	if err != nil {
-		fmt.Printf("config check failed: %s\n", redact.Error(err))
-		return err
-	}
 	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))
 	return nil
 }
 
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+func hasProxyEndpoints(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, ep := range cfg.Endpoints {
+		if ep.Type == config.ProbeSingBox {
+			return true
+		}
+	}
+	return false
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".frostgate-install-*")
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	installed := false
+	defer func() {
+		if installed {
+			return
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, fmt.Errorf("remove temporary file: %w", removeErr))
+		}
+	}()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -630,5 +712,9 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	installed = true
+	return nil
 }

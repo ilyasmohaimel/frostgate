@@ -11,6 +11,13 @@ var proxyURLRe = regexp.MustCompile(`(?i)(vless|hysteria2|hy2)://[^\s"']+`)
 var httpURLRe = regexp.MustCompile(`(?i)https?://[^\s"']+`)
 var bearerRe = regexp.MustCompile(`(?i)bearer\s+[^\s,"']+`)
 
+const sensitiveKeyPattern = `uuid|pbk|public[_-]?key|short[_-]?id|sid|password|obfs[_-]?password|controller[_-]?secret|authorization|token|secret|auth|auth[_-]?str|access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key`
+
+var sensitiveKVRe = regexp.MustCompile(`(?i)(["']?\b(?:` + sensitiveKeyPattern + `)\b["']?)\s*[:=]\s*["']?[^\s,;&"']+`)
+var sensitiveQuotedDoubleKVRe = regexp.MustCompile(`(?i)(["']?\b(?:` + sensitiveKeyPattern + `)\b["']?\s*[:=]\s*)"(?:\\.|[^"])*"`)
+var sensitiveQuotedSingleKVRe = regexp.MustCompile(`(?i)(["']?\b(?:` + sensitiveKeyPattern + `)\b["']?\s*[:=]\s*)'(?:\\.|[^'])*'`)
+var authorizationHeaderRe = regexp.MustCompile(`(?i)authorization\s*:\s*[^\r\n]+`)
+
 func URL(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -19,18 +26,13 @@ func URL(s string) string {
 	lower := strings.ToLower(s)
 	if strings.HasPrefix(lower, "vless://") || strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") {
 		if u, err := url.Parse(s); err == nil {
-			u.User = url.UserPassword("REDACTED", "REDACTED")
-			q := u.Query()
-			for _, k := range []string{"pbk", "sid", "sni", "fp", "flow", "type", "security", "encryption", "host", "path", "serviceName", "alpn", "fp", "pbk", "sid", "spx", "sni", "obfs", "obfs-password", "obfsPassword", "pinSHA256", "pin", "insecure"} {
-				if q.Get(k) != "" {
-					q.Set(k, "REDACTED")
-				}
+			// Share links are credentials. Preserve at most their protocol and
+			// host, never individual query keys or fragments which providers
+			// commonly use for tokens and names.
+			if u.Host != "" {
+				return strings.ToLower(u.Scheme) + "://" + u.Host + "/[REDACTED]"
 			}
-			u.RawQuery = q.Encode()
-			if u.Fragment != "" {
-				u.Fragment = "REDACTED"
-			}
-			return u.String()
+			return strings.ToLower(u.Scheme) + "://[REDACTED]"
 		}
 		return lower[:6] + "[redacted]"
 	}
@@ -58,6 +60,12 @@ func URL(s string) string {
 		return u.Scheme + "://" + u.Host + "/[redacted]" + suffix
 	})
 	s = bearerRe.ReplaceAllString(s, "Bearer [REDACTED]")
+	s = authorizationHeaderRe.ReplaceAllString(s, "Authorization: [REDACTED]")
+	// Do this before the bare token expression so a secret containing spaces
+	// cannot leave its trailing words visible in JSON, YAML, or shell errors.
+	s = sensitiveQuotedDoubleKVRe.ReplaceAllString(s, `$1"[REDACTED]"`)
+	s = sensitiveQuotedSingleKVRe.ReplaceAllString(s, `$1'[REDACTED]'`)
+	s = sensitiveKVRe.ReplaceAllString(s, "$1=[REDACTED]")
 	s = uuidRe.ReplaceAllString(s, "REDACTED-UUID")
 	// If it looks like a URL with query, redact query
 	if idx := strings.Index(s, "?"); idx != -1 {

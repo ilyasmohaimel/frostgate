@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +33,7 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/network"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/ranking"
 	"github.com/ilyasmohaimel/frostgate/internal/recommend"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
@@ -56,15 +60,7 @@ func run() int {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
 		case "setup":
-			home := setup.DefaultHomeDir()
-			if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
-				home = h
-			}
-			if err := runInteractiveSetup(home); err != nil {
-				fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
-				return 3
-			}
-			return 0
+			return handleSetup(os.Args[2:])
 		case "doctor":
 			fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
@@ -84,7 +80,11 @@ func run() int {
 				fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(fs.Arg(0)))
 				return 3
 			}
-			path, managedDir := commandPaths(*cfgPath)
+			path, managedDir, pathErr := commandPathsChecked(*cfgPath)
+			if pathErr != nil {
+				fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+				return 3
+			}
 			checks := doctor.RunForProfile(path, managedDir, *verbose)
 			fmt.Print(doctor.FormatColor(checks))
 			for _, c := range checks {
@@ -147,6 +147,10 @@ func run() int {
 		return 0
 	}
 	if *setupFlag {
+		if *cfgPath != "" {
+			fmt.Fprintln(os.Stderr, "--config is not supported with --setup; setup initializes only the historical default profile")
+			return 3
+		}
 		home := setup.DefaultHomeDir()
 		if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 			home = h
@@ -158,7 +162,11 @@ func run() int {
 		return 0
 	}
 	if *doctorFlag {
-		path, managedDir := commandPaths(*cfgPath)
+		path, managedDir, pathErr := commandPathsChecked(*cfgPath)
+		if pathErr != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+			return 3
+		}
 		checks := doctor.RunForProfile(path, managedDir, *verbose)
 		fmt.Print(doctor.FormatColor(checks))
 		for _, c := range checks {
@@ -168,7 +176,11 @@ func run() int {
 		}
 		return 0
 	}
-	resolved, managedDir := commandPaths(*cfgPath)
+	resolved, managedDir, pathErr := commandPathsChecked(*cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	if *checkFlag {
 		if _, err := config.Load(resolved); err != nil {
 			fmt.Fprintf(os.Stderr, "config check FAIL: %s\n", sanitizeError(err))
@@ -189,11 +201,15 @@ func run() int {
 		return 3
 	}
 	if *timeout > 0 {
-		cfg.Defaults.Timeout.Duration = *timeout
+		applyTimeoutOverride(cfg, *timeout)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	if *watch {
+		if *interval <= 0 {
+			fmt.Fprintln(os.Stderr, "--interval must be positive in --watch mode")
+			return 3
+		}
 		profileID := historyProfileForPaths(resolved, managedDir)
 		if *jsonOut {
 			return watchJSON(ctx, cfg, profileID, *interval, *verbose)
@@ -203,12 +219,45 @@ func run() int {
 	res := probe.Run(ctx, cfg)
 	profileID := historyProfileForPaths(resolved, managedDir)
 	rec := newRecorder(cfg, profileID)
-	defer rec.Close()
-	if err := rec.Record(history.FromProbeResults(res, nil, "", profileID)); err != nil {
-		fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+	historyErr := rec.Record(history.FromProbeResults(res, nil, "", profileID))
+	if closeErr := rec.Close(); closeErr != nil {
+		historyErr = errors.Join(historyErr, closeErr)
 	}
-	emit(res, *jsonOut, *verbose)
+	if historyErr != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(historyErr))
+	}
+	if err := emit(res, *jsonOut, *verbose); err != nil {
+		fmt.Fprintln(os.Stderr, "frostgate:", sanitizeError(err))
+		return 3
+	}
+	if historyErr != nil {
+		return 3
+	}
 	return exitCode(res)
+}
+
+func handleSetup(args []string) int {
+	if len(args) > 0 {
+		if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+			fmt.Fprintln(os.Stdout, "usage: frostgate setup")
+			return 0
+		}
+		if args[0] == "--config" || strings.HasPrefix(args[0], "--config=") {
+			fmt.Fprintln(os.Stderr, "--config is not supported with setup; setup initializes only the historical default profile")
+		} else {
+			fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(args[0]))
+		}
+		return 3
+	}
+	home := setup.DefaultHomeDir()
+	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
+		home = h
+	}
+	if err := runInteractiveSetup(home); err != nil {
+		fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
+		return 3
+	}
+	return 0
 }
 
 func runInteractiveSetup(home string) error {
@@ -275,7 +324,7 @@ func handleAdd(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
-	if len(positionals) == 0 {
+	if len(positionals) != 1 {
 		fmt.Fprintln(os.Stderr, "usage: frostgate add <link> [--name name]")
 		return 3
 	}
@@ -284,8 +333,20 @@ func handleAdd(args []string) int {
 		fmt.Fprintln(os.Stderr, "empty link")
 		return 3
 	}
-	cfgPath2, dir := commandPaths(cfgPath)
+	cfgPath2, dir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
+	rollbackMigration, finalizeMigration, err := prepareManagedStateWithRollback(cfgPath2, dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
 	if err := setup.EnsureConfigDir(dir); err != nil {
+		if rollbackErr := rollbackMigration(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
@@ -296,19 +357,30 @@ func handleAdd(args []string) int {
 	fmt.Println("Importing route...")
 	result, err := addManagedRoute(dir, cfgPath2, link, tag, nil)
 	if err != nil {
+		if rollbackErr := rollbackMigration(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	if result.AlreadyExists {
+		if err := rollbackMigration(); err != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			return 3
+		}
 		fmt.Printf("Route already exists: %s\n", result.Tag)
 		return 0
+	}
+	if err := finalizeMigration(); err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
 	}
 	fmt.Println("sing-box config valid")
 	fmt.Println("sidecar reloaded and verified")
 	fmt.Println("Testing new route...")
 	cfg, err := config.Load(cfgPath2)
 	if err != nil {
-		fmt.Println("config load failed")
+		fmt.Fprintln(os.Stderr, "config load failed:", sanitizeError(err))
 		return 3
 	}
 	var ep *config.Endpoint
@@ -327,7 +399,11 @@ func handleAdd(args []string) int {
 			fmt.Println("Route added, but test failed. Run frostgate diagnose.")
 			return 1
 		}
-		fmt.Printf("\n%s\nLatency: %dms\nLoss: %.0f%%\nJitter: %dms\n", tag, res.Metrics.Median.Milliseconds(), res.Metrics.LossPct, res.Metrics.Jitter.Milliseconds())
+		jitter := "N/A"
+		if res.Metrics.JitterKnown {
+			jitter = fmtDuration(res.Metrics.Jitter)
+		}
+		fmt.Printf("\n%s\nLatency: %s\nLoss: %.0f%%\nJitter: %s\n", tag, resultMedian(res), res.Metrics.LossPct, jitter)
 	}
 	fmt.Println("\nRoute added.")
 	return 0
@@ -365,8 +441,13 @@ func handleImport(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
-	if len(positionals) == 0 {
+	if len(positionals) != 1 {
 		fmt.Fprintln(os.Stderr, "usage: frostgate import <subscription-url> [--allow-insecure-http]")
+		return 3
+	}
+	cfgPath2, dir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 		return 3
 	}
 	subURL := positionals[0]
@@ -385,14 +466,24 @@ func handleImport(args []string) int {
 		return 3
 	}
 	fmt.Printf("Found %d links, %d skipped\n", len(res.Links), len(res.Skipped))
-	cfgPath2, dir := commandPaths(cfgPath)
+	rollbackMigration, finalizeMigration, err := prepareManagedStateWithRollback(cfgPath2, dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
 	if err := setup.EnsureConfigDir(dir); err != nil {
+		if rollbackErr := rollbackMigration(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	// Deduplicate via fingerprint against existing and within subscription
 	mg, err := managedconfig.Load(dir)
 	if err != nil {
+		if rollbackErr := rollbackMigration(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
 		fmt.Fprintln(os.Stderr, "load managed config:", sanitizeError(err))
 		return 3
 	}
@@ -440,6 +531,10 @@ func handleImport(args []string) int {
 		toAdd = append(toAdd, r)
 	}
 	if len(toAdd) == 0 {
+		if err := rollbackMigration(); err != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			return 3
+		}
 		fmt.Fprintln(os.Stderr, "all routes were duplicates or invalid")
 		return 3
 	}
@@ -456,6 +551,13 @@ func handleImport(args []string) int {
 		tags = append(tags, imported.Tag)
 	}
 	if err := commitManagedRoutes(mg, cfgPath2, tags, nil); err != nil {
+		if rollbackErr := rollbackMigration(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
+	if err := finalizeMigration(); err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
@@ -467,29 +569,31 @@ func handleImport(args []string) int {
 		}
 	}
 	cfg, err := config.Load(cfgPath2)
-	if err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		results := probe.Run(ctx, cfg)
-		cancel()
-		fmt.Println("\nTESTING...")
-		for i, r := range results {
-			status := string(r.Status)
-			fmt.Printf("%2d. %-20s %-8s %4.0f%% %6s\n", i+1, r.Endpoint.Name, status, r.Metrics.LossPct, fmtDuration(r.Metrics.Median))
-		}
-		usable := 0
-		for _, r := range results {
-			if r.Status != "down" {
-				usable++
-			}
-		}
-		fmt.Printf("\n%d/%d usable.\n", usable, len(results))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "load imported config:", sanitizeError(err))
+		return 3
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	results := probe.Run(ctx, cfg)
+	cancel()
+	fmt.Println("\nTESTING...")
+	for i, r := range results {
+		status := string(r.Status)
+		fmt.Printf("%2d. %-20s %-8s %4.0f%% %6s\n", i+1, r.Endpoint.Name, status, r.Metrics.LossPct, resultMedian(r))
+	}
+	usable := 0
+	for _, r := range results {
+		if r.Status != "down" {
+			usable++
+		}
+	}
+	fmt.Printf("\n%d/%d usable.\n", usable, len(results))
 	return 0
 }
 
 // --- test ---
 
-func handleTest(args []string) int {
+func handleTest(args []string) (exitCode int) {
 	jsonOut := false
 	var positionals []string
 	for i := 0; i < len(args); i++ {
@@ -506,7 +610,7 @@ func handleTest(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
-	if len(positionals) == 0 {
+	if len(positionals) != 1 {
 		fmt.Fprintln(os.Stderr, "usage: frostgate test <link> [--json]")
 		return 3
 	}
@@ -525,9 +629,21 @@ func handleTest(args []string) int {
 	if err != nil {
 		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
 	}
-	defer os.RemoveAll(tmpDir)
-	os.Chmod(tmpDir, 0o700)
-	secret, _ := setup.GenerateSecret()
+	defer func() {
+		if cleanupErr := os.RemoveAll(tmpDir); cleanupErr != nil {
+			fmt.Fprintln(os.Stderr, "remove temporary test state:", sanitizeError(cleanupErr))
+			if exitCode == 0 {
+				exitCode = 3
+			}
+		}
+	}()
+	if err := os.Chmod(tmpDir, 0o700); err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("secure temporary directory: %w", err), 3)
+	}
+	secret, err := setup.GenerateSecret()
+	if err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("generate controller secret: %w", err), 3)
+	}
 	var vlessOut []*setup.VLESSOutbound
 	var hystOut []*setup.Hysteria2Outbound
 	if r.VLESS != nil {
@@ -536,10 +652,19 @@ func handleTest(args []string) int {
 	if r.Hysteria != nil {
 		hystOut = append(hystOut, r.Hysteria)
 	}
-	port := freePort()
-	mixedPort := freePort()
-	if mixedPort == port {
-		mixedPort = freePort()
+	port, err := freePort()
+	if err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
+	}
+	mixedPort, err := freePort()
+	if err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
+	}
+	for mixedPort == port {
+		mixedPort, err = freePort()
+		if err != nil {
+			return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
+		}
 	}
 	controller := fmt.Sprintf("http://127.0.0.1:%d", port)
 	singData, err := setup.GenerateSingBoxConfig(secret, vlessOut, hystOut, tmpDir)
@@ -547,7 +672,9 @@ func handleTest(args []string) int {
 		return testCommandFailure(jsonOut, r.Protocol, "error", err, 3)
 	}
 	var cfgMap map[string]any
-	json.Unmarshal(singData, &cfgMap)
+	if err := json.Unmarshal(singData, &cfgMap); err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("parse generated sing-box config: %w", err), 3)
+	}
 	if exp, ok := cfgMap["experimental"].(map[string]any); ok {
 		if clash, ok := exp["clash_api"].(map[string]any); ok {
 			clash["external_controller"] = fmt.Sprintf("127.0.0.1:%d", port)
@@ -559,10 +686,17 @@ func handleTest(args []string) int {
 			m["listen_port"] = float64(mixedPort)
 		}
 	}
-	singData, _ = json.Marshal(cfgMap)
+	singData, err = json.Marshal(cfgMap)
+	if err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("encode generated sing-box config: %w", err), 3)
+	}
 	singPath := filepath.Join(tmpDir, "sing-box.json")
-	os.WriteFile(singPath, singData, 0o600)
-	os.Chmod(singPath, 0o600)
+	if err := os.WriteFile(singPath, singData, 0o600); err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("write temporary sing-box config: %w", err), 3)
+	}
+	if err := os.Chmod(singPath, 0o600); err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("secure temporary sing-box config: %w", err), 3)
+	}
 	if sbPath, err := exec.LookPath("sing-box"); err == nil {
 		cmd := exec.Command(sbPath, "check", "-c", singPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -575,7 +709,10 @@ func handleTest(args []string) int {
 	defer cancel()
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	sbPath, _ := exec.LookPath("sing-box")
+	sbPath, err := exec.LookPath("sing-box")
+	if err != nil {
+		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box not found: %w", err), 3)
+	}
 	cmd := exec.CommandContext(ctx, sbPath, "run", "-c", singPath)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -584,19 +721,18 @@ func handleTest(args []string) int {
 	}
 	defer func() {
 		if cmd.Process != nil {
-			cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Process.Signal(syscall.SIGTERM)
 			done := make(chan struct{})
 			go func() {
-				cmd.Wait()
+				_ = cmd.Wait()
 				close(done)
 			}()
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
-				cmd.Process.Kill()
+				_ = cmd.Process.Kill()
 			}
 		}
-		os.RemoveAll(tmpDir)
 	}()
 	client := singbox.New(controller, secret)
 	var ready bool
@@ -622,7 +758,10 @@ func handleTest(args []string) int {
 	cancel2()
 	if err != nil {
 		if jsonOut {
-			json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "down", "error": sanitizeError(err)})
+			if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "down", "error": sanitizeError(err)}); err != nil {
+				fmt.Fprintln(os.Stderr, "encode test JSON:", sanitizeError(err))
+				return 3
+			}
 		} else {
 			fmt.Printf("Protocol: %s\nStatus:   DOWN\nError: %s\n\nThis route was NOT saved.\nUse `frostgate add` to keep it.\n", strings.ToUpper(r.Protocol), sanitizeError(err))
 		}
@@ -639,9 +778,12 @@ func handleTest(args []string) int {
 		}
 	}
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "up", "median_ms": delay.Milliseconds(), "download_mbps": mbps})
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"protocol": strings.ToUpper(r.Protocol), "status": "up", "median_ms": delay.Milliseconds(), "download_mbps": mbps}); err != nil {
+			fmt.Fprintln(os.Stderr, "encode test JSON:", sanitizeError(err))
+			return 3
+		}
 	} else {
-		fmt.Printf("Protocol: %s\nStatus:   HEALTHY\nLoss:     0%%\nMedian:   %dms\nJitter:   0ms\n", strings.ToUpper(r.Protocol), delay.Milliseconds())
+		fmt.Printf("Protocol: %s\nStatus:   HEALTHY\nLoss:     0%%\nMedian:   %dms\nJitter:   N/A\n", strings.ToUpper(r.Protocol), delay.Milliseconds())
 		if mbps > 0 {
 			fmt.Printf("Download: %.1f Mbps\n", mbps)
 		}
@@ -654,25 +796,30 @@ func handleTest(args []string) int {
 func testCommandFailure(asJSON bool, protocol, status string, err error, code int) int {
 	safe := sanitizeError(err)
 	if asJSON {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(map[string]any{
 			"protocol": strings.ToUpper(protocol),
 			"status":   status,
 			"error":    safe,
-		})
+		}); encodeErr != nil {
+			fmt.Fprintln(os.Stderr, "encode test JSON:", sanitizeError(encodeErr))
+			return 3
+		}
 	} else {
 		fmt.Fprintln(os.Stderr, safe)
 	}
 	return code
 }
 
-func freePort() int {
+func freePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return 2081
+		return 0, fmt.Errorf("reserve temporary loopback port: %w", err)
 	}
-	defer l.Close()
 	addr := l.Addr().(*net.TCPAddr)
-	return addr.Port
+	if err := l.Close(); err != nil {
+		return 0, fmt.Errorf("release temporary loopback port: %w", err)
+	}
+	return addr.Port, nil
 }
 
 // --- benchmark ---
@@ -708,12 +855,33 @@ func handleBenchmark(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
-	_ = positionals
-	cfgFile, managedDir := commandPaths(cfgPath)
+	if len(positionals) != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(positionals[0]))
+		return 3
+	}
+	cfgFile, managedDir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
+	}
+	// A pre-v0.4.9 explicit profile stored its sidecar beside the config. A
+	// benchmark needs the managed listener, so it is the one read-oriented
+	// command that must complete a proven legacy migration before measuring.
+	// Otherwise it could silently use or report the wrong profile's listener.
+	if migrated, migrateErr := migrateLegacyProfileForBenchmarkIfNeeded(cfg, cfgFile, managedDir); migrateErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(migrateErr))
+		return 3
+	} else if migrated {
+		cfg, err = config.Load(cfgFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			return 3
+		}
 	}
 	bytesPerRoute := cfg.Benchmark.DownloadBytes
 	if bytesPerRoute == 0 {
@@ -724,7 +892,7 @@ func handleBenchmark(args []string) int {
 		downloadURL = benchmark.DefaultDownloadURL
 	}
 	routes := len(cfg.Endpoints)
-	totalBytes := int64(routes) * bytesPerRoute
+	totalBytes := saturatingPositiveProduct(int64(routes), bytesPerRoute)
 	if !noSpeed && routes > 10 {
 		msg := fmt.Sprintf("%d routes selected. Default benchmark will transfer ~%d MiB.\n", routes, totalBytes/1024/1024)
 		if jsonOut {
@@ -735,11 +903,18 @@ func handleBenchmark(args []string) int {
 			fmt.Print("Continue? [y/N]: ")
 		}
 		reader := bufio.NewReader(os.Stdin)
-		ans, _ := reader.ReadString('\n')
+		ans, readErr := reader.ReadString('\n')
+		if readErr != nil && strings.TrimSpace(ans) == "" {
+			fmt.Fprintln(os.Stderr, "benchmark confirmation:", sanitizeError(readErr))
+			return 3
+		}
 		if !strings.EqualFold(strings.TrimSpace(ans), "y") && !strings.EqualFold(strings.TrimSpace(ans), "yes") {
 			if jsonOut {
 				fmt.Fprintln(os.Stderr, "Cancelled")
-				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"status": "cancelled", "results": []any{}})
+				if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"status": "cancelled", "results": []any{}}); err != nil {
+					fmt.Fprintln(os.Stderr, "encode benchmark JSON:", sanitizeError(err))
+					return 3
+				}
 			} else {
 				fmt.Println("Cancelled")
 			}
@@ -779,9 +954,12 @@ func handleBenchmark(args []string) int {
 					br.DownloadNA = "direct baseline"
 				} else {
 					sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-					mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
+					mbps, _, measureErr := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
 					scancel()
 					br.Download = mbps
+					if measureErr != nil {
+						br.DownloadNA = "direct throughput measurement failed"
+					}
 				}
 				downloads[r.Endpoint.Name] = br.Download
 				bres = append(bres, br)
@@ -795,9 +973,12 @@ func handleBenchmark(args []string) int {
 						br.DownloadNA = "direct baseline"
 					} else {
 						sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
-						mbps, _, _ := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
+						mbps, _, measureErr := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
 						scancel()
 						br.Download = mbps
+						if measureErr != nil {
+							br.DownloadNA = "direct throughput measurement failed"
+						}
 					}
 					downloads[r.Endpoint.Name] = br.Download
 					bres = append(bres, br)
@@ -848,32 +1029,45 @@ func handleBenchmark(args []string) int {
 	// History via the central recorder (honors enabled/retention/watch_interval).
 	profileID := historyProfileForPaths(cfgFile, managedDir)
 	recCfg := newRecorder(cfg, profileID)
-	defer recCfg.Close()
+	var historyErr error
 	if recCfg.Enabled() {
-		if err := recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel, profileID)); err != nil {
-			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
-		}
+		historyErr = recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel, profileID))
+	}
+	if closeErr := recCfg.Close(); closeErr != nil {
+		historyErr = errors.Join(historyErr, closeErr)
+	}
+	if historyErr != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(historyErr))
 	}
 	if jsonOut {
+		networkOutput := networkLabel
+		if networkOutput != "" {
+			networkOutput = redact.String(networkOutput)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(map[string]any{"schema_version": 3, "results": bres, "network": networkLabel})
+		if err := enc.Encode(map[string]any{"schema_version": report.JSONSchemaVersion, "results": bres, "network": networkOutput}); err != nil {
+			fmt.Fprintln(os.Stderr, "encode benchmark JSON:", sanitizeError(err))
+			return 3
+		}
+		if historyErr != nil {
+			return 3
+		}
 		return exitCode(results)
 	}
 	fmt.Println("\nFROSTGATE BENCHMARK")
 	if d, ok := probe.DirectBaseline(results); ok {
-		lat := "—"
-		if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
-			lat = fmtDuration(d.Metrics.Median)
-		}
-		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), lat)
+		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), resultMedian(d))
 	}
 	fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", "ROUTE", "STATUS", "LOSS", "MEDIAN", "JITTER", "DOWNLOAD")
 	for _, br := range bres {
 		status := string(br.Result.Status)
 		loss := fmt.Sprintf("%.0f%%", br.Result.Metrics.LossPct)
-		median := fmtDuration(br.Result.Metrics.Median)
-		jitter := fmtDuration(br.Result.Metrics.Jitter)
+		median := resultMedian(br.Result)
+		jitter := "N/A"
+		if br.Result.Metrics.JitterKnown {
+			jitter = fmtDuration(br.Result.Metrics.Jitter)
+		}
 		down := fmt.Sprintf("%.0f Mbps", br.Download)
 		if br.Download <= 0 {
 			down = "N/A"
@@ -883,7 +1077,10 @@ func handleBenchmark(args []string) int {
 		}
 		fmt.Printf("%-20s %-8s %4s %7s %7s %10s\n", br.Result.Endpoint.Name, status, loss, median, jitter, down)
 	}
-	rec := recommendFromResultsWithDownloads(cfg, results, func(name string) float64 { return downloads[name] }, cfgFile, managedDir)
+	rec, recommendErr := recommendFromResultsWithDownloads(cfg, results, func(name string) float64 { return downloads[name] }, cfgFile, managedDir)
+	if recommendErr != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(recommendErr))
+	}
 	if rec.BestOverall.Name != "" {
 		fmt.Printf("\nBest proxy: %s\n", rec.BestOverall.Name)
 		if why := compactReasons(rec.Reasons); why != "" {
@@ -894,6 +1091,9 @@ func handleBenchmark(args []string) int {
 		}
 	} else if probe.HasProxy(results) {
 		fmt.Println("\nBest proxy: none usable")
+	}
+	if historyErr != nil || recommendErr != nil {
+		return 3
 	}
 	return exitCode(results)
 }
@@ -919,6 +1119,56 @@ func compactReasons(reasons []string) string {
 
 func benchmarkProxyAddr(cfg *config.Config, configPath, managedDir string) (string, string) {
 	return benchmarkProxyAddrWithRunner(cfg, configPath, managedDir, nil)
+}
+
+// migrateLegacyProfileForBenchmark makes an old parent-directory sidecar
+// usable only when prepareManagedState has proved its ownership. It is kept
+// separate from read-only diagnostics: benchmark changes selector/listener
+// state by definition, whereas doctor and diagnose must never start or move a
+// user service as a side effect.
+func migrateLegacyProfileForBenchmark(configPath, managedDir string) (bool, error) {
+	if managedDir != profile.StateDir(configPath) {
+		return false, nil
+	}
+	if _, err := os.Lstat(managedDir); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect profile state: %w", err)
+	}
+	rollback, finalize, err := prepareManagedStateWithRollback(configPath, managedDir)
+	if err != nil {
+		return false, err
+	}
+	// No state was copied, so this is a direct-only or brand-new profile.
+	if _, err := os.Lstat(managedDir); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("inspect migrated profile state: %w", err)
+	}
+	mg, err := managedconfig.Load(managedDir)
+	if err != nil {
+		if rollbackErr := rollback(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
+		return false, fmt.Errorf("load migrated managed config: %w", err)
+	}
+	if err := commitManagedRoutes(mg, configPath, nil, nil); err != nil {
+		if rollbackErr := rollback(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
+		return false, fmt.Errorf("activate migrated profile: %w", err)
+	}
+	if err := finalize(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func migrateLegacyProfileForBenchmarkIfNeeded(cfg *config.Config, configPath, managedDir string) (bool, error) {
+	if !hasProxyEndpoints(cfg) {
+		return false, nil
+	}
+	return migrateLegacyProfileForBenchmark(configPath, managedDir)
 }
 
 func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir string, runner *managedconfig.SidecarRunner) (string, string) {
@@ -958,12 +1208,29 @@ func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir str
 
 func fmtDuration(d time.Duration) string {
 	if d == 0 {
-		return "—"
+		return "0ms"
 	}
 	if d < time.Millisecond {
 		return "<1ms"
 	}
 	return fmt.Sprintf("%dms", d.Milliseconds())
+}
+
+func resultMedian(r probe.Result) string {
+	if r.Metrics.Succeeded == 0 {
+		return "N/A"
+	}
+	return fmtDuration(r.Metrics.Median)
+}
+
+func saturatingPositiveProduct(left, right int64) int64 {
+	if left <= 0 || right <= 0 {
+		return 0
+	}
+	if left > math.MaxInt64/right {
+		return math.MaxInt64
+	}
+	return left * right
 }
 
 // --- diagnose ---
@@ -990,8 +1257,16 @@ func handleDiagnose(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
+	if len(positionals) > 1 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(positionals[1]))
+		return 3
+	}
 	rest := positionals
-	cfgFile, dir := commandPaths(cfgPath)
+	cfgFile, dir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
@@ -1008,8 +1283,21 @@ func handleDiagnose(args []string) int {
 	} else {
 		layers = diagnose.DiagnoseRoute(cfg, rest[0], opts)
 	}
+	hasFail := false
+	for _, l := range layers {
+		if l.Status == "FAIL" {
+			hasFail = true
+			break
+		}
+	}
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(layers)
+		if err := json.NewEncoder(os.Stdout).Encode(layers); err != nil {
+			fmt.Fprintln(os.Stderr, "encode diagnose JSON:", sanitizeError(err))
+			return 3
+		}
+		if hasFail {
+			return 1
+		}
 		return 0
 	}
 	// Print
@@ -1032,12 +1320,6 @@ func handleDiagnose(args []string) int {
 		}
 	}
 	// Likely problem
-	hasFail := false
-	for _, l := range layers {
-		if l.Status == "FAIL" {
-			hasFail = true
-		}
-	}
 	if hasFail {
 		fmt.Println("\nLikely problem:")
 		for _, l := range layers {
@@ -1051,6 +1333,9 @@ func handleDiagnose(args []string) int {
 				fmt.Printf("\nBackup:\n%s\n", l.Detail)
 			}
 		}
+	}
+	if hasFail {
+		return 1
 	}
 	return 0
 }
@@ -1068,6 +1353,7 @@ type networkCheckDoc struct {
 func handleNetworkCheck(args []string) int {
 	cfgPath := ""
 	jsonOut := false
+	var positionals []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--json" {
@@ -1083,10 +1369,16 @@ func handleNetworkCheck(args []string) int {
 		} else if len(a) > 0 && a[0] == '-' {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
+		} else {
+			positionals = append(positionals, a)
 		}
 	}
+	if len(positionals) != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(positionals[0]))
+		return 3
+	}
 
-	doc := networkCheckDoc{SchemaVersion: 3}
+	doc := networkCheckDoc{SchemaVersion: report.JSONSchemaVersion}
 	if os.Getenv("FROSTGATE_TEST_SKIP_BASE_NETWORK_CHECKS") != "1" {
 		doc.Checks = network.CheckAll()
 	}
@@ -1095,7 +1387,11 @@ func handleNetworkCheck(args []string) int {
 	var destURLs []string
 	destLabels := map[string]string{}
 	var cfg *config.Config
-	resolvedConfig, managedDir := commandPaths(cfgPath)
+	resolvedConfig, managedDir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	if loaded, err := config.Load(resolvedConfig); err == nil {
 		cfg = loaded
 	} else if cfgPath != "" {
@@ -1129,8 +1425,12 @@ func handleNetworkCheck(args []string) int {
 
 	// Proxy destination matrix via per-outbound URL-test. Never mutates the
 	// benchmark selector.
-	if cfg != nil {
-		mg, _ := managedconfig.Load(managedDir)
+	if cfg != nil && hasProxyEndpoints(cfg) {
+		mg, err := loadManagedConfigForNetworkCheck(cfg, managedDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "load managed config:", sanitizeError(err))
+			return 3
+		}
 		routes := proxyRoutesForMatrix(cfg, mg)
 		client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -1149,7 +1449,11 @@ func handleNetworkCheck(args []string) int {
 	recommended := ""
 	if cfg != nil {
 		results := probeRunQuick(cfg)
-		rec := recommendFromResults(cfg, results, resolvedConfig, managedDir)
+		rec, recommendErr := recommendFromResults(cfg, results, resolvedConfig, managedDir)
+		if recommendErr != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(recommendErr))
+			return 3
+		}
 		if rec.BestOverall.Name != "" {
 			recommended = rec.BestOverall.Name
 		}
@@ -1162,8 +1466,11 @@ func handleNetworkCheck(args []string) int {
 	}
 
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(doc)
-		return 0
+		if err := json.NewEncoder(os.Stdout).Encode(doc); err != nil {
+			fmt.Fprintln(os.Stderr, "encode network-check JSON:", sanitizeError(err))
+			return 3
+		}
+		return networkCheckExitCode(doc)
 	}
 
 	fmt.Println("\nFROSTGATE NETWORK CHECK")
@@ -1228,6 +1535,54 @@ func handleNetworkCheck(args []string) int {
 		fmt.Printf("Recommended proxy: %s\n", recommended)
 	} else {
 		fmt.Println("Recommendation: insufficient data")
+	}
+	return networkCheckExitCode(doc)
+}
+
+func applyTimeoutOverride(cfg *config.Config, timeout time.Duration) {
+	if cfg == nil || timeout <= 0 {
+		return
+	}
+	cfg.Defaults.Timeout.Duration = timeout
+	for i := range cfg.Endpoints {
+		cfg.Endpoints[i].Timeout.Duration = timeout
+	}
+}
+
+func hasProxyEndpoints(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, ep := range cfg.Endpoints {
+		if ep.Type == config.ProbeSingBox {
+			return true
+		}
+	}
+	return false
+}
+
+func loadManagedConfigForNetworkCheck(cfg *config.Config, managedDir string) (*managedconfig.Managed, error) {
+	if !hasProxyEndpoints(cfg) {
+		return nil, nil
+	}
+	return managedconfig.Load(managedDir)
+}
+
+func networkCheckExitCode(doc networkCheckDoc) int {
+	for _, check := range doc.Checks {
+		if check.Status == "FAIL" {
+			return 1
+		}
+	}
+	for _, row := range doc.Matrix {
+		if strings.HasPrefix(row.Direct, "FAIL") {
+			return 1
+		}
+		for _, cell := range row.Routes {
+			if cell.Status == "FAIL" {
+				return 1
+			}
+		}
 	}
 	return 0
 }
@@ -1295,7 +1650,8 @@ type compareRoute struct {
 	Availability float64 `json:"availability_pct"`
 	Samples      int     `json:"samples"`
 	MedianMs     int64   `json:"median_ms"`
-	JitterMs     int64   `json:"jitter_ms"`
+	JitterMs     *int64  `json:"jitter_ms"`
+	JitterKnown  bool    `json:"jitter_known"`
 	DownloadMbps float64 `json:"download_mbps,omitempty"`
 	Trend        string  `json:"trend"`
 }
@@ -1312,6 +1668,9 @@ type compareNetwork struct {
 func compareBestProxy(summaries []history.Summary) (string, string) {
 	var cands []ranking.Candidate
 	for _, s := range summaries {
+		if s.Type != string(config.ProbeSingBox) {
+			continue
+		}
 		status := "up"
 		if s.Availability == 0 {
 			status = "down"
@@ -1325,10 +1684,14 @@ func compareBestProxy(summaries []history.Summary) (string, string) {
 			LossPct:         100 - s.Availability,
 			Median:          s.Median,
 			Jitter:          s.Jitter,
+			JitterKnown:     s.JitterKnown,
 			DownloadMbps:    s.Download,
 			HistoryCount:    s.Count,
 			AvailabilityPct: s.Availability,
 		})
+	}
+	if len(cands) == 0 {
+		return "", ""
 	}
 	best := ranking.Best(cands)
 	if best == nil {
@@ -1368,21 +1731,38 @@ func handleCompare(args []string) int {
 			return 3
 		}
 	}
-	configFile, managedDir := commandPaths(cfgPath)
+	configFile, managedDir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	profileID := historyProfileForPaths(configFile, managedDir)
 	db, err := history.OpenReadonly()
 	if err != nil {
+		if !errors.Is(err, history.ErrNoHistory) {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+			return 3
+		}
 		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
 		if jsonOut {
 			fmt.Fprintln(os.Stderr, msg)
-			json.NewEncoder(os.Stdout).Encode([]compareNetwork{})
+			if encodeErr := json.NewEncoder(os.Stdout).Encode([]compareNetwork{}); encodeErr != nil {
+				fmt.Fprintln(os.Stderr, "encode compare JSON:", sanitizeError(encodeErr))
+				return 3
+			}
 			return 0
 		}
 		fmt.Print(msg)
 		return 0
 	}
-	defer db.Close()
-	records, _ := db.QueryProfile(30*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
+	records, queryErr := db.QueryProfile(30*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
+	if queryErr != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			queryErr = errors.Join(queryErr, fmt.Errorf("close history: %w", closeErr))
+		}
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(queryErr))
+		return 3
+	}
 	netSet := map[string]bool{}
 	for _, r := range records {
 		if r.Network != "" {
@@ -1393,8 +1773,22 @@ func handleCompare(args []string) int {
 		msg := "No network history found. Run:\n  frostgate benchmark --network home\n"
 		if jsonOut {
 			fmt.Fprintln(os.Stderr, msg)
-			json.NewEncoder(os.Stdout).Encode([]compareNetwork{})
+			if encodeErr := json.NewEncoder(os.Stdout).Encode([]compareNetwork{}); encodeErr != nil {
+				if closeErr := db.Close(); closeErr != nil {
+					encodeErr = errors.Join(encodeErr, fmt.Errorf("close history: %w", closeErr))
+				}
+				fmt.Fprintln(os.Stderr, "encode compare JSON:", sanitizeError(encodeErr))
+				return 3
+			}
+			if closeErr := db.Close(); closeErr != nil {
+				fmt.Fprintln(os.Stderr, "history:", sanitizeError(closeErr))
+				return 3
+			}
 			return 0
+		}
+		if closeErr := db.Close(); closeErr != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(closeErr))
+			return 3
 		}
 		fmt.Print(msg)
 		return 0
@@ -1407,18 +1801,31 @@ func handleCompare(args []string) int {
 
 	out := make([]compareNetwork, 0, len(networks))
 	for _, netw := range networks {
-		recs, _ := db.QueryProfile(30*24*time.Hour, "", netw, profileID, profileID == history.DefaultProfile)
+		recs, readErr := db.QueryProfile(30*24*time.Hour, "", netw, profileID, profileID == history.DefaultProfile)
+		if readErr != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				readErr = errors.Join(readErr, fmt.Errorf("close history: %w", closeErr))
+			}
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(readErr))
+			return 3
+		}
 		summ := history.Summarize(recs)
 		sort.Slice(summ, func(i, j int) bool { return summ[i].Route < summ[j].Route })
 		cn := compareNetwork{Network: netw, Routes: make([]compareRoute, 0, len(summ))}
 		for _, s := range summ {
+			var jitterMs *int64
+			if s.JitterKnown {
+				value := s.Jitter.Milliseconds()
+				jitterMs = &value
+			}
 			cn.Routes = append(cn.Routes, compareRoute{
 				Route:        s.Route,
 				Type:         s.Type,
 				Availability: s.Availability,
 				Samples:      s.Count,
 				MedianMs:     s.Median.Milliseconds(),
-				JitterMs:     s.Jitter.Milliseconds(),
+				JitterMs:     jitterMs,
+				JitterKnown:  s.JitterKnown,
 				DownloadMbps: s.Download,
 				Trend:        s.Trend,
 			})
@@ -1429,7 +1836,17 @@ func handleCompare(args []string) int {
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(out)
+		if err := enc.Encode(out); err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close history: %w", closeErr))
+			}
+			fmt.Fprintln(os.Stderr, "encode compare JSON:", sanitizeError(err))
+			return 3
+		}
+		if err := db.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+			return 3
+		}
 		return 0
 	}
 	fmt.Println("\nNETWORK COMPARISON")
@@ -1468,8 +1885,12 @@ func handleCompare(args []string) int {
 			if cr.DownloadMbps > 0 {
 				dl = fmt.Sprintf(" download %.0fMb", cr.DownloadMbps)
 			}
-			fmt.Printf("  %-12s avail %3.0f%%  samples %-4d median %4dms  jitter %3dms%s\n",
-				cn.Network, cr.Availability, cr.Samples, cr.MedianMs, cr.JitterMs, dl)
+			jitter := "N/A"
+			if cr.JitterMs != nil {
+				jitter = fmt.Sprintf("%dms", *cr.JitterMs)
+			}
+			fmt.Printf("  %-12s avail %3.0f%%  samples %-4d median %4dms  jitter %s%s\n",
+				cn.Network, cr.Availability, cr.Samples, cr.MedianMs, jitter, dl)
 		}
 	}
 	fmt.Println("\nBest proxy per network:")
@@ -1480,6 +1901,10 @@ func handleCompare(args []string) int {
 		}
 		fmt.Printf("%-12s %s (confidence: %s)\n", cn.Network, cn.BestProxy, cn.BestProxyConfidence)
 	}
+	if err := db.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+		return 3
+	}
 	return 0
 }
 
@@ -1487,6 +1912,7 @@ func handleCompare(args []string) int {
 func handleRecommend(args []string) int {
 	jsonOut := false
 	cfgPath := ""
+	var positionals []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--json" {
@@ -1502,9 +1928,19 @@ func handleRecommend(args []string) int {
 		} else if len(a) > 0 && a[0] == '-' {
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", sanitizeOutput(a))
 			return 3
+		} else {
+			positionals = append(positionals, a)
 		}
 	}
-	cfgFile, managedDir := commandPaths(cfgPath)
+	if len(positionals) != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(positionals[0]))
+		return 3
+	}
+	cfgFile, managedDir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
@@ -1513,18 +1949,21 @@ func handleRecommend(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	results := probe.Run(ctx, cfg)
 	cancel()
-	rec := recommendFromResults(cfg, results, cfgFile, managedDir)
+	rec, recommendErr := recommendFromResults(cfg, results, cfgFile, managedDir)
+	if recommendErr != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(recommendErr))
+		return 3
+	}
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(rec)
+		if err := json.NewEncoder(os.Stdout).Encode(rec); err != nil {
+			fmt.Fprintln(os.Stderr, "encode recommend JSON:", sanitizeError(err))
+			return 3
+		}
 		return 0
 	}
 	fmt.Println("\nRECOMMENDATION")
 	if d, ok := probe.DirectBaseline(results); ok {
-		lat := "—"
-		if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
-			lat = fmtDuration(d.Metrics.Median)
-		}
-		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), lat)
+		fmt.Printf("Direct baseline: %s %s\n", strings.ToUpper(string(d.Status)), resultMedian(d))
 	}
 	if rec.BestOverall.Name == "" {
 		fmt.Println("Best proxy: none usable")
@@ -1596,34 +2035,62 @@ func handleHistory(args []string) int {
 			positionals = append(positionals, a)
 		}
 	}
-	_ = positionals
+	if len(positionals) != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q\n", sanitizeOutput(positionals[0]))
+		return 3
+	}
 	since, err := parseSince(sinceStr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --since: %v\n", err)
 		return 3
 	}
+	configFile, managedDir, pathErr := commandPathsChecked(cfgPath)
+	if pathErr != nil {
+		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
+		return 3
+	}
 	db, err := history.OpenReadonly()
 	if err != nil {
-		if jsonOut {
-			fmt.Fprintln(os.Stdout, "[]")
+		if errors.Is(err, history.ErrNoHistory) {
+			if jsonOut {
+				fmt.Fprintln(os.Stdout, "[]")
+				return 0
+			}
+			fmt.Println("No history")
 			return 0
 		}
-		fmt.Println("No history")
-		return 0
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+		return 3
 	}
-	defer db.Close()
-	configFile, managedDir := commandPaths(cfgPath)
 	profileID := historyProfileForPaths(configFile, managedDir)
 	records, err := db.QueryProfile(since, route, networkLabel, profileID, profileID == history.DefaultProfile)
 	if err != nil {
+		closeErr := db.Close()
+		if closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
 	if jsonOut {
-		json.NewEncoder(os.Stdout).Encode(records)
+		if err := json.NewEncoder(os.Stdout).Encode(records); err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close history: %w", closeErr))
+			}
+			fmt.Fprintln(os.Stderr, "encode history JSON:", sanitizeError(err))
+			return 3
+		}
+		if err := db.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+			return 3
+		}
 		return 0
 	}
 	if len(records) == 0 {
+		if err := db.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+			return 3
+		}
 		fmt.Println("No history")
 		return 0
 	}
@@ -1633,7 +2100,11 @@ func handleHistory(args []string) int {
 		fmt.Printf("%s\n", s.Route)
 		fmt.Printf("  Availability %6.1f%%\n", s.Availability)
 		fmt.Printf("  Median       %6dms\n", s.Median.Milliseconds())
-		fmt.Printf("  Jitter       %6dms\n", s.Jitter.Milliseconds())
+		if s.JitterKnown {
+			fmt.Printf("  Jitter       %6dms\n", s.Jitter.Milliseconds())
+		} else {
+			fmt.Println("  Jitter       N/A")
+		}
 		fmt.Printf("  Failures     %6d\n", s.Failures)
 		fmt.Printf("  Trend        %s\n", s.Trend)
 		if s.Download > 0 {
@@ -1653,6 +2124,10 @@ func handleHistory(args []string) int {
 	if best != "" {
 		fmt.Printf("Most reliable: %s\n", best)
 	}
+	if err := db.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+		return 3
+	}
 	return 0
 }
 
@@ -1660,16 +2135,23 @@ func parseSince(s string) (time.Duration, error) {
 	// Support d for days
 	if strings.HasSuffix(s, "d") {
 		num := strings.TrimSuffix(s, "d")
-		n, err := fmt.Sscanf(num, "%d", new(int))
-		_ = n
-		if err == nil {
-			// parse via int
-			var days int
-			fmt.Sscanf(num, "%d", &days)
-			return time.Duration(days) * 24 * time.Hour, nil
+		days, err := strconv.ParseInt(num, 10, 64)
+		if err != nil {
+			return 0, err
 		}
+		if days < 0 || days > int64((1<<63-1)/(24*time.Hour)) {
+			return 0, fmt.Errorf("days out of range")
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
 	}
-	return time.ParseDuration(s)
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("duration must be non-negative")
+	}
+	return d, nil
 }
 
 // --- helpers ---
@@ -1689,23 +2171,24 @@ func probeRunQuick(cfg *config.Config) []probe.Result {
 
 // recommendFromResults builds recommend inputs from probe results and
 // enriches them with per-route history evidence when history is enabled.
-func recommendFromResults(cfg *config.Config, results []probe.Result, configPath string, managedDir ...string) recommend.Result {
+func recommendFromResults(cfg *config.Config, results []probe.Result, configPath string, managedDir ...string) (recommend.Result, error) {
 	return recommendFromResultsWithDownloads(cfg, results, nil, configPath, managedDir...)
 }
 
-func recommendFromResultsWithDownloads(cfg *config.Config, results []probe.Result, downloadFor func(string) float64, configPath string, managedDir ...string) recommend.Result {
+func recommendFromResultsWithDownloads(cfg *config.Config, results []probe.Result, downloadFor func(string) float64, configPath string, managedDir ...string) (recommend.Result, error) {
 	var inputs []recommend.Input
 	for _, r := range results {
 		if r.Endpoint.Type != config.ProbeSingBox {
 			continue
 		}
 		in := recommend.Input{
-			Name:     r.Endpoint.Name,
-			Status:   string(r.Status),
-			Loss:     r.Metrics.LossPct,
-			Median:   r.Metrics.Median,
-			Jitter:   r.Metrics.Jitter,
-			Priority: r.Endpoint.Priority,
+			Name:        r.Endpoint.Name,
+			Status:      string(r.Status),
+			Loss:        r.Metrics.LossPct,
+			Median:      r.Metrics.Median,
+			Jitter:      r.Metrics.Jitter,
+			JitterKnown: r.Metrics.JitterKnown,
+			Priority:    r.Endpoint.Priority,
 		}
 		if downloadFor != nil {
 			in.Download = downloadFor(r.Endpoint.Name)
@@ -1718,9 +2201,20 @@ func recommendFromResultsWithDownloads(cfg *config.Config, results []probe.Resul
 	}
 	rec := newRecorder(cfg, profileID)
 	if rec.Enabled() {
-		if db, err := history.OpenReadonly(); err == nil {
-			defer db.Close()
-			recs, _ := db.QueryProfile(7*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
+		db, err := history.OpenReadonly()
+		if err != nil {
+			if !errors.Is(err, history.ErrNoHistory) {
+				return recommend.Result{}, fmt.Errorf("open history: %w", err)
+			}
+		} else {
+			recs, queryErr := db.QueryProfile(7*24*time.Hour, "", "", profileID, profileID == history.DefaultProfile)
+			closeErr := db.Close()
+			if queryErr != nil {
+				return recommend.Result{}, fmt.Errorf("read history: %w", queryErr)
+			}
+			if closeErr != nil {
+				return recommend.Result{}, fmt.Errorf("close history: %w", closeErr)
+			}
 			summaries := history.Summarize(recs)
 			for i := range inputs {
 				for _, s := range summaries {
@@ -1736,17 +2230,16 @@ func recommendFromResultsWithDownloads(cfg *config.Config, results []probe.Resul
 			}
 		}
 	}
-	return recommend.Recommend(inputs, 0)
+	return recommend.Recommend(inputs, 0), nil
 }
 
-func emit(results []probe.Result, asJSON bool, verbose bool) {
+func emit(results []probe.Result, asJSON bool, verbose bool) error {
 	if asJSON {
-		if err := report.JSON(os.Stdout, results); err != nil {
-			fmt.Fprintln(os.Stderr, "frostgate:", sanitizeError(err))
-		}
-		return
+		return report.JSON(os.Stdout, results)
 	}
-	fmt.Println(report.Table(results))
+	if _, err := fmt.Fprintln(os.Stdout, report.Table(results)); err != nil {
+		return err
+	}
 	if verbose {
 		for _, r := range results {
 			if r.Err != nil {
@@ -1754,13 +2247,19 @@ func emit(results []probe.Result, asJSON bool, verbose bool) {
 			}
 		}
 	}
+	return nil
 }
 
-func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) int {
+func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) (code int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	rec := newRecorder(cfg, profileID)
-	defer rec.Close()
+	defer func() {
+		if err := rec.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(err))
+			code = 3
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1770,12 +2269,17 @@ func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interv
 		results := probe.Run(ctx, cfg)
 		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
 			fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
+			return 3
 		}
 		line, err := report.NDJSONLine(results)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "json encode:", sanitizeError(err))
+			return 3
 		} else {
-			fmt.Println(string(line))
+			if _, err := fmt.Fprintln(os.Stdout, string(line)); err != nil {
+				fmt.Fprintln(os.Stderr, "write JSON:", sanitizeError(err))
+				return 3
+			}
 		}
 		if verbose {
 			for _, r := range results {
@@ -1792,9 +2296,18 @@ func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interv
 	}
 }
 
-func watchTUI(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) int {
+func watchTUI(ctx context.Context, cfg *config.Config, profileID string, interval time.Duration, verbose bool) (code int) {
 	rec := newRecorder(cfg, profileID)
-	defer rec.Close()
+	var recorderErr error
+	defer func() {
+		if err := rec.Close(); err != nil {
+			recorderErr = errors.Join(recorderErr, err)
+		}
+		if recorderErr != nil {
+			fmt.Fprintln(os.Stderr, "history:", sanitizeError(recorderErr))
+			code = 3
+		}
+	}()
 	observer := func(results []probe.Result) {
 		if len(results) == 0 {
 			return
@@ -1802,10 +2315,10 @@ func watchTUI(ctx context.Context, cfg *config.Config, profileID string, interva
 		// Throttling (watch_interval) is owned by the recorder; manual
 		// refreshes cannot flood the history DB.
 		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
-			fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
+			recorderErr = errors.Join(recorderErr, err)
 		}
 	}
-	m := tui.New(cfg, interval, verbose, observer)
+	m := tui.NewWithContext(ctx, cfg, interval, verbose, observer)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	if _, err := p.Run(); err != nil {
 		if strings.Contains(err.Error(), "context canceled") {

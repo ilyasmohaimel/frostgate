@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/health"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
 )
@@ -17,15 +18,16 @@ func mkResult(name string, typ config.ProbeType, status probe.Status, median tim
 		Endpoint: config.Endpoint{Name: name, Type: typ, Priority: 10},
 		Status:   status,
 		Metrics: metrics.Metrics{
-			Attempted: 4,
-			Succeeded: 4,
-			Failed:    0,
-			LossPct:   loss,
-			Median:    median,
-			Jitter:    5 * time.Millisecond,
-			Min:       median - 10*time.Millisecond,
-			Max:       median + 10*time.Millisecond,
-			Mean:      median,
+			Attempted:   4,
+			Succeeded:   4,
+			Failed:      0,
+			LossPct:     loss,
+			Median:      median,
+			Jitter:      5 * time.Millisecond,
+			Min:         median - 10*time.Millisecond,
+			Max:         median + 10*time.Millisecond,
+			Mean:        median,
+			JitterKnown: true,
 		},
 		Category: "",
 	}
@@ -44,8 +46,8 @@ func TestJSONSchema(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if doc["schema_version"] != float64(3) {
-		t.Errorf("schema_version %v want 3", doc["schema_version"])
+	if doc["schema_version"] != float64(JSONSchemaVersion) {
+		t.Errorf("schema_version %v want %d", doc["schema_version"], JSONSchemaVersion)
 	}
 	if _, ok := doc["timestamp"]; !ok {
 		t.Error("missing timestamp")
@@ -84,8 +86,52 @@ func TestNDJSONLine(t *testing.T) {
 	if err := json.Unmarshal(line, &doc); err != nil {
 		t.Fatalf("unmarshal ndjson: %v", err)
 	}
-	if doc["schema_version"] != float64(3) {
+	if doc["schema_version"] != float64(JSONSchemaVersion) {
 		t.Error("wrong schema")
+	}
+}
+
+func TestJSONReportsClassifierReasonsAndNoPhantomError(t *testing.T) {
+	r := mkResult("degraded", config.ProbeTCP, probe.StatusDegraded, 120*time.Millisecond, 0)
+	r.Reasons = []health.Reason{health.ReasonLatency}
+	jr := ToJSONResult(r)
+	if len(jr.Reasons) != 1 || jr.Reasons[0] != "slow" {
+		t.Fatalf("reasons=%v", jr.Reasons)
+	}
+	if jr.Error != "" {
+		t.Fatalf("successful result has phantom error %q", jr.Error)
+	}
+	r.Metrics.JitterKnown = false
+	jr = ToJSONResult(r)
+	if jr.JitterMs != nil || jr.JitterKnown {
+		t.Fatalf("unknown jitter was encoded as evidence: %+v", jr)
+	}
+}
+
+func TestTableDistinguishesMeasuredZeroJitterFromUnknown(t *testing.T) {
+	measured := mkResult("measured-zero", config.ProbeTCP, probe.StatusUp, 20*time.Millisecond, 0)
+	measured.Metrics.Jitter = 0
+	measured.Metrics.JitterKnown = true
+	unknown := mkResult("unknown", config.ProbeTCP, probe.StatusUp, 20*time.Millisecond, 0)
+	unknown.Metrics.Jitter = 0
+	unknown.Metrics.JitterKnown = false
+
+	table := Table([]probe.Result{measured, unknown})
+	if !strings.Contains(table, "0ms") {
+		t.Fatalf("measured zero jitter was hidden: %q", table)
+	}
+	if strings.Count(table, "│0ms") != 1 {
+		t.Fatalf("unknown jitter was rendered as measured zero: %q", table)
+	}
+}
+
+func TestTableShowsMeasuredZeroDirectBaselineLatency(t *testing.T) {
+	results := []probe.Result{
+		{Endpoint: config.Endpoint{Name: "direct", Type: config.ProbeHTTP}, Status: probe.StatusUp, Metrics: metrics.Metrics{Attempted: 1, Succeeded: 1, Median: 0}},
+		{Endpoint: config.Endpoint{Name: "proxy", Type: config.ProbeSingBox}, Status: probe.StatusUp, Metrics: metrics.Metrics{Attempted: 1, Succeeded: 1, Median: time.Millisecond}},
+	}
+	if got := Table(results); !strings.Contains(got, "Direct baseline: UP 0ms") {
+		t.Fatalf("measured zero direct baseline was rendered as unknown: %q", got)
 	}
 }
 

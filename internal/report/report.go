@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -22,6 +23,11 @@ var (
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
+// JSONSchemaVersion changes only when machine-readable output changes its
+// meaning. v4 makes jitter explicitly nullable when there is no evidence and
+// exposes the classifier reasons shown in the human table.
+const JSONSchemaVersion = 4
+
 func statusCell(s probe.Status) string {
 	switch s {
 	case probe.StatusUp:
@@ -34,13 +40,16 @@ func statusCell(s probe.Status) string {
 }
 
 func latencyCell(d time.Duration, ok bool) string {
-	if !ok || d == 0 {
+	if !ok {
 		return "—"
 	}
 	return formatLatency(d)
 }
 
 func formatLatency(d time.Duration) string {
+	if d == 0 {
+		return "0ms"
+	}
 	if d < time.Millisecond {
 		return "<1ms"
 	}
@@ -82,7 +91,7 @@ func Table(results []probe.Result) string {
 			statusCell(r.Status),
 			lossCell(r.Metrics.LossPct, r.Metrics.Attempted > 0),
 			latencyCell(r.Metrics.Median, r.Metrics.Succeeded > 0),
-			latencyCell(r.Metrics.Jitter, r.Metrics.Succeeded > 1),
+			latencyCell(r.Metrics.Jitter, r.Metrics.JitterKnown),
 			detail,
 		)
 	}
@@ -90,7 +99,7 @@ func Table(results []probe.Result) string {
 	if probe.HasProxy(results) {
 		if d, ok := probe.DirectBaseline(results); ok {
 			lat := "—"
-			if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+			if d.Metrics.Succeeded > 0 {
 				lat = formatLatency(d.Metrics.Median)
 			}
 			out += dimStyle.Render("Direct baseline:") + " " + plainStatus(d.Status) + " " + lat + "\n"
@@ -142,16 +151,19 @@ func plainStatus(s probe.Status) string {
 }
 
 func shortReason(r probe.Result) string {
-	if r.Status == probe.StatusDegraded {
-		if r.Metrics.LossPct > 0 {
-			return fmt.Sprintf("loss %.0f%%", r.Metrics.LossPct)
-		}
-		if r.Metrics.Jitter > 50*time.Millisecond {
-			return "jitter"
-		}
-		return "slow"
+	if r.Status != probe.StatusDegraded || len(r.Reasons) == 0 {
+		return ""
 	}
-	return ""
+	reasons := make([]string, 0, len(r.Reasons))
+	for _, reason := range r.Reasons {
+		switch reason {
+		case "loss":
+			reasons = append(reasons, fmt.Sprintf("loss %.0f%%", r.Metrics.LossPct))
+		default:
+			reasons = append(reasons, string(reason))
+		}
+	}
+	return strings.Join(reasons, ", ")
 }
 
 func diagnosis(results []probe.Result) string {
@@ -242,22 +254,24 @@ func toLower(s string) string {
 }
 
 type JSONResult struct {
-	Name      string  `json:"name"`
-	Type      string  `json:"type"`
-	Status    string  `json:"status"`
-	Category  string  `json:"category,omitempty"`
-	Attempted int     `json:"attempted"`
-	Succeeded int     `json:"succeeded"`
-	Failed    int     `json:"failed"`
-	LossPct   float64 `json:"loss_pct"`
-	MinMs     int64   `json:"min_ms,omitempty"`
-	MedianMs  int64   `json:"median_ms"`
-	MaxMs     int64   `json:"max_ms,omitempty"`
-	MeanMs    int64   `json:"mean_ms,omitempty"`
-	JitterMs  int64   `json:"jitter_ms"`
-	Priority  int     `json:"priority"`
-	Error     string  `json:"error,omitempty"`
-	Outbound  string  `json:"outbound,omitempty"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Status      string   `json:"status"`
+	Category    string   `json:"category,omitempty"`
+	Attempted   int      `json:"attempted"`
+	Succeeded   int      `json:"succeeded"`
+	Failed      int      `json:"failed"`
+	LossPct     float64  `json:"loss_pct"`
+	MinMs       int64    `json:"min_ms,omitempty"`
+	MedianMs    int64    `json:"median_ms"`
+	MaxMs       int64    `json:"max_ms,omitempty"`
+	MeanMs      int64    `json:"mean_ms,omitempty"`
+	JitterMs    *int64   `json:"jitter_ms"`
+	JitterKnown bool     `json:"jitter_known"`
+	Reasons     []string `json:"reasons,omitempty"`
+	Priority    int      `json:"priority"`
+	Error       string   `json:"error,omitempty"`
+	Outbound    string   `json:"outbound,omitempty"`
 }
 
 type jsonDoc struct {
@@ -272,18 +286,23 @@ type jsonDoc struct {
 
 func ToJSONResult(r probe.Result) JSONResult {
 	jr := JSONResult{
-		Name:      r.Endpoint.Name,
-		Type:      string(r.Endpoint.Type),
-		Status:    string(r.Status),
-		Category:  r.Category,
-		Attempted: r.Metrics.Attempted,
-		Succeeded: r.Metrics.Succeeded,
-		Failed:    r.Metrics.Failed,
-		LossPct:   r.Metrics.LossPct,
-		MedianMs:  r.Metrics.Median.Milliseconds(),
-		JitterMs:  r.Metrics.Jitter.Milliseconds(),
-		Priority:  r.Endpoint.Priority,
-		Error:     redact.String(r.ErrMsg),
+		Name:        r.Endpoint.Name,
+		Type:        string(r.Endpoint.Type),
+		Status:      string(r.Status),
+		Category:    r.Category,
+		Attempted:   r.Metrics.Attempted,
+		Succeeded:   r.Metrics.Succeeded,
+		Failed:      r.Metrics.Failed,
+		LossPct:     r.Metrics.LossPct,
+		MedianMs:    r.Metrics.Median.Milliseconds(),
+		JitterKnown: r.Metrics.JitterKnown,
+		Priority:    r.Endpoint.Priority,
+	}
+	if r.ErrMsg != "" {
+		jr.Error = redact.String(r.ErrMsg)
+	}
+	for _, reason := range r.Reasons {
+		jr.Reasons = append(jr.Reasons, string(reason))
 	}
 	if r.Endpoint.Outbound != "" {
 		jr.Outbound = r.Endpoint.Outbound
@@ -293,12 +312,16 @@ func ToJSONResult(r probe.Result) JSONResult {
 		jr.MaxMs = r.Metrics.Max.Milliseconds()
 		jr.MeanMs = r.Metrics.Mean.Milliseconds()
 	}
+	if r.Metrics.JitterKnown {
+		jitter := r.Metrics.Jitter.Milliseconds()
+		jr.JitterMs = &jitter
+	}
 	return jr
 }
 
 func buildDoc(results []probe.Result, now string) jsonDoc {
 	doc := jsonDoc{
-		SchemaVersion: 3,
+		SchemaVersion: JSONSchemaVersion,
 		Timestamp:     now,
 	}
 	for _, r := range results {

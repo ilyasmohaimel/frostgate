@@ -4,30 +4,37 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/profile"
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"go.etcd.io/bbolt"
 )
 
 type Record struct {
-	Timestamp    time.Time `json:"ts"`
-	Route        string    `json:"route"`
-	Type         string    `json:"type"`
-	Status       string    `json:"status"`
-	Loss         float64   `json:"loss"`
-	MedianMs     int64     `json:"median_ms"`
-	JitterMs     int64     `json:"jitter_ms"`
-	MinMs        int64     `json:"min_ms"`
-	MaxMs        int64     `json:"max_ms"`
-	MeanMs       int64     `json:"mean_ms"`
-	DownloadMbps float64   `json:"download_mbps,omitempty"`
-	Network      string    `json:"network,omitempty"`
-	Category     string    `json:"category,omitempty"`
+	Timestamp time.Time `json:"ts"`
+	Route     string    `json:"route"`
+	Type      string    `json:"type"`
+	Status    string    `json:"status"`
+	Loss      float64   `json:"loss"`
+	MedianMs  int64     `json:"median_ms"`
+	JitterMs  int64     `json:"jitter_ms"`
+	// JitterKnown is a pointer so an absent legacy field stays distinguishable
+	// from a newly recorded false value. Legacy zero jitter is not evidence of
+	// perfect jitter; legacy non-zero jitter is.
+	JitterKnown  *bool   `json:"jitter_known,omitempty"`
+	MinMs        int64   `json:"min_ms"`
+	MaxMs        int64   `json:"max_ms"`
+	MeanMs       int64   `json:"mean_ms"`
+	DownloadMbps float64 `json:"download_mbps,omitempty"`
+	Network      string  `json:"network,omitempty"`
+	Category     string  `json:"category,omitempty"`
 	// Profile scopes equal route names in independent Frostgate configs. The
 	// empty value is a legacy record and is visible only to the default profile.
 	Profile string `json:"profile,omitempty"`
@@ -78,11 +85,17 @@ func Open() (*DB, error) {
 		return e
 	})
 	if err != nil {
-		bdb.Close()
-		return nil, err
+		return nil, errors.Join(err, bdb.Close())
 	}
-	// Ensure perms 0600
-	os.Chmod(path, 0o600)
+	// Ensure perms 0600. A failure here would leave measurements readable by
+	// other users, so do not continue as if the database were private.
+	if err := os.Chmod(path, 0o600); err != nil {
+		closeErr := bdb.Close()
+		if closeErr != nil {
+			return nil, fmt.Errorf("secure history permissions: %w; close history db: %v", err, closeErr)
+		}
+		return nil, fmt.Errorf("secure history permissions: %w", err)
+	}
 	return &DB{db: bdb}, nil
 }
 
@@ -97,6 +110,9 @@ func (d *DB) Add(r Record) error {
 	if r.Timestamp.IsZero() {
 		r.Timestamp = time.Now()
 	}
+	r.Route = redact.String(r.Route)
+	r.Network = sanitizeNetworkLabel(r.Network)
+	r.Category = redact.String(r.Category)
 	// Never store secrets: ensure no URL/password in record (we only store route name)
 	// Prune old before adding? Do lazy
 	data, err := json.Marshal(r)
@@ -119,6 +135,7 @@ func (d *DB) Query(since time.Duration, route, network string) ([]Record, error)
 // explicit custom profile.
 func (d *DB) QueryProfile(since time.Duration, route, network, profile string, includeLegacy bool) ([]Record, error) {
 	var out []Record
+	network = sanitizeNetworkLabel(network)
 	cutoff := time.Now().Add(-since)
 	if since == 0 {
 		cutoff = time.Time{}
@@ -131,11 +148,14 @@ func (d *DB) QueryProfile(since time.Duration, route, network, profile string, i
 		return b.ForEach(func(k, v []byte) error {
 			var r Record
 			if err := json.Unmarshal(v, &r); err != nil {
-				return nil
+				return fmt.Errorf("decode history record %q: %w", string(k), err)
 			}
 			if !cutoff.IsZero() && r.Timestamp.Before(cutoff) {
 				return nil
 			}
+			r.Route = redact.String(r.Route)
+			r.Network = sanitizeNetworkLabel(r.Network)
+			r.Category = redact.String(r.Category)
 			if route != "" && r.Route != route {
 				return nil
 			}
@@ -150,6 +170,13 @@ func (d *DB) QueryProfile(since time.Duration, route, network, profile string, i
 		})
 	})
 	return out, err
+}
+
+func sanitizeNetworkLabel(label string) string {
+	if label == "" {
+		return ""
+	}
+	return redact.String(label)
 }
 
 func (d *DB) Prune(retention time.Duration) error {
@@ -193,6 +220,7 @@ type Summary struct {
 	Availability float64
 	Median       time.Duration
 	Jitter       time.Duration
+	JitterKnown  bool
 	Failures     int
 	Trend        string
 	Download     float64
@@ -211,10 +239,9 @@ func Summarize(records []Record) []Summary {
 		routeType := recs[0].Type
 		sort.Slice(recs, func(i, j int) bool { return recs[i].Timestamp.Before(recs[j].Timestamp) })
 		up := 0
-		var sumJitter int64
 		var sumDownload float64
 		var validLatency []Record
-		var validJitterCount int
+		var jitters []int64
 		var sumDownloadCount int
 		failures := 0
 		var medians []int64
@@ -225,13 +252,14 @@ func Summarize(records []Record) []Summary {
 			} else {
 				failures++
 			}
-			if usable && r.MedianMs > 0 {
+			if usable && r.MedianMs >= 0 {
 				medians = append(medians, r.MedianMs)
 				validLatency = append(validLatency, r)
-				sumJitter += r.JitterMs
-				validJitterCount++
 			}
-			if usable && r.DownloadMbps > 0 {
+			if usable && recordJitterKnown(r) && r.JitterMs >= 0 {
+				jitters = append(jitters, r.JitterMs)
+			}
+			if usable && r.DownloadMbps > 0 && !math.IsNaN(r.DownloadMbps) && !math.IsInf(r.DownloadMbps, 0) {
 				sumDownload += r.DownloadMbps
 				sumDownloadCount++
 			}
@@ -242,14 +270,14 @@ func Summarize(records []Record) []Summary {
 			sort.Slice(medians, func(i, j int) bool { return medians[i] < medians[j] })
 			mid := len(medians) / 2
 			if len(medians)%2 == 1 {
-				median = time.Duration(medians[mid]) * time.Millisecond
+				median = durationFromMilliseconds(medians[mid])
 			} else {
-				median = time.Duration((medians[mid-1]+medians[mid])/2) * time.Millisecond
+				median = durationFromMilliseconds(medians[mid-1] + (medians[mid]-medians[mid-1])/2)
 			}
 		}
 		jitter := time.Duration(0)
-		if validJitterCount > 0 {
-			jitter = time.Duration(sumJitter/int64(validJitterCount)) * time.Millisecond
+		if len(jitters) > 0 {
+			jitter = durationFromMilliseconds(meanNonNegativeInt64(jitters))
 		}
 		avgDownload := 0.0
 		if sumDownloadCount > 0 {
@@ -258,18 +286,19 @@ func Summarize(records []Record) []Summary {
 		trend := "stable"
 		if len(validLatency) >= 4 {
 			mid := len(validLatency) / 2
-			var firstSum, secondSum int64
+			first := make([]int64, 0, mid)
+			second := make([]int64, 0, len(validLatency)-mid)
 			for i := 0; i < mid; i++ {
-				firstSum += validLatency[i].MedianMs
+				first = append(first, validLatency[i].MedianMs)
 			}
 			for i := mid; i < len(validLatency); i++ {
-				secondSum += validLatency[i].MedianMs
+				second = append(second, validLatency[i].MedianMs)
 			}
-			firstAvg := firstSum / int64(mid)
-			secondAvg := secondSum / int64(len(validLatency)-mid)
-			if secondAvg > firstAvg+20 {
+			firstAvg := meanNonNegativeInt64(first)
+			secondAvg := meanNonNegativeInt64(second)
+			if secondAvg > saturatingAddMilliseconds(firstAvg, 20) {
 				trend = "getting worse"
-			} else if secondAvg < firstAvg-20 {
+			} else if firstAvg > saturatingAddMilliseconds(secondAvg, 20) {
 				trend = "improving"
 			}
 		}
@@ -280,6 +309,7 @@ func Summarize(records []Record) []Summary {
 			Availability: avail,
 			Median:       median,
 			Jitter:       jitter,
+			JitterKnown:  len(jitters) > 0,
 			Failures:     failures,
 			Trend:        trend,
 			Download:     avgDownload,
@@ -287,4 +317,54 @@ func Summarize(records []Record) []Summary {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Route < out[j].Route })
 	return out
+}
+
+func saturatingAddMilliseconds(value, increment int64) int64 {
+	if increment > 0 && value > math.MaxInt64-increment {
+		return math.MaxInt64
+	}
+	return value + increment
+}
+
+func durationFromMilliseconds(ms int64) time.Duration {
+	if ms <= 0 {
+		return 0
+	}
+	if ms > math.MaxInt64/int64(time.Millisecond) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// meanNonNegativeInt64 avoids overflow when summarizing a user-owned legacy
+// database. Callers have filtered negative values first.
+func meanNonNegativeInt64(values []int64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	var quotient int64
+	var remainder uint64
+	n := int64(len(values))
+	denominator := uint64(n)
+	for _, value := range values {
+		quotient += value / n
+		rest := uint64(value % n)
+		if remainder >= denominator-rest {
+			quotient++
+			remainder -= denominator - rest
+		} else {
+			remainder += rest
+		}
+	}
+	return quotient
+}
+
+func recordJitterKnown(r Record) bool {
+	if r.JitterKnown != nil {
+		return *r.JitterKnown
+	}
+	// Before jitter evidence was stored, non-zero jitter must have come from
+	// at least two samples. A legacy zero may mean either perfect jitter or
+	// insufficient samples, so preserve that uncertainty.
+	return r.JitterMs != 0
 }

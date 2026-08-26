@@ -158,14 +158,17 @@ func FromProbeResults(results []probe.Result, downloadFor func(name string) floa
 			Loss:         res.Metrics.LossPct,
 			MedianMs:     res.Metrics.Median.Milliseconds(),
 			JitterMs:     res.Metrics.Jitter.Milliseconds(),
+			JitterKnown:  boolPtr(res.Metrics.JitterKnown),
 			MinMs:        res.Metrics.Min.Milliseconds(),
 			MaxMs:        res.Metrics.Max.Milliseconds(),
 			MeanMs:       res.Metrics.Mean.Milliseconds(),
 			DownloadMbps: dl,
-			Network:      networkLabel,
+			Network:      sanitizeNetworkLabel(networkLabel),
 			Category:     res.Category,
 			Profile:      profileID,
 		})
 	}
 	return out
 }
+
+func boolPtr(v bool) *bool { return &v }

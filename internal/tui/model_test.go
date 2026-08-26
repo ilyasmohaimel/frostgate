@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/health"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
 )
@@ -158,6 +159,17 @@ func TestTUIDirectVsBestProxyPresentation(t *testing.T) {
 	}
 }
 
+func TestTUIShowsMeasuredZeroDirectLatency(t *testing.T) {
+	cfg := &config.Config{}
+	direct := probe.Result{Endpoint: config.Endpoint{Name: "direct", Type: config.ProbeHTTP}, Status: probe.StatusUp, Metrics: metrics.Metrics{Attempted: 1, Succeeded: 1}}
+	proxy := probe.Result{Endpoint: config.Endpoint{Name: "proxy", Type: config.ProbeSingBox}, Status: probe.StatusUp, Metrics: metricsOf(1)}
+	m := New(cfg, time.Hour, false, nil)
+	m.results = []probe.Result{proxy, direct}
+	if view := m.View(); !containsStr(view, "Direct baseline: UP 0ms") {
+		t.Fatalf("measured zero direct latency rendered as unknown:\n%s", view)
+	}
+}
+
 func TestTUINoProxyUsesBestRoute(t *testing.T) {
 	cfg := &config.Config{}
 	direct := probe.Result{Endpoint: config.Endpoint{Name: "web", Type: config.ProbeHTTP}, Status: probe.StatusUp, Metrics: metricsOf(30)}
@@ -165,6 +177,32 @@ func TestTUINoProxyUsesBestRoute(t *testing.T) {
 	m.results = []probe.Result{direct}
 	if v := m.View(); !containsStr(v, "Best route: web") {
 		t.Fatalf("non-proxy run should keep best route wording:\n%s", v)
+	}
+}
+
+func TestProbeBudgetUsesConfiguredRouteScheduleNotThirtySeconds(t *testing.T) {
+	cfg := &config.Config{Defaults: config.Defaults{
+		Timeout:        config.Duration{Duration: 10 * time.Second},
+		Samples:        4,
+		SampleInterval: config.Duration{Duration: 2 * time.Second},
+	}, Endpoints: []config.Endpoint{{Name: "route", Host: "127.0.0.1", Port: 1}}}
+	if got, want := ProbeBudget(cfg), 47*time.Second; got != want {
+		t.Fatalf("probe budget=%s, want %s", got, want)
+	}
+}
+
+func TestVerboseTUIShowsClassifierReasons(t *testing.T) {
+	r := probe.Result{
+		Endpoint: config.Endpoint{Name: "slow", Type: config.ProbeTCP},
+		Status:   probe.StatusDegraded,
+		Metrics:  metrics.Metrics{Attempted: 2, Succeeded: 2, Median: 120 * time.Millisecond, JitterKnown: true},
+		Reasons:  []health.Reason{health.ReasonLatency},
+	}
+	m := New(&config.Config{}, time.Second, true, nil)
+	m.results = []probe.Result{r}
+	view := m.View()
+	if !containsStr(view, "slow") || !containsStr(view, "Sample evidence") {
+		t.Fatalf("verbose TUI omitted classification evidence:\n%s", view)
 	}
 }
 

@@ -1,10 +1,14 @@
 package history
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 func tempDB(t *testing.T) (*DB, func()) {
@@ -71,6 +75,66 @@ func TestNetworkFilter(t *testing.T) {
 	records, _ := db.Query(24*time.Hour, "", "home")
 	if len(records) != 1 {
 		t.Fatalf("network filter %d", len(records))
+	}
+}
+
+func TestNetworkLabelRedactedAtRestAndOnRead(t *testing.T) {
+	db, cleanup := tempDB(t)
+	defer cleanup()
+	secret := "vless://11111111-1111-4111-8111-111111111111@example.com/path?token=fixture-token"
+	if err := db.Add(Record{Route: "proxy", Status: "up", Network: secret}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := db.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket([]byte("history")).ForEach(func(_, value []byte) error {
+			raw = append(raw, value...)
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), "fixture-token") {
+		t.Fatalf("network secret was stored at rest: %s", raw)
+	}
+	records, err := db.Query(24*time.Hour, "", secret)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("redacted network query records=%d err=%v", len(records), err)
+	}
+	if strings.Contains(records[0].Network, "fixture-token") || strings.Contains(records[0].Network, "11111111-1111") {
+		t.Fatalf("network secret was exposed on read: %+v", records[0])
+	}
+}
+
+func TestHistoryRedactsRouteAndCategoryAtRestAndOnRead(t *testing.T) {
+	db, cleanup := tempDB(t)
+	defer cleanup()
+	secret := "SUPER_SECRET_TOKEN_9A"
+	if err := db.Add(Record{
+		Route:    "vless://" + secret + "@203.0.113.10:443",
+		Status:   "up",
+		Category: "auth=" + secret,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	if err := db.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket([]byte("history")).ForEach(func(_, value []byte) error {
+			raw = append(raw, value...)
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("history retained secret data: %s", raw)
+	}
+	records, err := db.Query(24*time.Hour, "", "")
+	if err != nil || len(records) != 1 {
+		t.Fatalf("query records=%d err=%v", len(records), err)
+	}
+	if strings.Contains(records[0].Route, secret) || strings.Contains(records[0].Category, secret) {
+		t.Fatalf("history exposed secret data: %+v", records[0])
 	}
 }
 
@@ -156,6 +220,57 @@ func TestSummarizeAllFailuresHasNoLatency(t *testing.T) {
 	s := Summarize([]Record{{Route: "down", Status: "down"}, {Route: "down", Status: "down"}})[0]
 	if s.Availability != 0 || s.Median != 0 || s.Jitter != 0 || s.Trend != "stable" || s.Failures != 2 {
 		t.Fatalf("bad all-down summary: %+v", s)
+	}
+}
+
+func TestSummarizeJitterEvidenceKeepsLegacyZeroUnknown(t *testing.T) {
+	known := true
+	unknown := false
+	s := Summarize([]Record{
+		// Legacy zero was ambiguous before v0.4.9 and must not earn a
+		// perfect-jitter score.
+		{Route: "route", Status: "up", MedianMs: 100, JitterMs: 0},
+		{Route: "route", Status: "up", MedianMs: 100, JitterMs: 0, JitterKnown: &unknown},
+		{Route: "route", Status: "up", MedianMs: 100, JitterMs: 8, JitterKnown: &known},
+		{Route: "route", Status: "up", MedianMs: 100, JitterMs: 0, JitterKnown: &known},
+	})[0]
+	if !s.JitterKnown || s.Jitter != 4*time.Millisecond {
+		t.Fatalf("only new known jitter evidence should be averaged: %+v", s)
+	}
+}
+
+func TestSummarizePreservesMeasuredZeroJitterAndSaturatesHostileDurations(t *testing.T) {
+	known := true
+	s := Summarize([]Record{
+		{Route: "route", Status: "up", MedianMs: 0, JitterMs: 0, JitterKnown: &known},
+		{Route: "route", Status: "up", MedianMs: math.MaxInt64, JitterMs: math.MaxInt64, JitterKnown: &known},
+	})[0]
+	if !s.JitterKnown || s.Jitter != time.Duration(math.MaxInt64) {
+		t.Fatalf("known jitter evidence was lost or overflowed: %+v", s)
+	}
+	if s.Median != time.Duration(math.MaxInt64) {
+		t.Fatalf("median duration overflowed: %+v", s)
+	}
+}
+
+func TestSummarizeHostileLargeLatencyDoesNotWrapTrend(t *testing.T) {
+	base := time.Now()
+	max := int64(math.MaxInt64)
+	s := Summarize([]Record{
+		{Route: "route", Status: "up", MedianMs: max - 10, Timestamp: base},
+		{Route: "route", Status: "up", MedianMs: max - 5, Timestamp: base.Add(time.Minute)},
+		{Route: "route", Status: "up", MedianMs: max - 2, Timestamp: base.Add(2 * time.Minute)},
+		{Route: "route", Status: "up", MedianMs: max, Timestamp: base.Add(3 * time.Minute)},
+	})[0]
+	if s.Trend != "stable" {
+		t.Fatalf("large latency values overflowed trend: %+v", s)
+	}
+}
+
+func TestSummarizeLegacyNonZeroJitterRemainsReadable(t *testing.T) {
+	s := Summarize([]Record{{Route: "route", Status: "up", MedianMs: 100, JitterMs: 12}})[0]
+	if !s.JitterKnown || s.Jitter != 12*time.Millisecond {
+		t.Fatalf("legacy non-zero jitter should remain evidence: %+v", s)
 	}
 }
 

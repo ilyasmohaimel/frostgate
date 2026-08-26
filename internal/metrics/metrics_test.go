@@ -33,6 +33,9 @@ func TestCompute_AllSuccess(t *testing.T) {
 	if m.Jitter != 13*time.Millisecond {
 		t.Errorf("jitter=%v want 13ms", m.Jitter)
 	}
+	if !m.JitterKnown {
+		t.Error("multiple successful samples must provide jitter evidence")
+	}
 }
 
 func TestCompute_AllFail(t *testing.T) {
@@ -112,6 +115,9 @@ func TestJitter_SingleSuccess(t *testing.T) {
 	if m.Jitter != 0 {
 		t.Errorf("single sample jitter should be 0, got %v", m.Jitter)
 	}
+	if m.JitterKnown {
+		t.Error("one successful sample must have unknown jitter")
+	}
 }
 
 func TestJitter_ZeroSuccess(t *testing.T) {
@@ -119,5 +125,32 @@ func TestJitter_ZeroSuccess(t *testing.T) {
 	m := Compute(samples)
 	if m.Jitter != 0 {
 		t.Errorf("zero success jitter should be 0, got %v", m.Jitter)
+	}
+	if m.JitterKnown {
+		t.Error("zero successful samples must have unknown jitter")
+	}
+}
+
+func TestJitterMeasuredZeroIsKnown(t *testing.T) {
+	m := Compute([]Sample{
+		{Success: true, Latency: 100 * time.Millisecond},
+		{Success: true, Latency: 100 * time.Millisecond},
+	})
+	if !m.JitterKnown || m.Jitter != 0 {
+		t.Fatalf("equal successful samples must prove 0ms jitter: %+v", m)
+	}
+}
+
+func TestComputeMeanAndJitterKeepIntegerRemainders(t *testing.T) {
+	m := Compute([]Sample{
+		{Success: true, Latency: 1 * time.Nanosecond},
+		{Success: true, Latency: 2 * time.Nanosecond},
+		{Success: true, Latency: 3 * time.Nanosecond},
+	})
+	if m.Mean != 2*time.Nanosecond {
+		t.Fatalf("mean=%s, want 2ns", m.Mean)
+	}
+	if !m.JitterKnown || m.Jitter != 1*time.Nanosecond {
+		t.Fatalf("jitter=%s known=%t, want 1ns known", m.Jitter, m.JitterKnown)
 	}
 }

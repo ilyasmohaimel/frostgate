@@ -222,6 +222,24 @@ func TestNoComparisonStubLayer(t *testing.T) {
 	}
 }
 
+func TestDirectOnlySkipsProxyLayers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	cfg := &config.Config{
+		Defaults:  config.Defaults{Timeout: config.Duration{Duration: time.Second}, Samples: 1},
+		Endpoints: []config.Endpoint{{Name: "direct", Type: config.ProbeHTTP, URL: server.URL, ExpectedStatus: http.StatusNoContent}},
+	}
+	layers := DiagnoseAll(cfg, Options{})
+	for _, name := range []string{"sing-box binary", "sing-box sidecar", "Controller"} {
+		layer := findLayer(layers, name)
+		if layer == nil || layer.Status != "SKIP" || !strings.Contains(layer.Detail, "no proxy routes") {
+			t.Fatalf("%s = %+v, want direct-only SKIP", name, layer)
+		}
+	}
+}
+
 func TestMetadataSecretsNeverLeak(t *testing.T) {
 	ctrl := httptest.NewServer(newFakeCtrl(map[string]int{"vless-a": 10, "hy2-b": 20}).handler())
 	defer ctrl.Close()

@@ -142,7 +142,10 @@ func (c *Client) GetSelectedOutbound(ctx context.Context, selector string) (stri
 	raw, ok := m["now"]
 	if !ok {
 		// Try to decode full object
-		b, _ := json.Marshal(m)
+		b, marshalErr := json.Marshal(m)
+		if marshalErr != nil {
+			return "", fmt.Errorf("singbox-api: encode selector response: %w", marshalErr)
+		}
 		if err := json.Unmarshal(b, &st); err != nil {
 			return "", fmt.Errorf("singbox-api: missing now field")
 		}
@@ -165,7 +168,10 @@ func (c *Client) SelectOutbound(ctx context.Context, selector, target string) er
 	if selector == "" {
 		selector = "frostgate-selector"
 	}
-	body, _ := json.Marshal(map[string]string{"name": target})
+	body, err := json.Marshal(map[string]string{"name": target})
+	if err != nil {
+		return fmt.Errorf("singbox-api: encode selector request: %w", err)
+	}
 	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(selector))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
@@ -185,8 +191,6 @@ func (c *Client) SelectOutbound(ctx context.Context, selector, target string) er
 		return fmt.Errorf("outbound-not-found: selector %q or target %q", selector, target)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		var m map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&m)
 		return fmt.Errorf("singbox-api: selector switch failed status %d", resp.StatusCode)
 	}
 	now, err := c.GetSelectedOutbound(ctx, selector)
@@ -234,8 +238,6 @@ func (c *Client) Delay(ctx context.Context, outboundTag, testURL string, timeout
 	case http.StatusGatewayTimeout:
 		return 0, fmt.Errorf("timeout: outbound %q delay test timed out", outboundTag)
 	default:
-		var body map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&body)
 		return 0, fmt.Errorf("singbox-api: status %d", resp.StatusCode)
 	}
 }

@@ -71,7 +71,12 @@ func WriteSystemdUnit(servicePath, binaryPath, configDir string) error {
 	if err := os.MkdirAll(filepath.Dir(servicePath), 0o755); err != nil {
 		return fmt.Errorf("create systemd user directory: %w", err)
 	}
-	if err := os.WriteFile(servicePath, []byte(BuildSystemdUnit(binaryPath, configDir)), 0o644); err != nil {
+	if info, err := os.Lstat(servicePath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write symlinked systemd unit %s", servicePath)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect systemd unit: %w", err)
+	}
+	if err := writeFileAtomic(servicePath, []byte(BuildSystemdUnit(binaryPath, configDir)), 0o644); err != nil {
 		return fmt.Errorf("write systemd unit: %w", err)
 	}
 	return nil

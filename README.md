@@ -101,9 +101,10 @@ Raw share and subscription URLs are never printed. Keep `~/.config/frostgate/` p
 ### Supported protocol scope
 
 - VLESS + REALITY over RAW/TCP; Vision (`xtls-rprx-vision`) is supported.
+- Native sing-box RAW VLESS has no V2Ray `transport` object. An omitted native `network` keeps sing-box's TCP-and-UDP default; explicit native TCP is preserved as `network: tcp`.
 - Hysteria2 with password, SNI, salamander obfs, obfs password, and `tls.insecure`.
 - VLESS `ws`, `grpc`, `http`, `httpupgrade`, `quic`, and `kcp` transports are rejected.
-- Hysteria2 certificate pin parameters (`pinSHA256` and `pin`) are rejected because sing-box pin preservation is not implemented.
+- Certificate pinning fields are rejected for VLESS and Hysteria2 because Frostgate cannot preserve them safely.
 - Trojan, Shadowsocks, VMess, and unsupported subscription nodes are reported as unsupported.
 
 ## Benchmark
@@ -153,6 +154,8 @@ Diagnosis checks direct connectivity, DNS, measured VLESS TCP reachability, side
 
 `DIFFER` is a signal only, not proof of DNS poisoning or censorship. CDNs and geographically distributed resolvers can return different addresses.
 
+With no sing-box endpoints, `doctor` and `diagnose` mark sing-box, sidecar, and controller checks as `SKIP`; direct connectivity and DNS checks still run.
+
 ## History, comparison, and recommendations
 
 ```sh
@@ -174,7 +177,9 @@ History is stored at `$XDG_DATA_HOME/frostgate/history.db` or `~/.local/share/fr
 
 Most users should use `frostgate setup`, `add`, or `import`. The generated config is at `$XDG_CONFIG_HOME/frostgate/config.yaml` or `~/.config/frostgate/config.yaml`.
 
-An explicit `--config /path/to/config.yaml` is an isolated profile: its managed `sing-box.json` and `controller-secret` live beside that config instead of in the default XDG directory. Managed custom profiles use a deterministic profile-specific user service and loopback controller/benchmark bindings, so they do not restart or bind over the default profile.
+An explicit `--config /path/to/config.yaml` is an isolated profile. Its managed state is the hidden sibling `.frostgate-<profile-id>/`, keyed by the canonical config file. Two configs in one directory stay separate; relative and symlink aliases of one config share one profile. The default config keeps its historical XDG paths, service, and ports. Custom profiles use deterministic service and loopback bindings.
+
+Legacy custom state beside an explicit config is adopted only when its config, routes, controller, listener, and secret prove ownership. If a legacy unit exists, it must point at that state before Frostgate quiesces it. Ambiguous legacy state is left untouched.
 
 ```yaml
 defaults:
@@ -218,6 +223,8 @@ endpoints:
 
 `benchmark.download_url` must be HTTP or HTTPS. Frostgate appends the configured byte count to its `bytes` query parameter. `singbox.benchmark_proxy` must be a loopback `host:port` and belongs to the managed sidecar; omit it for an external controller that has no proven benchmark listener.
 
+`defaults.priority` is inherited only by endpoints that omit `priority`; an explicit `priority: 0` remains zero. `defaults.degraded_latency` is rejected because it has no health-policy effect.
+
 Set `history.enabled: false` for zero history database access. `history.retention` controls pruning. `history.watch_interval` limits writes while watching.
 
 For HTTP endpoints, `expected_status` requires an exact response code. Without it, any HTTP status from 200 through 399 is considered successful.
@@ -235,7 +242,7 @@ frostgate recommend --json
 frostgate history --json
 ```
 
-Core probe documents use JSON schema version 3. They include `direct` and `best_proxy`; the legacy `best` field remains where applicable. Watch mode writes one JSON document per line. Human messages go to stderr in JSON mode.
+Core probe documents use JSON schema version 4. They include `direct`, `best_proxy`, and classifier `reasons`; unknown jitter is `null` with `jitter_known: false`. The legacy `best` field remains where applicable. Watch mode writes one JSON document per line. Human messages go to stderr in JSON mode.
 
 ## Sidecar and recovery
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,23 +15,27 @@ import (
 )
 
 type Model struct {
-	cfg         *config.Config
-	results     []probe.Result
-	err         error
-	interval    time.Duration
-	width       int
-	height      int
-	lastTick    time.Time
-	lastRefresh time.Time
-	probing     bool
-	pending     bool
-	quitting    bool
-	verbose     bool
+	ctx          context.Context
+	cfg          *config.Config
+	results      []probe.Result
+	err          error
+	interval     time.Duration
+	width        int
+	height       int
+	lastTick     time.Time
+	lastRefresh  time.Time
+	probing      bool
+	pending      bool
+	quitting     bool
+	verbose      bool
+	probeControl *probeControl
 	// onSnapshot is invoked after every completed probe snapshot (scheduled
 	// tick or manual refresh). The application layer uses it to feed the
 	// history recorder; the TUI itself never touches storage.
 	onSnapshot func([]probe.Result)
 }
+
+type probeControl struct{ cancel context.CancelFunc }
 
 type tickMsg time.Time
 type resultsMsg struct {
@@ -47,13 +52,27 @@ var (
 
 // New builds the TUI model. onSnapshot may be nil.
 func New(cfg *config.Config, interval time.Duration, verbose bool, onSnapshot func([]probe.Result)) Model {
+	return NewWithContext(context.Background(), cfg, interval, verbose, onSnapshot)
+}
+
+// NewWithContext lets callers propagate process cancellation into the TUI's
+// in-flight probe. New remains available for callers that do not need it.
+func NewWithContext(ctx context.Context, cfg *config.Config, interval time.Duration, verbose bool, onSnapshot func([]probe.Result)) Model {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	return Model{
-		cfg:        cfg,
-		interval:   interval,
-		verbose:    verbose,
-		lastTick:   time.Now(),
-		probing:    true,
-		onSnapshot: onSnapshot,
+		ctx:          ctx,
+		cfg:          cfg,
+		interval:     interval,
+		verbose:      verbose,
+		lastTick:     time.Now(),
+		probing:      true,
+		probeControl: &probeControl{},
+		onSnapshot:   onSnapshot,
 	}
 }
 
@@ -62,12 +81,59 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) probeCmd() tea.Cmd {
+	ctx, cancel := context.WithTimeout(m.ctx, ProbeBudget(m.cfg))
+	if m.probeControl != nil {
+		m.probeControl.cancel = cancel
+	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		results := probe.Run(ctx, m.cfg)
 		return resultsMsg{results: results, completed: time.Now()}
 	}
+}
+
+// ProbeBudget is the longest valid per-route probe schedule plus a small
+// scheduling allowance. Routes run concurrently, so the bound is the maximum
+// endpoint schedule, not the sum across endpoints. Endpoint timeouts and
+// configured intervals remain authoritative.
+func ProbeBudget(cfg *config.Config) time.Duration {
+	if cfg == nil || len(cfg.Endpoints) == 0 {
+		return 5 * time.Second
+	}
+	var longest time.Duration
+	for _, ep := range cfg.Endpoints {
+		samples := cfg.SamplesFor(ep)
+		if samples < 1 {
+			samples = 1
+		}
+		budget := saturatingDurationProduct(samples, cfg.TimeoutFor(ep))
+		if samples > 1 {
+			budget = saturatingDurationAdd(budget, saturatingDurationProduct(samples-1, cfg.SampleIntervalFor(ep)))
+		}
+		if budget > longest {
+			longest = budget
+		}
+	}
+	return saturatingDurationAdd(longest, time.Second)
+}
+
+func saturatingDurationProduct(count int, duration time.Duration) time.Duration {
+	if count <= 0 || duration <= 0 {
+		return 0
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	if int64(count) > int64(maxDuration/duration) {
+		return maxDuration
+	}
+	return time.Duration(count) * duration
+}
+
+func saturatingDurationAdd(left, right time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if left >= maxDuration-right {
+		return maxDuration
+	}
+	return left + right
 }
 
 func (m Model) tickCmd() tea.Cmd {
@@ -82,6 +148,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			m.quitting = true
+			if m.probeControl != nil && m.probeControl.cancel != nil {
+				m.probeControl.cancel()
+			}
 			return m, tea.Quit
 		case "r":
 			if m.probing {
@@ -104,6 +173,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.probing = true
 		return m, tea.Batch(m.probeCmd(), m.tickCmd())
 	case resultsMsg:
+		if m.probeControl != nil {
+			m.probeControl.cancel = nil
+		}
 		m.probing = false
 		m.lastRefresh = msg.completed
 		if m.lastRefresh.IsZero() {
@@ -149,7 +221,7 @@ func (m Model) View() string {
 		if probe.HasProxy(m.results) {
 			if d, ok := probe.DirectBaseline(m.results); ok {
 				lat := "—"
-				if d.Metrics.Succeeded > 0 && d.Metrics.Median > 0 {
+				if d.Metrics.Succeeded > 0 {
 					lat = formatDur(d.Metrics.Median)
 				}
 				state := "DOWN"
@@ -179,7 +251,21 @@ func (m Model) View() string {
 	}
 	b += subStyle.Render(fmt.Sprintf("Last refresh: %s", lastRefresh)) + "  " + helpStyle.Render("q quit  r refresh") + "\n"
 	if m.verbose && len(m.results) > 0 {
-		// show details: each route's samples?
+		b += "\n" + subStyle.Render("Sample evidence") + "\n"
+		for _, r := range m.results {
+			jitter := "N/A"
+			if r.Metrics.JitterKnown {
+				jitter = formatDur(r.Metrics.Jitter)
+			}
+			detail := fmt.Sprintf("%s: %d/%d successful, jitter %s", r.Endpoint.Name, r.Metrics.Succeeded, r.Metrics.Attempted, jitter)
+			if r.Category != "" {
+				detail += ", " + r.Category
+			}
+			if reasons := resultReasons(r); reasons != "" {
+				detail += ", " + reasons
+			}
+			b += subStyle.Render(detail) + "\n"
+		}
 	}
 	return b
 }
@@ -208,7 +294,7 @@ func renderTable(results []probe.Result, width int) string {
 			median = formatDur(r.Metrics.Median)
 		}
 		jitter := "—"
-		if r.Metrics.Succeeded > 1 {
+		if r.Metrics.JitterKnown {
 			jitter = formatDur(r.Metrics.Jitter)
 		}
 		detail := ""
@@ -218,6 +304,12 @@ func renderTable(results []probe.Result, width int) string {
 			} else if r.ErrMsg != "" {
 				detail = truncate(redact.String(r.ErrMsg), 24)
 			}
+		}
+		if reasons := resultReasons(r); reasons != "" {
+			if detail != "" {
+				detail += ", "
+			}
+			detail += reasons
 		}
 		line := fmt.Sprintf("%-20s %-9s %4s %7s %7s  %s", truncate(r.Endpoint.Name, 20), state, loss, median, jitter, detail)
 		lines = append(lines, line)
@@ -237,7 +329,21 @@ func renderTable(results []probe.Result, width int) string {
 	return out
 }
 
+func resultReasons(r probe.Result) string {
+	if len(r.Reasons) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(r.Reasons))
+	for _, reason := range r.Reasons {
+		parts = append(parts, string(reason))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func formatDur(d time.Duration) string {
+	if d == 0 {
+		return "0ms"
+	}
 	if d < time.Millisecond {
 		return "<1ms"
 	}

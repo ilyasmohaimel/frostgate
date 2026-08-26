@@ -5,20 +5,24 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/ilyasmohaimel/frostgate/internal/redact"
 )
 
 type VLESSOutbound struct {
-	Tag            string
-	Server         string
-	ServerPort     int
-	UUID           string
-	Flow           string
-	SNI            string
-	FP             string
-	PBK            string
-	SID            string
-	SpiderX        string
-	PacketEncoding string
+	Tag               string
+	Server            string
+	ServerPort        int
+	UUID              string
+	Flow              string
+	SNI               string
+	FP                string
+	PBK               string
+	SID               string
+	SpiderX           string
+	PacketEncoding    string
+	PacketEncodingSet bool
+	Network           string
 }
 
 type Hysteria2Outbound struct {
@@ -31,6 +35,7 @@ type Hysteria2Outbound struct {
 	SNI          string
 	Insecure     bool
 	PinSHA256    string
+	Network      string
 }
 
 func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
@@ -91,6 +96,20 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 	if transport != "" && transport != "tcp" && transport != "raw" {
 		return nil, fmt.Errorf("unsupported VLESS transport %q", transport)
 	}
+	network := strings.ToLower(q.Get("network"))
+	switch network {
+	case "":
+		// Share links predate the native sing-box TCP-and-UDP default. Keep
+		// their historical raw TCP meaning when they do not state a network.
+		network = "tcp"
+	case "tcp":
+	case "both":
+		// An empty native sing-box network enables TCP and UDP. `both` is an
+		// internal importer marker used when a native outbound omitted it.
+		network = ""
+	default:
+		return nil, fmt.Errorf("unsupported VLESS network %q", network)
+	}
 	if flow != "" && flow != "xtls-rprx-vision" {
 		return nil, fmt.Errorf("unsupported VLESS flow %q", flow)
 	}
@@ -104,19 +123,29 @@ func ParseVLESSShareLink(link, tag string) (*VLESSOutbound, error) {
 		return nil, fmt.Errorf("non-REALITY VLESS is not currently supported: security=%q", security)
 	}
 	// Fragment may contain name but not needed
+	packetEncoding, packetEncodingSet := q["packet_encoding"]
 	return &VLESSOutbound{
-		Tag:            tag,
-		Server:         host,
-		ServerPort:     port,
-		UUID:           uuid,
-		Flow:           flow,
-		SNI:            sni,
-		FP:             fp,
-		PBK:            pbk,
-		SID:            sid,
-		SpiderX:        spx,
-		PacketEncoding: q.Get("packet_encoding"),
+		Tag:               tag,
+		Server:            host,
+		ServerPort:        port,
+		UUID:              uuid,
+		Flow:              flow,
+		SNI:               sni,
+		FP:                fp,
+		PBK:               pbk,
+		SID:               sid,
+		SpiderX:           spx,
+		PacketEncoding:    firstValue(packetEncoding),
+		PacketEncodingSet: packetEncodingSet,
+		Network:           network,
 	}, nil
+}
+
+func firstValue(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
@@ -177,15 +206,25 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 	if obfs == "salamander" && obfsPass == "" {
 		return nil, fmt.Errorf("salamander obfs requires obfs-password")
 	}
+	if obfs != "" && obfs != "salamander" {
+		return nil, fmt.Errorf("unsupported Hysteria2 obfs %q", obfs)
+	}
+	network := strings.ToLower(q.Get("network"))
+	if network != "" && network != "tcp" && network != "udp" {
+		return nil, fmt.Errorf("unsupported Hysteria2 network %q", network)
+	}
 	insecure := false
 	if v := q.Get("insecure"); v == "1" || strings.EqualFold(v, "true") {
 		insecure = true
 	}
 	pin := q.Get("pinSHA256")
+	if pin == "" {
+		pin = q.Get("certificate_public_key_sha256")
+	}
 	if pin != "" {
 		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256: certificate pinning is not currently supported")
 	}
-	if q.Get("pin") != "" {
+	if q.Get("pin") != "" || q.Get("certificate_fingerprint") != "" || q.Get("fingerprint") != "" {
 		return nil, fmt.Errorf("unsupported Hysteria2 pinSHA256")
 	}
 	return &Hysteria2Outbound{
@@ -198,24 +237,10 @@ func ParseHysteria2ShareLink(link, tag string) (*Hysteria2Outbound, error) {
 		SNI:          sni,
 		Insecure:     insecure,
 		PinSHA256:    pin,
+		Network:      network,
 	}, nil
 }
 
 func RedactURL(link string) string {
-	u, err := url.Parse(strings.TrimSpace(link))
-	if err != nil {
-		return "[redacted]"
-	}
-	if u.User != nil {
-		u.User = url.UserPassword("REDACTED", "REDACTED")
-	}
-	// redact sensitive query params
-	q := u.Query()
-	for _, k := range []string{"pbk", "sid", "password", "obfs-password", "obfsPassword"} {
-		if q.Get(k) != "" {
-			q.Set(k, "REDACTED")
-		}
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
+	return redact.String(link)
 }

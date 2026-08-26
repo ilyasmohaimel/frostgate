@@ -19,7 +19,7 @@ func TestClassify(t *testing.T) {
 		{"high loss -> down", metrics.Metrics{Attempted: 4, Succeeded: 1, Failed: 3, LossPct: 75, Median: 100 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDown},
 		{"all fail -> down", metrics.Metrics{Attempted: 4, Succeeded: 0, Failed: 4, LossPct: 100}, StatusDown},
 		{"slow median -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 900 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDegraded},
-		{"high jitter -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 100 * time.Millisecond, Jitter: 100 * time.Millisecond}, StatusDegraded},
+		{"high measured jitter -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 100 * time.Millisecond, Jitter: 100 * time.Millisecond, JitterKnown: true}, StatusDegraded},
 		{"zero attempted -> down", metrics.Metrics{Attempted: 0}, StatusDown},
 	}
 	for _, tt := range tests {
@@ -28,6 +28,14 @@ func TestClassify(t *testing.T) {
 				t.Errorf("Classify() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClassifyDoesNotTreatUnknownJitterAsMeasured(t *testing.T) {
+	th := DefaultThresholds()
+	m := metrics.Metrics{Attempted: 2, Succeeded: 2, Median: 100 * time.Millisecond, Jitter: th.MaxJitter + time.Second}
+	if got := Classify(m, th); got != StatusUp {
+		t.Fatalf("unknown jitter changed health status: %s", got)
 	}
 }
 
@@ -64,5 +72,28 @@ func TestClassify_Boundaries(t *testing.T) {
 	m.Attempted = 4
 	if got := Classify(m, th); got != StatusUp {
 		t.Errorf("0 loss should be up")
+	}
+}
+
+func TestClassifyWithReasonsUsesConfiguredJitterThreshold(t *testing.T) {
+	th := Thresholds{
+		HealthyLatency:  200 * time.Millisecond,
+		MaxJitter:       20 * time.Millisecond,
+		MaxLossPct:      5,
+		DegradedLossPct: 50,
+	}
+	m := metrics.Metrics{
+		Attempted:   4,
+		Succeeded:   4,
+		Median:      150 * time.Millisecond,
+		Jitter:      35 * time.Millisecond,
+		JitterKnown: true,
+	}
+	status, reasons := ClassifyWithReasons(m, th)
+	if status != StatusDegraded {
+		t.Fatalf("status=%s, want degraded", status)
+	}
+	if len(reasons) != 1 || reasons[0] != ReasonJitter {
+		t.Fatalf("reasons=%v, want [jitter]", reasons)
 	}
 }

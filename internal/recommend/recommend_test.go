@@ -29,8 +29,8 @@ func TestHugeDifferenceBeatsPriority(t *testing.T) {
 
 func TestReasonsOnlyClaimLowestJitterWhenCompared(t *testing.T) {
 	inputs := []Input{
-		{Name: "winner", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Jitter: 12 * time.Millisecond, Priority: 10},
-		{Name: "steadier", Status: "up", Loss: 10, Median: 500 * time.Millisecond, Jitter: 4 * time.Millisecond, Priority: 20},
+		{Name: "winner", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Jitter: 12 * time.Millisecond, JitterKnown: true, Priority: 10},
+		{Name: "steadier", Status: "up", Loss: 10, Median: 500 * time.Millisecond, Jitter: 4 * time.Millisecond, JitterKnown: true, Priority: 20},
 	}
 	result := Recommend(inputs, 0)
 	if result.BestOverall.Name != "winner" || containsReason(result.Reasons, "lowest jitter") || !containsReason(result.Reasons, "12ms jitter") {
@@ -47,9 +47,24 @@ func TestReasonsOnlyClaimLowestJitterWhenCompared(t *testing.T) {
 		t.Fatalf("tied lowest jitter missing: %+v", result.Reasons)
 	}
 	inputs[0].Jitter = 0
+	inputs[0].JitterKnown = false
 	result = Recommend(inputs, 0)
 	if containsReason(result.Reasons, "lowest jitter") || containsReason(result.Reasons, "0ms jitter") {
 		t.Fatalf("missing jitter evidence became a superlative: %+v", result.Reasons)
+	}
+}
+
+func TestUnknownJitterIsNotPreferredAsPerfect(t *testing.T) {
+	inputs := []Input{
+		{Name: "unknown", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Priority: 10},
+		{Name: "measured", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Jitter: 0, JitterKnown: true, Priority: 20},
+	}
+	result := Recommend(inputs, 0)
+	if result.MostStable.Name != "measured" {
+		t.Fatalf("unknown jitter selected as most stable: %+v", result.MostStable)
+	}
+	if containsReason(result.Reasons, "lowest jitter") {
+		t.Fatalf("incomplete jitter evidence produced a superlative: %v", result.Reasons)
 	}
 }
 
@@ -70,6 +85,18 @@ func TestCloseAllowsPriority(t *testing.T) {
 	res := Recommend(inputs, 5)
 	if res.BestOverall.Name != "Reality" {
 		t.Fatalf("close should allow priority Reality but got %q", res.BestOverall.Name)
+	}
+}
+
+func TestPreferredSupportsFullIntPriorityRange(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	inputs := []Input{
+		{Name: "best", Status: "up", Loss: 0, Median: 100 * time.Millisecond, Priority: maxInt},
+		{Name: "other", Status: "up", Loss: 0, Median: 200 * time.Millisecond, Priority: maxInt - 1},
+	}
+	result := Recommend(inputs, 0)
+	if result.Preferred == nil || result.Preferred.Name != "other" {
+		t.Fatalf("preferred = %+v, want full-range lower priority route", result.Preferred)
 	}
 }
 

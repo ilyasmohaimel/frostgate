@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -57,7 +58,7 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
 	}
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, bytes+1024*1024))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, boundedReadLimit(bytes, 1024*1024)))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -71,7 +72,7 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if elapsed == 0 {
 		return 0, elapsed, fmt.Errorf("zero elapsed")
 	}
-	mbps := float64(n*8) / elapsed.Seconds() / 1e6
+	mbps := float64(n) * 8 / elapsed.Seconds() / 1e6
 	return mbps, elapsed, nil
 }
 
@@ -113,7 +114,7 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
 	}
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, bytes+2*1024*1024))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, boundedReadLimit(bytes, 2*1024*1024)))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -127,8 +128,15 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if elapsed == 0 {
 		return 0, elapsed, fmt.Errorf("zero elapsed")
 	}
-	mbps := float64(n*8) / elapsed.Seconds() / 1e6
+	mbps := float64(n) * 8 / elapsed.Seconds() / 1e6
 	return mbps, elapsed, nil
+}
+
+func boundedReadLimit(bytes, slack int64) int64 {
+	if bytes <= 0 || bytes > math.MaxInt64-slack {
+		return math.MaxInt64
+	}
+	return bytes + slack
 }
 
 func hasBytesParam(u string) bool {

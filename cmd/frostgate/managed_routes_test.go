@@ -423,14 +423,293 @@ func TestFailedFirstRouteBootstrapRemovesNewProfileUnit(t *testing.T) {
 	identity := profile.ForPath(configPath, false)
 	findSingBox = func(string) (string, error) { return "/opt/bin/sing-box", nil }
 	writeSystemdUnit = setup.WriteSystemdUnit
+	var stops, disables int
 	newSidecarRunner = func(string, string, string) *managedconfig.SidecarRunner {
-		return &managedconfig.SidecarRunner{Validator: func([]byte) error { return nil }, Restart: func() error { return errors.New("restart rejected") }}
+		return &managedconfig.SidecarRunner{
+			Validator: func([]byte) error { return nil },
+			Restart:   func() error { return errors.New("restart rejected") },
+			Stop:      func() error { stops++; return nil },
+			Disable:   func() error { disables++; return nil },
+		}
 	}
 	if _, err := addManagedRoute(dir, configPath, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com", "first-route", nil); err == nil {
 		t.Fatal("expected bootstrap failure")
 	}
 	if _, err := os.Stat(setup.ServiceUnitPath(identity.Service)); !os.IsNotExist(err) {
 		t.Fatalf("failed bootstrap left profile unit: %v", err)
+	}
+	if stops != 1 || disables != 1 {
+		t.Fatalf("failed bootstrap did not quiesce transient sidecar: stop=%d disable=%d", stops, disables)
+	}
+}
+
+func TestFailedExistingCustomProfileKeepsHealthyUnitRunning(t *testing.T) {
+	oldFind, oldWrite, oldRunner := findSingBox, writeSystemdUnit, newSidecarRunner
+	t.Cleanup(func() { findSingBox, writeSystemdUnit, newSidecarRunner = oldFind, oldWrite, oldRunner })
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	dir := filepath.Join(root, "profiles", "custom")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	identity := profile.ForPath(configPath, false)
+	managed := &managedconfig.Managed{Dir: dir, Secret: "fixture-secret"}
+	managed.AddVLESS(&setup.VLESSOutbound{Tag: "existing", Server: "203.0.113.10", ServerPort: 443, UUID: "11111111-1111-4111-8111-111111111111", SNI: "example.com", PBK: "fixture-key", FP: "chrome", Network: "tcp"})
+	managed.ConfigureProfile(identity.ControllerAddr, identity.BenchmarkAddr)
+	sidecar, err := managed.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), sidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "controller-secret"), []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configData := fmt.Sprintf(`singbox:
+  controller: http://%s
+  secret_file: %s
+  benchmark_proxy: %s
+endpoints:
+  - name: direct
+    type: http
+    url: https://www.gstatic.com/generate_204
+  - name: existing
+    type: singbox
+    outbound: existing
+`, identity.ControllerAddr, filepath.Join(dir, "controller-secret"), identity.BenchmarkAddr)
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := setup.ServiceUnitPath(identity.Service)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalUnit := []byte("existing healthy unit")
+	if err := os.WriteFile(unitPath, originalUnit, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findSingBox = func(string) (string, error) { return "/opt/bin/sing-box", nil }
+	writeSystemdUnit = setup.WriteSystemdUnit
+	var stops, disables int
+	newSidecarRunner = func(_, _, _ string) *managedconfig.SidecarRunner {
+		return &managedconfig.SidecarRunner{
+			Validator: func([]byte) error { return nil },
+			Restart:   func() error { return errors.New("restart rejected") },
+			Stop:      func() error { stops++; return nil },
+			Disable:   func() error { disables++; return nil },
+			DaemonReload: func() error {
+				return nil
+			},
+		}
+	}
+	if _, err := addManagedRoute(dir, configPath, "hysteria2://fixture-password@203.0.113.20:443?sni=example.com", "new-route", nil); err == nil {
+		t.Fatal("expected existing profile transaction failure")
+	}
+	if stops != 0 || disables != 0 {
+		t.Fatalf("healthy existing profile was quiesced: stop=%d disable=%d", stops, disables)
+	}
+	if got, err := os.ReadFile(unitPath); err != nil || !bytes.Equal(got, originalUnit) {
+		t.Fatalf("existing unit was not restored in place: %q err=%v", got, err)
+	}
+}
+
+func TestManagedUnitRollbackRejectsReplacementSymlink(t *testing.T) {
+	oldWrite := writeSystemdUnit
+	t.Cleanup(func() { writeSystemdUnit = oldWrite })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile.service")
+	target := filepath.Join(dir, "outside.service")
+	original := []byte("original unit")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := []byte("outside unit")
+	if err := os.WriteFile(target, outside, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeSystemdUnit = func(path, _, _ string) error {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		return os.Symlink(target, path)
+	}
+	restore, created, err := writeManagedUnit(path, "/usr/bin/sing-box", dir)
+	if err != nil || created {
+		t.Fatalf("existing unit snapshot created:%v err:%v", created, err)
+	}
+	if err := restore(); err == nil || !strings.Contains(err.Error(), "symlinked systemd unit") {
+		t.Fatalf("symlink replacement was followed during rollback: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, outside) {
+		t.Fatalf("rollback changed replacement target: %q err=%v", got, err)
+	}
+	if link, err := os.Readlink(path); err != nil || link != target {
+		t.Fatalf("replacement symlink was overwritten: %q err=%v", link, err)
+	}
+}
+
+func TestMigrationCleanupRequiresMatchingOwner(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, migrationOwnerFile), []byte("owner-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnedMigrationState(dir, "owner-b"); err == nil {
+		t.Fatal("migration cleanup ignored a mismatched owner")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("mismatched owner cleanup removed state: %v", err)
+	}
+	if err := removeOwnedMigrationState(dir, "owner-a"); err != nil {
+		t.Fatalf("matching owner cleanup failed: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("matching owner cleanup retained state: %v", err)
+	}
+}
+
+func TestFinalizeMigrationStateRemovesOnlyItsMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, migrationOwnerFile), []byte("owner-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeMigrationState(dir, "owner-b"); err == nil {
+		t.Fatal("migration finalization ignored a mismatched owner")
+	}
+	if _, err := os.Stat(filepath.Join(dir, migrationOwnerFile)); err != nil {
+		t.Fatalf("mismatched finalization removed marker: %v", err)
+	}
+	if err := finalizeMigrationState(dir, "owner-a"); err != nil {
+		t.Fatalf("migration finalization failed: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("migration finalization removed state directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, migrationOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("migration finalization retained marker: %v", err)
+	}
+}
+
+func TestPrepareManagedStateRejectsInProgressMigration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	configPath := filepath.Join(root, "profile.yaml")
+	_, state := commandPaths(configPath)
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, migrationOwnerFile), []byte("another-owner\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := prepareManagedStateWithRollback(configPath, state); err == nil || !strings.Contains(err.Error(), "in-progress migration") {
+		t.Fatalf("concurrent migration was not rejected: %v", err)
+	}
+}
+
+func TestMigrationRollbackPreservesDisabledInactiveLegacyService(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	legacyDir := filepath.Join(root, "legacy")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := profile.LegacyIdentity(filepath.Join(legacyDir, "config.yaml"))
+	unitPath := setup.ServiceUnitPath(identity.Service)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(setup.BuildSystemdUnit("/usr/bin/sing-box", legacyDir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldOutput := runUserSystemctlOutput
+	oldSystemctl := runUserSystemctl
+	t.Cleanup(func() { runUserSystemctlOutput, runUserSystemctl = oldOutput, oldSystemctl })
+	runUserSystemctlOutput = func(args ...string) ([]byte, error) {
+		if args[0] == "is-enabled" {
+			return []byte("disabled\n"), errors.New("disabled")
+		}
+		return []byte("inactive\n"), errors.New("inactive")
+	}
+	var calls []string
+	runUserSystemctl = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	state, err := quiesceLegacyService(legacyDir, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.Enabled || state.Active {
+		t.Fatalf("legacy service state was not captured: %+v", state)
+	}
+	if err := restoreLegacyService(*state); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"disable --now " + identity.Service, "disable " + identity.Service}; !equalStrings(calls, want) {
+		t.Fatalf("legacy disabled/inactive lifecycle = %v, want %v", calls, want)
+	}
+}
+
+func TestMigrationRollbackPreservesStaticLegacyServiceState(t *testing.T) {
+	oldSystemctl := runUserSystemctl
+	t.Cleanup(func() { runUserSystemctl = oldSystemctl })
+	var calls []string
+	runUserSystemctl = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	state := legacyServiceState{Name: "frostgate-static.service", Active: true}
+	if err := restoreLegacyService(state); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"start frostgate-static.service"}; !equalStrings(calls, want) {
+		t.Fatalf("static legacy service lifecycle = %v, want %v", calls, want)
+	}
+}
+
+func TestQuiesceFailureReturnsLegacyStateForRecovery(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	legacyDir := filepath.Join(root, "legacy")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := profile.LegacyIdentity(filepath.Join(legacyDir, "config.yaml"))
+	unitPath := setup.ServiceUnitPath(identity.Service)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(setup.BuildSystemdUnit("/usr/bin/sing-box", legacyDir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldOutput := runUserSystemctlOutput
+	oldSystemctl := runUserSystemctl
+	t.Cleanup(func() { runUserSystemctlOutput, runUserSystemctl = oldOutput, oldSystemctl })
+	runUserSystemctlOutput = func(args ...string) ([]byte, error) {
+		if args[0] == "is-enabled" {
+			return []byte("enabled\n"), nil
+		}
+		return []byte("active\n"), nil
+	}
+	var calls []string
+	runUserSystemctl = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		if len(args) > 1 && args[0] == "disable" && args[1] == "--now" {
+			return errors.New("disable partially failed")
+		}
+		return nil
+	}
+	state, err := quiesceLegacyService(legacyDir, identity)
+	if err == nil || state == nil || !state.Enabled || !state.Active {
+		t.Fatalf("quiesce failure lost prior state: state=%+v err=%v", state, err)
+	}
+	if restoreErr := restoreLegacyService(*state); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if want := []string{"disable --now " + identity.Service, "enable --now " + identity.Service}; !equalStrings(calls, want) {
+		t.Fatalf("quiesce failure recovery lifecycle = %v, want %v", calls, want)
 	}
 }
 
@@ -570,5 +849,228 @@ endpoints:
 	}
 	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, configData) {
 		t.Fatalf("external config changed: %q err=%v", got, err)
+	}
+}
+
+func TestPrepareManagedStateAdoptsOnlyProvenLegacyProfile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	oldSystemctl, oldSystemctlOutput := runUserSystemctl, runUserSystemctlOutput
+	var systemctlCalls [][]string
+	runUserSystemctl = func(args ...string) error {
+		systemctlCalls = append(systemctlCalls, append([]string(nil), args...))
+		return nil
+	}
+	runUserSystemctlOutput = func(args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "is-enabled" {
+			return []byte("enabled\n"), nil
+		}
+		return []byte("active\n"), nil
+	}
+	t.Cleanup(func() { runUserSystemctl, runUserSystemctlOutput = oldSystemctl, oldSystemctlOutput })
+	configPath := filepath.Join(dir, "profile.yaml")
+	legacyIdentity := profile.LegacyIdentity(configPath)
+	configData := []byte(fmt.Sprintf(`singbox:
+  controller: http://%s
+  secret_file: %s
+  benchmark_proxy: %s
+endpoints:
+  - name: direct
+    type: http
+    url: https://example.com/
+  - name: route-a
+    type: singbox
+    outbound: route-a
+`, legacyIdentity.ControllerAddr, filepath.Join(dir, "controller-secret"), legacyIdentity.BenchmarkAddr))
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyManaged := &managedconfig.Managed{Dir: dir, Secret: "legacy-secret"}
+	legacyManaged.AddVLESS(&setup.VLESSOutbound{Tag: "route-a", Server: "203.0.113.10", ServerPort: 443, UUID: "11111111-1111-4111-8111-111111111111", SNI: "example.com", PBK: "fixture-key", FP: "chrome", Network: "tcp"})
+	legacyManaged.ConfigureProfile("http://"+legacyIdentity.ControllerAddr, legacyIdentity.BenchmarkAddr)
+	legacy, err := legacyManaged.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "controller-secret"), []byte("legacy-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := setup.ServiceUnitPath(legacyIdentity.Service)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(setup.BuildSystemdUnit("/usr/bin/sing-box", dir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, state := commandPaths(configPath)
+	rollback, _, err := prepareManagedStateWithRollback(configPath, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"sing-box.json", "controller-secret"} {
+		copied, err := os.ReadFile(filepath.Join(state, name))
+		if err != nil {
+			t.Fatalf("migrated %s missing: %v", name, err)
+		}
+		original, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !bytes.Equal(copied, original) {
+			t.Fatalf("legacy %s was not preserved", name)
+		}
+	}
+	if marker, err := os.ReadFile(filepath.Join(state, migrationOwnerFile)); err != nil || strings.TrimSpace(string(marker)) == "" {
+		t.Fatalf("migration ownership marker missing: %q err=%v", marker, err)
+	}
+	if len(systemctlCalls) != 1 || strings.Join(systemctlCalls[0], " ") != "disable --now "+legacyIdentity.Service {
+		t.Fatalf("legacy service was not quiesced: %v", systemctlCalls)
+	}
+	if err := rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("rollback retained migrated state: %v", err)
+	}
+	if len(systemctlCalls) != 2 || strings.Join(systemctlCalls[1], " ") != "enable --now "+legacyIdentity.Service {
+		t.Fatalf("legacy service was not restored: %v", systemctlCalls)
+	}
+}
+
+func TestPrepareManagedStateRejectsAmbiguousLegacySibling(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "a.yaml")
+	other := filepath.Join(dir, "b.yaml")
+	for _, path := range []string{configPath, other} {
+		if err := os.WriteFile(path, []byte("endpoints: []\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), []byte(`{"outbounds":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, state := commandPaths(configPath)
+	if err := prepareManagedState(configPath, state); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous legacy state was adopted: %v", err)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("ambiguous migration created state: %v", err)
+	}
+}
+
+func TestBenchmarkMigratesProvenLegacyCustomProfile(t *testing.T) {
+	oldFind, oldWrite, oldRunner, oldSystemctl, oldSystemctlOutput := findSingBox, writeSystemdUnit, newSidecarRunner, runUserSystemctl, runUserSystemctlOutput
+	t.Cleanup(func() {
+		findSingBox, writeSystemdUnit, newSidecarRunner, runUserSystemctl, runUserSystemctlOutput = oldFind, oldWrite, oldRunner, oldSystemctl, oldSystemctlOutput
+	})
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	legacyDir := filepath.Join(root, "profile")
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(legacyDir, "config.yaml")
+	legacyIdentity := profile.LegacyIdentity(configPath)
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`singbox:
+  controller: http://%s
+  secret_file: %s
+endpoints:
+  - name: direct
+    type: http
+    url: https://example.com/
+  - name: legacy-route
+    type: singbox
+    outbound: legacy-route
+`, legacyIdentity.ControllerAddr, filepath.Join(legacyDir, "controller-secret"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &managedconfig.Managed{Dir: legacyDir, Secret: "fixture-secret"}
+	legacy.AddVLESS(&setup.VLESSOutbound{Tag: "legacy-route", Server: "203.0.113.10", ServerPort: 443, UUID: "11111111-1111-4111-8111-111111111111", SNI: "example.com", PBK: "fixture-key", FP: "chrome", Network: "tcp"})
+	legacy.ConfigureProfile("http://"+legacyIdentity.ControllerAddr, legacyIdentity.BenchmarkAddr)
+	data, err := legacy.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "sing-box.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "controller-secret"), []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := setup.ServiceUnitPath(legacyIdentity.Service)
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(setup.BuildSystemdUnit("/usr/bin/sing-box", legacyDir)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	runUserSystemctl = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	runUserSystemctlOutput = func(args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "is-enabled" {
+			return []byte("enabled\n"), nil
+		}
+		return []byte("active\n"), nil
+	}
+	findSingBox = func(string) (string, error) { return "/usr/bin/sing-box", nil }
+	writeSystemdUnit = setup.WriteSystemdUnit
+	newSidecarRunner = func(_, _, _ string) *managedconfig.SidecarRunner {
+		return &managedconfig.SidecarRunner{
+			Validator:       func([]byte) error { return nil },
+			DaemonReload:    func() error { return nil },
+			Enable:          func() error { return nil },
+			Restart:         func() error { return nil },
+			IsActive:        func() (bool, error) { return true, nil },
+			ControllerReady: func([]string) (bool, error) { return true, nil },
+		}
+	}
+	state := profile.StateDir(configPath)
+	migrated, err := migrateLegacyProfileForBenchmark(configPath, state)
+	if err != nil || !migrated {
+		t.Fatalf("benchmark migration = %v, %v", migrated, err)
+	}
+	if got, want := calls, []string{"disable --now " + legacyIdentity.Service}; !equalStrings(got, want) {
+		t.Fatalf("legacy service lifecycle = %v, want %v", got, want)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := profile.ForPath(configPath, false)
+	if cfg.SingBox.Controller != "http://"+identity.ControllerAddr || cfg.SingBox.BenchmarkProxy != identity.BenchmarkAddr || cfg.SingBox.SecretFile != filepath.Join(state, "controller-secret") {
+		t.Fatalf("config retained legacy bindings: %+v", cfg.SingBox)
+	}
+	if _, err := os.Stat(filepath.Join(state, "sing-box.json")); err != nil {
+		t.Fatalf("new profile state missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, migrationOwnerFile)); !os.IsNotExist(err) {
+		t.Fatalf("successful benchmark migration retained ownership marker: %v", err)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestUnitExecStartMatchesOnlyActualLegacyConfig(t *testing.T) {
+	configPath := "/tmp/frostgate profile/sing-box.json"
+	good := setup.BuildSystemdUnit("/usr/bin/sing-box", "/tmp/frostgate profile")
+	if !unitExecStartMatches(good, configPath) {
+		t.Fatal("generated legacy unit was not recognized")
+	}
+	bad := "[Unit]\nDescription=has " + configPath + "\n[Service]\nExecStart=/usr/bin/other run -c \"/tmp/elsewhere/sing-box.json\"\n"
+	if unitExecStartMatches(bad, configPath) {
+		t.Fatal("unrelated unit was accepted from a comment")
 	}
 }

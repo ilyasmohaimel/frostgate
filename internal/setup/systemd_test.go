@@ -91,3 +91,23 @@ func TestInstallSystemdServiceSuccess(t *testing.T) {
 		t.Fatalf("unexpected unit:\n%s", data)
 	}
 }
+
+func TestWriteSystemdUnitRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "unrelated.service")
+	original := []byte("unrelated unit\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "frostgate.service")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := WriteSystemdUnit(path, "/bin/sing-box", dir); err == nil || !strings.Contains(err.Error(), "symlinked") {
+		t.Fatalf("symlinked unit write = %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+}

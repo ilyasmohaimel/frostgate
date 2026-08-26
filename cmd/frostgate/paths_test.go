@@ -28,7 +28,7 @@ func TestCustomConfigUsesIsolatedManagedDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolved, managedDir := commandPaths(customConfig)
-	if resolved != customConfig || managedDir != customDir {
+	if resolved != customConfig || managedDir != profile.StateDir(customConfig) {
 		t.Fatalf("custom paths = %q %q", resolved, managedDir)
 	}
 	runner := &managedconfig.SidecarRunner{Validator: func([]byte) error { return nil }}
@@ -40,8 +40,92 @@ func TestCustomConfigUsesIsolatedManagedDirectory(t *testing.T) {
 	if err != nil || !bytes.Equal(gotDefault, defaultSidecar) {
 		t.Fatalf("custom config mutated default sidecar: %q err=%v", gotDefault, err)
 	}
-	if _, err := os.Stat(filepath.Join(customDir, "sing-box.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(managedDir, "sing-box.json")); err != nil {
 		t.Fatalf("custom managed sidecar missing: %v", err)
+	}
+}
+
+func TestExplicitSiblingConfigsHaveIndependentState(t *testing.T) {
+	dir := t.TempDir()
+	left := filepath.Join(dir, "china.yaml")
+	right := filepath.Join(dir, "home.yaml")
+	for _, path := range []string{left, right} {
+		if err := os.WriteFile(path, []byte("endpoints: []\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leftConfig, leftState := commandPaths(left)
+	rightConfig, rightState := commandPaths(right)
+	if leftConfig != left || rightConfig != right || leftState == rightState {
+		t.Fatalf("sibling profiles overlap: left=%q right=%q", leftState, rightState)
+	}
+	leftIdentity := profileForPaths(leftConfig, leftState)
+	rightIdentity := profileForPaths(rightConfig, rightState)
+	if leftIdentity.ID == rightIdentity.ID || leftIdentity.Service == rightIdentity.Service || leftIdentity.ControllerAddr == rightIdentity.ControllerAddr || leftIdentity.BenchmarkAddr == rightIdentity.BenchmarkAddr {
+		t.Fatalf("sibling profile identities overlap: %+v %+v", leftIdentity, rightIdentity)
+	}
+}
+
+func TestExplicitAlternateInDefaultDirectoryIsNotDefault(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	defaultDir := filepath.Join(root, "frostgate")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alternate := filepath.Join(defaultDir, "alternate.yaml")
+	if err := os.WriteFile(alternate, []byte("endpoints: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath, state := commandPaths(alternate)
+	identity := profileForPaths(configPath, state)
+	if identity.ID == profile.DefaultID || state == defaultDir {
+		t.Fatalf("explicit alternate became default: state=%q identity=%+v", state, identity)
+	}
+}
+
+func TestExplicitCanonicalAliasesUseSameState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("endpoints: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias.yaml")
+	if err := os.Symlink(configPath, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	canonicalConfig, canonicalState := commandPaths(configPath)
+	aliasConfig, aliasState := commandPaths(alias)
+	if canonicalConfig != aliasConfig || canonicalState != aliasState {
+		t.Fatalf("canonical aliases differ: %q %q; %q %q", canonicalConfig, canonicalState, aliasConfig, aliasState)
+	}
+}
+
+func TestExplicitSymlinkedManagedStateIsRejected(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FROSTGATE_TEST_HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg"))
+	defaultDir := filepath.Join(root, "xdg", "frostgate")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	customConfig := filepath.Join(root, "custom", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(customConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(customConfig, []byte("endpoints: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, managedDir := commandPaths(customConfig)
+	if err := os.Symlink(defaultDir, managedDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := validateManagedStatePath(customConfig, managedDir); err == nil {
+		t.Fatal("symlinked custom managed state was accepted")
+	}
+	if got := profileForPaths(customConfig, managedDir); got.ID == profile.DefaultID {
+		t.Fatalf("symlinked custom state was classified as default: %+v", got)
 	}
 }
 

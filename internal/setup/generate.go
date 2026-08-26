@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -40,6 +41,31 @@ func WriteSecretFile(path, secret string) error {
 }
 
 func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hysteriaOutbounds []*Hysteria2Outbound, dir string) ([]byte, error) {
+	for _, v := range vlessOutbounds {
+		if v == nil {
+			return nil, fmt.Errorf("nil VLESS outbound")
+		}
+		if v.Network != "" && v.Network != "tcp" {
+			return nil, fmt.Errorf("unsupported VLESS network %q", v.Network)
+		}
+	}
+	for _, h := range hysteriaOutbounds {
+		if h == nil {
+			return nil, fmt.Errorf("nil Hysteria2 outbound")
+		}
+		if h.Network != "" && h.Network != "tcp" && h.Network != "udp" {
+			return nil, fmt.Errorf("unsupported Hysteria2 network %q", h.Network)
+		}
+		if h.PinSHA256 != "" {
+			return nil, fmt.Errorf("Hysteria2 certificate pinning is not supported")
+		}
+		if h.ObfsType != "" && h.ObfsType != "salamander" {
+			return nil, fmt.Errorf("unsupported Hysteria2 obfs %q", h.ObfsType)
+		}
+		if h.ObfsType == "salamander" && h.ObfsPassword == "" {
+			return nil, fmt.Errorf("Hysteria2 salamander obfs requires a password")
+		}
+	}
 	cfg := map[string]any{
 		"log": map[string]any{
 			"level":  "warn",
@@ -99,10 +125,15 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 			"flow":        v.Flow,
 			"tls":         tlsCfg,
 		}
-		if v.PacketEncoding != "" {
+		if v.PacketEncodingSet {
+			ob["packet_encoding"] = v.PacketEncoding
+		} else if v.PacketEncoding != "" {
 			ob["packet_encoding"] = v.PacketEncoding
 		} else {
 			ob["packet_encoding"] = "xudp"
+		}
+		if v.Network != "" {
+			ob["network"] = v.Network
 		}
 		outbounds = append(outbounds, ob)
 	}
@@ -113,9 +144,6 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 		}
 		if h.Insecure {
 			tlsCfg["insecure"] = true
-		}
-		if h.PinSHA256 != "" {
-			tlsCfg["alpn"] = nil
 		}
 		ob := map[string]any{
 			"type":        "hysteria2",
@@ -134,6 +162,9 @@ func GenerateSingBoxConfig(secret string, vlessOutbounds []*VLESSOutbound, hyste
 				"type":     obfsType,
 				"password": h.ObfsPassword,
 			}
+		}
+		if h.Network != "" {
+			ob["network"] = h.Network
 		}
 		outbounds = append(outbounds, ob)
 	}

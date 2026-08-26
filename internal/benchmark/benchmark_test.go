@@ -3,6 +3,7 @@ package benchmark
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -87,5 +88,11 @@ func TestMeasureDirectZeroElapsed(t *testing.T) {
 	mbps, _, _ := MeasureDirect(ctx, srv.URL, 5)
 	if mbps < 0 {
 		t.Error("mbps negative")
+	}
+}
+
+func TestBoundedReadLimitDoesNotWrap(t *testing.T) {
+	if got := boundedReadLimit(math.MaxInt64, 1); got != math.MaxInt64 {
+		t.Fatalf("overflowing read limit wrapped: %d", got)
 	}
 }

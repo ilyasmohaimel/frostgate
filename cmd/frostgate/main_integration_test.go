@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,8 +25,11 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/benchmark"
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/history"
+	"github.com/ilyasmohaimel/frostgate/internal/importer"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/profile"
+	"github.com/ilyasmohaimel/frostgate/internal/route"
 )
 
 var integrationBinary string
@@ -222,10 +226,16 @@ func TestConfigContractAffectsRuntime(t *testing.T) {
 		t.Fatalf("history.enabled=false created a DB: %v", err)
 	}
 
-	stdout, _, _ = runCLI(t, env, "benchmark", "--json")
+	networkSecret := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&pbk=fixture-key#private-network"
+	stdout, _, _ = runCLI(t, env, "benchmark", "--json", "--network", networkSecret)
 	benchmarkDoc := requireJSON(t, stdout).(map[string]any)
-	if bytes.Contains(stdout, []byte(f.secretToken)) {
-		t.Fatal("benchmark JSON leaked the configured URL query token")
+	for _, secret := range []string{f.secretToken, "11111111-1111-4111-8111-111111111111", "fixture-key", "private-network"} {
+		if bytes.Contains(stdout, []byte(secret)) {
+			t.Fatalf("benchmark JSON leaked %q", secret)
+		}
+	}
+	if got, want := benchmarkDoc["network"], "vless://203.0.113.10:443/[REDACTED]"; got != want {
+		t.Fatalf("benchmark network label = %v, want %q", got, want)
 	}
 	measured := false
 	for _, raw := range benchmarkDoc["results"].([]any) {
@@ -256,6 +266,85 @@ func TestConfigContractAffectsRuntime(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.home, "xdg-data", "frostgate", "history.db")); !os.IsNotExist(err) {
 		t.Fatalf("disabled history created a DB after runtime commands: %v", err)
+	}
+}
+
+func TestOpaqueImportedFragmentNeverBecomesStoredOrDisplayedName(t *testing.T) {
+	f := newCLIFixture(t)
+	fragments := []string{"A1b2C3d4E5f6G7h8I9j0K1", "pbk%3Dfixture-key", "access%2Btoken%3Dabc123", "access%252Btoken%253Dabc123"}
+	tags := make([]string, 0, len(fragments))
+	db, err := history.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, fragment := range fragments {
+		link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&sni=example.com&pbk=fixture-key#" + fragment
+		parsed := importer.ParseSubscription([]byte(link + "\n"))
+		if len(parsed.Links) != 1 || len(parsed.Skipped) != 0 {
+			_ = db.Close()
+			t.Fatalf("import parse = %+v", parsed)
+		}
+		tag := route.SanitizeName(route.DeriveNameFromLink(parsed.Links[0], i+1))
+		wantTag := fmt.Sprintf("vless-%02d", i+1)
+		if tag != wantTag {
+			_ = db.Close()
+			t.Fatalf("opaque provider fragment became tag %q, want %q", tag, wantTag)
+		}
+		if _, err := route.ParseShareLink(parsed.Links[0], tag); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Add(history.Record{Route: tag, Type: string(config.ProbeSingBox), Status: "up", Profile: history.DefaultProfile}); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		tags = append(tags, tag)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var configYAML strings.Builder
+	configYAML.WriteString("endpoints:\n")
+	for _, tag := range tags {
+		fmt.Fprintf(&configYAML, "  - name: %s\n    type: singbox\n    outbound: %s\n", tag, tag)
+	}
+	configPath := filepath.Join(f.home, "imported.yaml")
+	if err := os.WriteFile(configPath, []byte(configYAML.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(configPath); err != nil {
+		t.Fatalf("fallback route names were rejected by config validation: %v", err)
+	}
+	stdout, stderr, code := runCLI(t, f.env(), "history", "--json")
+	if code != 0 {
+		t.Fatalf("history code=%d stderr=%q", code, stderr)
+	}
+	for _, fragment := range fragments {
+		values := []string{fragment}
+		decoded := fragment
+		for depth := 0; depth < 3; depth++ {
+			next, decodeErr := url.QueryUnescape(decoded)
+			if decodeErr != nil || next == decoded {
+				break
+			}
+			values = append(values, next)
+			decoded = next
+		}
+		for _, value := range values {
+			if bytes.Contains(stdout, []byte(value)) {
+				t.Fatalf("opaque provider fragment leaked in history output: %q output=%s", value, stdout)
+			}
+		}
+		for _, value := range []string{strings.ReplaceAll(decoded, "=", "-"), strings.ReplaceAll(decoded, "+", "-")} {
+			if bytes.Contains(stdout, []byte(value)) {
+				t.Fatalf("opaque provider fragment leaked in history output: %q output=%s", value, stdout)
+			}
+		}
+	}
+	for _, tag := range tags {
+		if !bytes.Contains(stdout, []byte(`"route":"`+tag+`"`)) {
+			t.Fatalf("safe fallback tag %q missing from history output: %s", tag, stdout)
+		}
 	}
 }
 
@@ -316,7 +405,9 @@ func TestEmitRedactsVerboseAndJSONErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stdout, os.Stderr = outW, errOutW
-	emit([]probe.Result{result}, false, true)
+	if err := emit([]probe.Result{result}, false, true); err != nil {
+		t.Fatal(err)
+	}
 	_ = outW.Close()
 	_ = errOutW.Close()
 	os.Stdout, os.Stderr = oldOut, oldErr
@@ -331,7 +422,9 @@ func TestEmitRedactsVerboseAndJSONErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stdout, os.Stderr = outW, errOutW
-	emit([]probe.Result{result}, true, true)
+	if err := emit([]probe.Result{result}, true, true); err != nil {
+		t.Fatal(err)
+	}
 	_ = outW.Close()
 	_ = errOutW.Close()
 	os.Stdout, os.Stderr = oldOut, oldErr
@@ -410,8 +503,14 @@ func TestRecommendHistoryIsScopedToExplicitConfigProfile(t *testing.T) {
 	enabled := true
 	cfg := &config.Config{History: config.HistoryConfig{Enabled: &enabled}}
 	results := []probe.Result{{Endpoint: config.Endpoint{Name: "same-name", Type: config.ProbeSingBox}, Status: probe.StatusUp, Metrics: metrics.Metrics{Median: 100 * time.Millisecond}}}
-	fromA := recommendFromResults(cfg, results, profileA)
-	fromB := recommendFromResults(cfg, results, profileB)
+	fromA, err := recommendFromResults(cfg, results, profileA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromB, err := recommendFromResults(cfg, results, profileB)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if fromA.BestOverall.HistoryCount != 0 || fromA.Confidence != "low" {
 		t.Fatalf("profile A borrowed profile B history: %+v", fromA)
 	}
@@ -442,12 +541,16 @@ func TestCustomConfigKeepsManagedSidecarsIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	customSidecar := []byte(`{"outbounds":[{"type":"selector","tag":"frostgate-selector","outbounds":["custom-hysteria"],"default":"custom-hysteria"},{"type":"hysteria2","tag":"custom-hysteria","server":"203.0.113.20","server_port":443,"password":"fixture-password","tls":{"enabled":true,"server_name":"example.com"}}]}`)
-	if err := os.WriteFile(filepath.Join(customDir, "sing-box.json"), customSidecar, 0o600); err != nil {
+	customState := profile.StateDir(customConfig)
+	if err := os.MkdirAll(customState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customState, "sing-box.json"), customSidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	stdout, stderr, code := runCLI(t, f.env(), "diagnose", "--json", "custom-hysteria", "--config", customConfig)
-	if code != 0 {
+	if code != 1 {
 		t.Fatalf("diagnose exit=%d stderr=%s", code, stderr)
 	}
 	layers := requireJSON(t, stdout).([]any)
@@ -474,6 +577,38 @@ func TestCustomConfigKeepsManagedSidecarsIsolated(t *testing.T) {
 	gotDefault, err := os.ReadFile(defaultSidecarPath)
 	if err != nil || !bytes.Equal(gotDefault, defaultSidecar) {
 		t.Fatalf("custom config commands changed default sidecar: err=%v", err)
+	}
+}
+
+func TestExplicitSymlinkedStateIsRejectedByAllProfileCommands(t *testing.T) {
+	f := newCLIFixture(t)
+	customConfig := filepath.Join(f.home, "profiles", "custom", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(customConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(customConfig, []byte("endpoints: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	customState := profile.StateDir(customConfig)
+	if err := os.Symlink(filepath.Dir(f.configPath), customState); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	commands := [][]string{
+		{"history", "--config", customConfig},
+		{"recommend", "--config", customConfig},
+		{"diagnose", "--config", customConfig},
+		{"network-check", "--config", customConfig},
+		{"benchmark", "--config", customConfig},
+		{"compare", "--config", customConfig},
+		{"add", "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443", "--config", customConfig},
+		{"--config", customConfig, "--check"},
+	}
+	for _, args := range commands {
+		stdout, stderr, code := runCLI(t, f.env(), args...)
+		if code != 3 || len(stdout) != 0 || !strings.Contains(string(stderr), "symlinked managed state path") {
+			t.Fatalf("%v: code=%d stdout=%q stderr=%q", args, code, stdout, stderr)
+		}
 	}
 }
 
@@ -670,6 +805,19 @@ func TestCLIRejectsUnsafeExplicitRouteName(t *testing.T) {
 	_, stderr, code := runCLI(t, f.env(), "add", "--name", "../unsafe", "not-a-link")
 	if code != 3 || !bytes.Contains(stderr, []byte("invalid route name")) {
 		t.Fatalf("unsafe name was not rejected: code=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestSetupRejectsConfigInsteadOfSilentlyUsingDefaultProfile(t *testing.T) {
+	f := newCLIFixture(t)
+	for _, args := range [][]string{
+		{"setup", "--config", filepath.Join(f.home, "alternate.yaml")},
+		{"--setup", "--config", filepath.Join(f.home, "alternate.yaml")},
+	} {
+		_, stderr, code := runCLI(t, f.env(), args...)
+		if code != 3 || !bytes.Contains(stderr, []byte("--config is not supported")) {
+			t.Fatalf("setup config was not clearly rejected: args=%v code=%d stderr=%q", args, code, stderr)
+		}
 	}
 }
 

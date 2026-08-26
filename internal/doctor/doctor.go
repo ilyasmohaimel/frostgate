@@ -64,13 +64,6 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 	}
 	out = append(out, Check{Name: "Config parse", Status: "PASS", Detail: fmt.Sprintf("%d endpoints", len(cfg.Endpoints))})
 
-	// Test URL
-	if _, err := url.ParseRequestURI(cfg.SingBox.TestURL); err != nil {
-		out = append(out, Check{Name: "Test URL", Status: "FAIL", Detail: redact.Error(err)})
-	} else {
-		out = append(out, Check{Name: "Test URL", Status: "PASS", Detail: redact.String(cfg.SingBox.TestURL)})
-	}
-
 	// Benchmark proxy configuration (required for proxy throughput)
 	hasSBEndpoints := false
 	for _, ep := range cfg.Endpoints {
@@ -78,6 +71,15 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 			hasSBEndpoints = true
 			break
 		}
+	}
+	// singbox.test_url is sidecar-only state. Direct-only configurations may
+	// deliberately retain stale sidecar values while remaining healthy.
+	if !hasSBEndpoints {
+		out = append(out, Check{Name: "Test URL", Status: "SKIP", Detail: "no proxy routes configured"})
+	} else if _, err := url.ParseRequestURI(cfg.SingBox.TestURL); err != nil {
+		out = append(out, Check{Name: "Test URL", Status: "FAIL", Detail: redact.Error(err)})
+	} else {
+		out = append(out, Check{Name: "Test URL", Status: "PASS", Detail: redact.String(cfg.SingBox.TestURL)})
 	}
 	if hasSBEndpoints {
 		if cfg.SingBox.BenchmarkProxy == "" {
@@ -102,7 +104,16 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 		}
 	}
 
-	// sing-box installed
+	if !hasSBEndpoints {
+		out = append(out,
+			Check{Name: "sing-box", Status: "SKIP", Detail: "no proxy routes configured"},
+			Check{Name: "Sidecar service", Status: "SKIP", Detail: "no proxy routes configured"},
+			Check{Name: "Controller", Status: "SKIP", Detail: "no proxy routes configured"},
+		)
+		return out
+	}
+
+	// sing-box is required only when the selected profile has proxy routes.
 	sbPath, err := exec.LookPath("sing-box")
 	if err != nil {
 		// also check common alt
@@ -119,21 +130,11 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 			ver = "found"
 		}
 		out = append(out, Check{Name: "sing-box", Status: "PASS", Detail: fmt.Sprintf("%s (%s)", ver, sbPath)})
-		// controller check if there are singbox endpoints
-		hasSB := false
-		for _, ep := range cfg.Endpoints {
-			if ep.Type == config.ProbeSingBox {
-				hasSB = true
-				break
-			}
-		}
-		if hasSB {
-			u, _ := url.Parse(cfg.SingBox.Controller)
-			host := "127.0.0.1"
-			if u != nil && u.Host != "" {
-				host = u.Host
-			}
-			if !isLoopback(host) {
+		if hasSBEndpoints {
+			u, parseErr := url.Parse(cfg.SingBox.Controller)
+			if parseErr != nil || u == nil || u.Hostname() == "" {
+				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: "invalid controller address"})
+			} else if !config.IsLoopbackHost(u.Hostname()) {
 				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: fmt.Sprintf("controller %s is not loopback", redact.String(cfg.SingBox.Controller))})
 			} else {
 				out = append(out, Check{Name: "Controller bind", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
@@ -163,13 +164,11 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 					}
 				}
 			}
-		} else {
-			out = append(out, Check{Name: "Controller", Status: "SKIP", Detail: "no singbox endpoints"})
 		}
 		defaultDir := setup.ConfigDir(setup.DefaultHomeDir())
-		managedAbs, _ := filepath.Abs(managedDir)
-		defaultAbs, _ := filepath.Abs(defaultDir)
-		identity := profile.ForPath(resolved, managedAbs != "" && managedAbs == defaultAbs)
+		managedCanonical := profile.CanonicalPath(managedDir)
+		defaultCanonical := profile.CanonicalPath(defaultDir)
+		identity := profile.ForPath(profile.CanonicalPath(resolved), managedCanonical != "" && managedCanonical == defaultCanonical)
 		servicePath := setup.ServiceUnitPath(identity.Service)
 		if _, err := os.Stat(servicePath); err == nil {
 			status := getSystemdStatus(identity.Service)
@@ -222,21 +221,6 @@ func getSingBoxVersion(path string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func isLoopback(host string) bool {
-	if strings.HasPrefix(host, "127.") {
-		return true
-	}
-	if host == "localhost" || host == "::1" || host == "[::1]" {
-		return true
-	}
-	// host may be host:port
-	h, _, err := net.SplitHostPort(host)
-	if err == nil {
-		return isLoopback(h)
-	}
-	return false
-}
-
 func hostOnly(addr string) string {
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		return h
@@ -251,11 +235,17 @@ func getSystemdStatus(unit string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", unit)
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return "systemctl unavailable"
+	}
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
 		cmd2 := exec.CommandContext(ctx, "systemctl", "--user", "status", unit, "--no-pager")
-		out2, _ := cmd2.CombinedOutput()
+		out2, statusErr := cmd2.CombinedOutput()
+		if statusErr != nil && len(out2) == 0 {
+			return "active (status unavailable)"
+		}
 		if strings.Contains(string(out2), "active (running)") {
 			return "active (running)"
 		}

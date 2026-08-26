@@ -244,12 +244,22 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
+			// In Clash/Mihomo, fingerprint is certificate pinning, not the
+			// uTLS client fingerprint. Frostgate does not support pinning, so
+			// never reinterpret it into a different security setting.
+			if hasCertificatePin(mm) {
+				skipped = append(skipped, Skipped{Reason: "unsupported VLESS certificate pin", Line: typ})
+				continue
+			}
 			transportValue, hasTransport := mm["network"]
 			if !hasTransport {
 				transportValue, hasTransport = mm["transport"]
 			}
-			transport := rawTransportName(transportValue)
-			if !hasTransport || transport == "" {
+			transport := "tcp"
+			if hasTransport {
+				transport = rawTransportName(transportValue)
+			}
+			if transport == "" {
 				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
 				continue
 			}
@@ -271,9 +281,6 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			sid := ""
 			fp := "chrome"
 			if v, ok := mm["client-fingerprint"].(string); ok && v != "" {
-				fp = v
-			}
-			if v, ok := mm["fingerprint"].(string); ok && v != "" {
 				fp = v
 			}
 			opts, ok := mm["reality-opts"].(map[string]any)
@@ -320,16 +327,26 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			} else if spx, _ := mm["spider_x"].(string); spx != "" {
 				q.Set("spx", spx)
 			}
-			if packet, _ := mm["packet-encoding"].(string); packet != "" {
-				q.Set("packet_encoding", packet)
-			} else if packet, _ := mm["packet_encoding"].(string); packet != "" {
-				q.Set("packet_encoding", packet)
+			if packet, present := mm["packet-encoding"]; present {
+				packetValue, ok := packet.(string)
+				if !ok {
+					skipped = append(skipped, Skipped{Reason: "malformed VLESS packet encoding", Line: typ})
+					continue
+				}
+				q.Set("packet_encoding", packetValue)
+			} else if packet, present := mm["packet_encoding"]; present {
+				packetValue, ok := packet.(string)
+				if !ok {
+					skipped = append(skipped, Skipped{Reason: "malformed VLESS packet encoding", Line: typ})
+					continue
+				}
+				q.Set("packet_encoding", packetValue)
 			}
 			q.Set("type", transport)
 			fragment := url.QueryEscape(name)
 			link := vlessLink(uuid, server, port, q, fragment)
 			links = append(links, link)
-		case "hysteria2", "hysteria":
+		case "hysteria2":
 			server, _ := mm["server"].(string)
 			port := toInt(mm["port"])
 			password, _ := mm["password"].(string)
@@ -340,6 +357,10 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			}
 			if server == "" || port == 0 || password == "" {
 				skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 route", Line: typ})
+				continue
+			}
+			if hasCertificatePin(mm) {
+				skipped = append(skipped, Skipped{Reason: "unsupported Hysteria2 certificate pin", Line: typ})
 				continue
 			}
 			sni, _ := mm["sni"].(string)
@@ -360,8 +381,12 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 				q.Set("sni", sni)
 			}
 			if obfs != "" {
-				q.Set("obfs", obfs)
-				if obfs == "salamander" {
+				if !strings.EqualFold(obfs, "salamander") {
+					skipped = append(skipped, Skipped{Reason: "unsupported Hysteria2 obfs", Line: typ})
+					continue
+				}
+				q.Set("obfs", "salamander")
+				if strings.EqualFold(obfs, "salamander") {
 					if obfsPass == "" {
 						skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 salamander obfs", Line: typ})
 						continue
@@ -376,6 +401,10 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			u := hysteria2Link(password, server, port, q, fragment)
 			links = append(links, u)
 		default:
+			if typLower == "hysteria" {
+				skipped = append(skipped, Skipped{Reason: "unsupported Clash type: hysteria (Hysteria v1)", Line: typ})
+				continue
+			}
 			skipped = append(skipped, Skipped{Reason: "unsupported clash type: " + typ, Line: typ})
 		}
 	}
@@ -424,13 +453,8 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
-			transportValue, hasTransport := mm["transport"]
-			if !hasTransport {
-				transportValue, hasTransport = mm["network"]
-			}
-			transport := rawTransportName(transportValue)
-			if !hasTransport || transport == "" {
-				skipped = append(skipped, Skipped{Reason: "unsupported VLESS transport", Line: typ})
+			if reason := nativeVLESSReason(mm); reason != "" {
+				skipped = append(skipped, Skipped{Reason: reason, Line: typ})
 				continue
 			}
 			flow, _ := mm["flow"].(string)
@@ -492,10 +516,22 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 			if spx != "" {
 				q.Set("spx", spx)
 			}
-			if packet, _ := mm["packet_encoding"].(string); packet != "" {
-				q.Set("packet_encoding", packet)
+			if packet, present := mm["packet_encoding"]; present {
+				packetValue, ok := packet.(string)
+				if !ok {
+					skipped = append(skipped, Skipped{Reason: "malformed VLESS packet encoding", Line: typ})
+					continue
+				}
+				q.Set("packet_encoding", packetValue)
 			}
-			q.Set("type", transport)
+			// Native RAW uses no V2Ray transport. An omitted native network
+			// enables both TCP and UDP in sing-box, so carry that distinct
+			// meaning through our share-link boundary instead of narrowing it
+			// to TCP merely because the common share syntax has type=tcp.
+			q.Set("type", "tcp")
+			if network, present := mm["network"].(string); !present || network == "" {
+				q.Set("network", "both")
+			}
 			fname := tag
 			if fname == "" {
 				fname = fmt.Sprintf("vless-%d", port)
@@ -538,6 +574,10 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				q.Set("sni", sni)
 			}
 			if obfsType != "" {
+				if obfsType != "salamander" {
+					skipped = append(skipped, Skipped{Reason: "unsupported Hysteria2 obfs", Line: typ})
+					continue
+				}
 				q.Set("obfs", obfsType)
 				if obfsType == "salamander" && obfsPass == "" {
 					skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 salamander obfs", Line: typ})
@@ -546,6 +586,13 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 				if obfsPass != "" {
 					q.Set("obfs-password", obfsPass)
 				}
+			}
+			if network, ok := mm["network"].(string); ok && network != "" {
+				if !strings.EqualFold(network, "tcp") && !strings.EqualFold(network, "udp") {
+					skipped = append(skipped, Skipped{Reason: "unsupported Hysteria2 network", Line: typ})
+					continue
+				}
+				q.Set("network", strings.ToLower(network))
 			}
 			fname := tag
 			if fname == "" {
@@ -587,11 +634,107 @@ func boolField(m map[string]any, key string) bool {
 
 func hasCertificatePin(m map[string]any) bool {
 	for _, key := range []string{"pin", "pinSHA256", "certificate_public_key_sha256", "certificate_fingerprint", "fingerprint"} {
-		if v, ok := m[key].(string); ok && v != "" {
+		if v, ok := m[key]; ok && pinValuePresent(v) {
 			return true
 		}
 	}
 	return false
+}
+
+func pinValuePresent(v any) bool {
+	switch value := v.(type) {
+	case string:
+		return value != ""
+	case []any:
+		return len(value) > 0
+	case []string:
+		return len(value) > 0
+	default:
+		return v != nil
+	}
+}
+
+// nativeVLESSReason accepts only the subset of native sing-box VLESS that
+// Frostgate can represent without silently changing behavior. Unsupported
+// transport, multiplex, dial, and TLS settings must be rejected at import.
+func nativeVLESSReason(m map[string]any) string {
+	if _, ok := m["transport"]; ok {
+		return "unsupported VLESS transport"
+	}
+	if _, ok := m["multiplex"]; ok {
+		return "unsupported VLESS multiplex"
+	}
+	if network, ok := m["network"]; ok {
+		value, ok := network.(string)
+		if !ok || (value != "" && !strings.EqualFold(value, "tcp")) {
+			return "unsupported VLESS network"
+		}
+	}
+	if packet, ok := m["packet_encoding"]; ok {
+		if _, ok := packet.(string); !ok {
+			return "malformed VLESS packet encoding"
+		}
+	}
+	for key := range m {
+		switch key {
+		case "type", "tag", "server", "server_port", "uuid", "flow", "network", "tls", "packet_encoding", "transport", "multiplex":
+		default:
+			return "unsupported VLESS setting: " + key
+		}
+	}
+	if tlsValue, present := m["tls"]; present {
+		tlsRaw, ok := tlsValue.(map[string]any)
+		if !ok {
+			return "malformed VLESS TLS settings"
+		}
+		if reason := nativeVLESSTLSReason(tlsRaw); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+func nativeVLESSTLSReason(tlsRaw map[string]any) string {
+	for key := range tlsRaw {
+		switch key {
+		case "enabled", "server_name", "utls", "reality", "pin", "pinSHA256", "certificate_public_key_sha256", "certificate_fingerprint", "fingerprint":
+		default:
+			return "unsupported VLESS TLS setting: " + key
+		}
+	}
+	if utlsValue, present := tlsRaw["utls"]; present {
+		utls, ok := utlsValue.(map[string]any)
+		if !ok {
+			return "malformed VLESS uTLS settings"
+		}
+		for key := range utls {
+			switch key {
+			case "enabled", "fingerprint":
+			default:
+				return "unsupported VLESS uTLS setting: " + key
+			}
+		}
+	}
+	if realityValue, present := tlsRaw["reality"]; present {
+		reality, ok := realityValue.(map[string]any)
+		if !ok {
+			return "malformed VLESS REALITY settings"
+		}
+		for key := range reality {
+			switch key {
+			case "enabled", "public_key", "short_id", "spider_x":
+			default:
+				return "unsupported VLESS REALITY setting: " + key
+			}
+		}
+	}
+	return ""
+}
+
+// nativeVLESSRaw is retained for callers and tests that need a boolean
+// capability check without exposing the detailed rejection reason.
+func nativeVLESSRaw(m map[string]any) bool {
+	return nativeVLESSReason(m) == ""
 }
 
 func vlessLink(uuid, server string, port int, q url.Values, fragment string) string {
@@ -607,12 +750,6 @@ func hysteria2Link(password, server string, port int, q url.Values, fragment str
 }
 
 func redactLine(line string) string {
-	if len(line) > 60 {
-		return line[:30] + "...[redacted]"
-	}
-	if idx := strings.Index(line, "://"); idx != -1 {
-		return line[:idx+3] + "[redacted]"
-	}
 	return "[redacted]"
 }
 

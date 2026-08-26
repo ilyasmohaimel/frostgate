@@ -106,6 +106,20 @@ func TestGenerateSingBoxConfigLoopbackEnforced(t *testing.T) {
 	_ = data
 }
 
+func TestGenerateSingBoxConfigRejectsNilAndUnsupportedVLESSNetwork(t *testing.T) {
+	if _, err := GenerateSingBoxConfig("s", []*VLESSOutbound{nil}, nil, t.TempDir()); err == nil || !strings.Contains(err.Error(), "nil VLESS") {
+		t.Fatalf("nil VLESS outbound error = %v", err)
+	}
+	v := &VLESSOutbound{Tag: "udp", Server: "203.0.113.10", ServerPort: 443, UUID: "fixture", SNI: "example.com", PBK: "fixture-key", Network: "udp"}
+	if _, err := GenerateSingBoxConfig("s", []*VLESSOutbound{v}, nil, t.TempDir()); err == nil || !strings.Contains(err.Error(), "unsupported VLESS network") {
+		t.Fatalf("unsupported VLESS network error = %v", err)
+	}
+	h := &Hysteria2Outbound{Tag: "quic", Server: "203.0.113.10", ServerPort: 443, Password: "fixture", Network: "sctp"}
+	if _, err := GenerateSingBoxConfig("s", nil, []*Hysteria2Outbound{h}, t.TempDir()); err == nil || !strings.Contains(err.Error(), "unsupported Hysteria2 network") {
+		t.Fatalf("unsupported Hysteria2 network error = %v", err)
+	}
+}
+
 func TestGenerateFrostgateConfig(t *testing.T) {
 	content := GenerateFrostgateConfig([]string{"reality-primary"}, []string{"hysteria-backup"}, "https://www.gstatic.com/generate_204", "http://127.0.0.1:9090", "/home/user/.config/frostgate/controller-secret")
 	if !strings.Contains(content, "reality-primary") {

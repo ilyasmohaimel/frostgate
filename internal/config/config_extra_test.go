@@ -11,8 +11,8 @@ func TestDefaultsApplied(t *testing.T) {
 	path := writeTemp(t, `
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -129,8 +129,8 @@ defaults:
   timeout: 5s
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
     timeout: 2s
   - name: b
     host: example.com
@@ -148,14 +148,31 @@ endpoints:
 	}
 }
 
+func TestDirectOnlyIgnoresStaleSingBoxSettings(t *testing.T) {
+	path := writeTemp(t, `
+singbox:
+  controller: not-a-url
+  test_url: also-not-a-url
+  secret_file: /definitely/not/used
+  benchmark_proxy: 0.0.0.0:2080
+endpoints:
+  - name: direct
+    type: http
+    url: https://example.com/
+`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("direct-only config was rejected for unused sing-box settings: %v", err)
+	}
+}
+
 func TestPerRouteSamples(t *testing.T) {
 	path := writeTemp(t, `
 defaults:
   samples: 4
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
     samples: 7
 `)
 	cfg, err := Load(path)
@@ -188,8 +205,8 @@ defaults:
   timeout: notaduration
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected invalid duration error")
@@ -221,8 +238,8 @@ singbox:
   benchmark_proxy: "`+addr+`"
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 		if _, err := Load(path); err != nil {
 			t.Fatalf("valid benchmark proxy %q rejected: %v", addr, err)
@@ -234,8 +251,8 @@ singbox:
   benchmark_proxy: "`+addr+`"
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 		if _, err := Load(path); err == nil {
 			t.Fatalf("unsafe benchmark proxy %q accepted", addr)
@@ -351,8 +368,8 @@ singbox:
   secret_file: `+secretFile+`
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 	cfg, err := Load(path)
 	if err != nil {
@@ -371,8 +388,8 @@ singbox:
   secret: filesecret
 endpoints:
   - name: a
-    host: example.com
-    port: 443
+    type: singbox
+    outbound: route-a
 `)
 	cfg, err := Load(path)
 	if err != nil {

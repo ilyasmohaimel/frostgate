@@ -70,7 +70,10 @@ func handleCompletion(args []string) int {
 		fmt.Fprintf(os.Stderr, "unsupported shell %q (supported: fish, bash, zsh)\n", sanitizeOutput(args[0]))
 		return 3
 	}
-	_, _ = io.WriteString(os.Stdout, script)
+	if _, err := io.WriteString(os.Stdout, script); err != nil {
+		fmt.Fprintln(os.Stderr, "write completion:", sanitizeError(err))
+		return 3
+	}
 	return 0
 }
 
@@ -84,12 +87,12 @@ func commandNames() []string {
 
 func fishCompletion() string {
 	var b strings.Builder
-	b.WriteString("function __frostgate_needs_command\n    set -l words (commandline -opc)\n    test (count $words) -eq 1\nend\n\ncomplete -c frostgate -f\n")
+	b.WriteString("complete -c frostgate -e\nfunction __frostgate_needs_command\n    not __fish_seen_subcommand_from " + strings.Join(commandNames(), " ") + "\nend\n\ncomplete -c frostgate -f\n")
 	for _, spec := range commandSpecs {
 		fmt.Fprintf(&b, "complete -c frostgate -n '__frostgate_needs_command' -a '%s' -d '%s'\n", spec.Name, fishEscape(spec.Summary))
 	}
 	for _, flag := range globalFlags {
-		writeFishFlag(&b, "", flag)
+		writeFishRootFlag(&b, flag)
 	}
 	for _, spec := range commandSpecs {
 		for _, flag := range spec.Flags {
@@ -97,6 +100,17 @@ func fishCompletion() string {
 		}
 	}
 	return b.String()
+}
+
+func writeFishRootFlag(b *strings.Builder, flag flagSpec) {
+	fmt.Fprintf(b, "complete -c frostgate -n '__frostgate_needs_command' -l '%s'", flag.Name)
+	if flag.TakesValue {
+		b.WriteString(" -r")
+	}
+	if flag.Description != "" {
+		fmt.Fprintf(b, " -d '%s'", fishEscape(flag.Description))
+	}
+	b.WriteByte('\n')
 }
 
 func writeFishFlag(b *strings.Builder, command string, flag flagSpec) {
@@ -118,7 +132,7 @@ func fishEscape(s string) string { return strings.ReplaceAll(s, "'", "\\'") }
 
 func bashCompletion() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "_frostgate() {\n    local cur command opts\n    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n    if [ \"$COMP_CWORD\" -eq 1 ]; then\n        COMPREPLY=( $(compgen -W '%s' -- \"$cur\") )\n        return\n    fi\n    command=\"${COMP_WORDS[1]}\"\n    opts=\"%s\"\n    case \"$command\" in\n", strings.Join(commandNames(), " "), bashFlags(globalFlags))
+	fmt.Fprintf(&b, "_frostgate() {\n    local cur command opts\n    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n    if [ \"$COMP_CWORD\" -eq 1 ]; then\n        if [[ \"$cur\" == -* ]]; then\n            COMPREPLY=( $(compgen -W '%s' -- \"$cur\") )\n        else\n            COMPREPLY=( $(compgen -W '%s' -- \"$cur\") )\n        fi\n        return\n    fi\n    command=\"${COMP_WORDS[1]}\"\n    opts=\"\"\n    case \"$command\" in\n", bashFlags(globalFlags), strings.Join(commandNames(), " "))
 	for _, spec := range commandSpecs {
 		if len(spec.Flags) > 0 {
 			fmt.Fprintf(&b, "        %s) opts=\"$opts %s\" ;;\n", spec.Name, bashFlags(spec.Flags))
@@ -142,11 +156,11 @@ func zshCompletion() string {
 	for _, spec := range commandSpecs {
 		fmt.Fprintf(&b, "    '%s:%s'\n", spec.Name, zshEscape(spec.Summary))
 	}
-	b.WriteString("  )\n  _arguments -C \\\n")
+	b.WriteString("  )\n  if (( CURRENT == 2 )); then\n    _arguments -C \\\n")
 	for _, flag := range globalFlags {
 		fmt.Fprintf(&b, "    '--%s[%s]' \\\n", flag.Name, zshEscape(flag.Description))
 	}
-	b.WriteString("    '1:command:->command' \\\n    '*::argument:->args'\n\n  case $state in\n    command) _describe -t commands 'frostgate command' commands ;;\n    args)\n      case $words[2] in\n")
+	b.WriteString("    '1:command:->command'\n    case $state in\n      command) _describe -t commands 'frostgate command' commands ;;\n    esac\n    return\n  fi\n\n  case $words[2] in\n")
 	for _, spec := range commandSpecs {
 		if len(spec.Flags) == 0 {
 			continue
@@ -157,7 +171,7 @@ func zshCompletion() string {
 		}
 		b.WriteString(" ;;\n")
 	}
-	b.WriteString("      esac ;;\n  esac\n}\n\n_frostgate \"$@\"\n")
+	b.WriteString("  esac\n}\n\n_frostgate \"$@\"\n")
 	return b.String()
 }
 

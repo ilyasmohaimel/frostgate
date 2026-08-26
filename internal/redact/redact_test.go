@@ -55,6 +55,36 @@ func TestRedactBearer(t *testing.T) {
 	}
 }
 
+func TestRedactQuotedSensitiveValuesIncludingSpaces(t *testing.T) {
+	for _, input := range []string{
+		`{"password":"SENTINEL SECRET PHRASE"}`,
+		`password: 'SENTINEL SECRET PHRASE'`,
+		`{"authorization":"Bearer SENTINEL AUTHORIZATION VALUE"}`,
+	} {
+		out := String(input)
+		if strings.Contains(out, "SENTINEL SECRET PHRASE") || strings.Contains(out, "SENTINEL AUTHORIZATION VALUE") {
+			t.Fatalf("quoted secret leaked: %q -> %q", input, out)
+		}
+	}
+}
+
+func TestRedactAdditionalSensitiveKeyAliases(t *testing.T) {
+	for _, input := range []string{
+		`{"auth":"SENTINEL_AUTH"}`,
+		`auth_str: 'SENTINEL_AUTH_STR'`,
+		`{"access_token":"SENTINEL_ACCESS"}`,
+		`refresh-token=SENTINEL_REFRESH`,
+		`{"api_key":"SENTINEL_API"}`,
+		`client-secret: SENTINEL_CLIENT`,
+		`{"private_key":"SENTINEL_PRIVATE"}`,
+	} {
+		out := String(input)
+		if strings.Contains(out, "SENTINEL_") {
+			t.Fatalf("sensitive alias leaked: %q -> %q", input, out)
+		}
+	}
+}
+
 func TestRedactUUID(t *testing.T) {
 	realUUID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	inp := "connection failed for " + realUUID + " at host"

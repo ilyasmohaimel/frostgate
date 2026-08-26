@@ -33,6 +33,7 @@ type Result struct {
 	Samples  []metrics.Sample `json:"samples,omitempty"`
 	Status   Status           `json:"status"`
 	Category string           `json:"category"`
+	Reasons  []health.Reason  `json:"reasons,omitempty"`
 	Err      error            `json:"-"`
 	ErrMsg   string           `json:"error,omitempty"`
 }
@@ -119,7 +120,7 @@ func ProbeEndpoint(ctx context.Context, cfg *config.Config, e config.Endpoint) R
 		MaxLossPct:      cfg.MaxLossFor(e),
 		DegradedLossPct: 50,
 	}
-	status := health.Classify(m, th)
+	status, reasons := health.ClassifyWithReasons(m, th)
 
 	// find representative error: last failed sample's error
 	var repErr error
@@ -150,6 +151,7 @@ func ProbeEndpoint(ctx context.Context, cfg *config.Config, e config.Endpoint) R
 		Samples:  s,
 		Status:   status,
 		Category: category,
+		Reasons:  reasons,
 		Err:      repErr,
 		ErrMsg:   errMsg,
 	}
@@ -291,13 +293,14 @@ func Rank(results []Result) {
 	cands := make([]ranking.Candidate, len(results))
 	for i, r := range results {
 		cands[i] = ranking.Candidate{
-			Name:     r.Endpoint.Name,
-			IsProxy:  r.Endpoint.Type == config.ProbeSingBox,
-			Status:   string(r.Status),
-			LossPct:  r.Metrics.LossPct,
-			Median:   r.Metrics.Median,
-			Jitter:   r.Metrics.Jitter,
-			Priority: r.Endpoint.Priority,
+			Name:        r.Endpoint.Name,
+			IsProxy:     r.Endpoint.Type == config.ProbeSingBox,
+			Status:      string(r.Status),
+			LossPct:     r.Metrics.LossPct,
+			Median:      r.Metrics.Median,
+			Jitter:      r.Metrics.Jitter,
+			JitterKnown: r.Metrics.JitterKnown,
+			Priority:    r.Endpoint.Priority,
 		}
 	}
 	sorted := ranking.Sort(cands)

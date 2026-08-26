@@ -68,6 +68,11 @@ func TestFishCompletionEngine(t *testing.T) {
 	if !containsLine(flags, "--json") || !containsLine(flags, "--network") {
 		t.Fatalf("benchmark flags missing from fish completion: %q", flags)
 	}
+	for _, invalid := range []string{"--watch", "--doctor", "--version"} {
+		if containsLine(flags, invalid) {
+			t.Fatalf("benchmark completion advertised invalid root flag %s: %q", invalid, flags)
+		}
+	}
 }
 
 func TestBashCompletionScriptAndEngine(t *testing.T) {

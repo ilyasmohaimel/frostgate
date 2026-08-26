@@ -72,10 +72,33 @@ proxies:
 	}
 }
 
+func TestClashVLESSDefaultsMissingNetworkToTCP(t *testing.T) {
+	data := []byte(`proxies:
+  - name: vless-default-tcp
+    type: vless
+    server: 203.0.113.1
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    servername: example.com
+    reality-opts: {public-key: fixture-key}
+`)
+	result := ParseSubscription(data)
+	if len(result.Links) != 1 || len(result.Skipped) != 0 {
+		t.Fatalf("missing network was not treated as TCP: %+v", result)
+	}
+	v, err := setup.ParseVLESSShareLink(result.Links[0], "route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Network != "tcp" {
+		t.Fatalf("network = %q, want tcp", v.Network)
+	}
+}
+
 func TestSingBoxJSON(t *testing.T) {
 	jsonData := `{
   "outbounds": [
-    {"type": "vless", "tag": "v1", "server": "203.0.113.1", "server_port": 443, "uuid": "uuid1", "transport": {"type": "tcp"}, "flow": "xtls-rprx-vision", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "pbk1", "short_id": "sid"}}},
+	{"type": "vless", "tag": "v1", "server": "203.0.113.1", "server_port": 443, "uuid": "uuid1", "network": "tcp", "flow": "xtls-rprx-vision", "tls": {"enabled": true, "server_name": "example.com", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "pbk1", "short_id": "sid"}}},
     {"type": "hysteria2", "tag": "h1", "server": "203.0.113.2", "server_port": 443, "password": "pass1", "tls": {"enabled": true, "server_name": "example.com"}},
     {"type": "direct", "tag": "direct"},
     {"type": "trojan", "tag": "trojan1", "server": "1.1.1.1"}
@@ -114,10 +137,113 @@ func TestImportRejectsUnsupportedVLESSTransports(t *testing.T) {
 	}
 }
 
-func TestSingBoxVLESSWithoutExplicitRawTransportIsRejected(t *testing.T) {
-	result := ParseSubscription([]byte(`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`))
-	if len(result.Links) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "unsupported VLESS transport" {
-		t.Fatalf("implicit transport was rewritten as tcp: %+v", result)
+func TestSingBoxRawVLESSWithoutTransportRoundTrips(t *testing.T) {
+	data := []byte(`{"outbounds":[{"type":"vless","tag":"raw-v6","server":"2001:db8::10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`)
+	result := ParseSubscription(data)
+	if len(result.Links) != 1 || len(result.Skipped) != 0 {
+		t.Fatalf("native raw VLESS was rejected: %+v", result)
+	}
+	v, err := setup.ParseVLESSShareLink(result.Links[0], "raw-v6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Server != "2001:db8::10" || v.ServerPort != 443 || v.UUID != "11111111-1111-4111-8111-111111111111" || v.Flow != "xtls-rprx-vision" || v.SNI != "example.com" || v.PBK != "fixture-key" || v.SID != "abcd" || v.FP != "firefox" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.Network != "" {
+		t.Fatalf("raw VLESS fidelity failed: %+v", v)
+	}
+	generated, err := setup.GenerateSingBoxConfig("fixture-secret", []*setup.VLESSOutbound{v}, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(generated), `"transport"`) || strings.Contains(string(generated), `"network"`) {
+		t.Fatalf("raw VLESS both-network default was narrowed or rewritten: %s", generated)
+	}
+}
+
+func TestSingBoxExplicitEmptyPacketEncodingRoundTrips(t *testing.T) {
+	data := []byte(`{"outbounds":[{"type":"vless","tag":"raw-empty-packet","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","packet_encoding":"","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`)
+	result := ParseSubscription(data)
+	if len(result.Links) != 1 || len(result.Skipped) != 0 {
+		t.Fatalf("explicit empty packet encoding was rejected: %+v", result)
+	}
+	v, err := setup.ParseVLESSShareLink(result.Links[0], "raw-empty-packet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.PacketEncodingSet || v.PacketEncoding != "" {
+		t.Fatalf("packet encoding presence was lost: %+v", v)
+	}
+	generated, err := setup.GenerateSingBoxConfig("fixture-secret", []*setup.VLESSOutbound{v}, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(generated), `"packet_encoding": ""`) || strings.Contains(string(generated), `"packet_encoding": "xudp"`) {
+		t.Fatalf("explicit disabled packet encoding was rewritten: %s", generated)
+	}
+}
+
+func TestSingBoxUnsupportedVLESSSettingsAreRejected(t *testing.T) {
+	for _, data := range [][]byte{
+		[]byte(`{"outbounds":[{"type":"vless","tag":"unsupported-multiplex","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","multiplex":{"enabled":true},"tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`),
+		[]byte(`{"outbounds":[{"type":"vless","tag":"unsupported-tls","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","alpn":["h2"],"reality":{"enabled":true,"public_key":"fixture-key"}}}]}`),
+		[]byte(`{"outbounds":[{"type":"vless","tag":"unsupported-dial","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","detour":"other","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`),
+	} {
+		result := ParseSubscription(data)
+		if len(result.Links) != 0 || len(result.Skipped) != 1 {
+			t.Fatalf("unsupported native VLESS setting was dropped: result=%+v", result)
+		}
+	}
+}
+
+func TestClashHysteria2ObfsCaseIsNormalized(t *testing.T) {
+	data := []byte(`proxies:
+  - name: hy2-case
+    type: hysteria2
+    server: 203.0.113.2
+    port: 443
+    password: fixture-password
+    obfs: SALAMANDER
+    obfs-password: fixture-obfs
+`)
+	result := ParseSubscription(data)
+	if len(result.Links) != 1 || len(result.Skipped) != 0 {
+		t.Fatalf("case-insensitive obfs input was rejected: %+v", result)
+	}
+	h, err := setup.ParseHysteria2ShareLink(result.Links[0], "hy2-case")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ObfsType != "salamander" {
+		t.Fatalf("obfs type = %q, want salamander", h.ObfsType)
+	}
+}
+
+func TestClashCertificatePinsAreRejectedRatherThanReinterpreted(t *testing.T) {
+	for _, source := range []string{
+		`proxies:
+  - name: vless-pinned
+    type: vless
+    server: 203.0.113.1
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
+    servername: example.com
+    fingerprint: SHA256:fixture-certificate-pin
+    reality-opts: {public-key: fixture-key}
+`,
+		`proxies:
+  - name: hysteria-pinned
+    type: hysteria2
+    server: 203.0.113.2
+    port: 443
+    password: fixture-password
+    sni: example.com
+    fingerprint: SHA256:fixture-certificate-pin
+`,
+	} {
+		result := ParseSubscription([]byte(source))
+		if len(result.Links) != 0 || len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "certificate pin") {
+			t.Fatalf("certificate pin was imported or mislabeled: %+v", result)
+		}
 	}
 }
 
@@ -182,7 +308,7 @@ func TestImportedFieldFidelityAndIPv6(t *testing.T) {
 		},
 		{
 			name: "singbox vless",
-			data: `{"outbounds":[{"type":"vless","tag":"v","server":"2001:db8::5","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","transport":{"type":"tcp"},"flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`,
+			data: `{"outbounds":[{"type":"vless","tag":"v","server":"2001:db8::5","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","network":"tcp","flow":"xtls-rprx-vision","packet_encoding":"packetaddr","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":true,"fingerprint":"firefox"},"reality":{"enabled":true,"public_key":"fixture-key","short_id":"abcd","spider_x":"/edge"}}}]}`,
 			check: func(t *testing.T, link string) {
 				v, err := setup.ParseVLESSShareLink(link, "route")
 				if err != nil || v.Server != "2001:db8::5" || v.Flow != "xtls-rprx-vision" || v.SpiderX != "/edge" || v.PacketEncoding != "packetaddr" || v.FP != "firefox" || v.PBK != "fixture-key" || v.SID != "abcd" {

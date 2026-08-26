@@ -71,50 +71,60 @@ install_via_go() {
     echo "go not found; install Go from https://go.dev/dl/ or download a release binary from https://github.com/$REPO/releases" >&2
     exit 1
   fi
+  go_tmp="$(mktemp -d "${TMPDIR:-/tmp}/frostgate-go.XXXXXX")" || return 1
   if [ "$VERSION" = "latest" ]; then
-    go install "github.com/$REPO/cmd/frostgate@latest"
-  else
-    go install "github.com/$REPO/cmd/frostgate@${VERSION}"
-  fi
-  GOBIN="$(go env GOBIN 2>/dev/null || true)"
-  GOPATH_BIN="$(go env GOPATH 2>/dev/null || echo "$HOME/go")/bin"
-  src=""
-  if [ -n "$GOBIN" ] && [ -x "$GOBIN/$BINARY" ]; then
-    src="$GOBIN/$BINARY"
-    echo "installed via go to $GOBIN/$BINARY" >&2
-  elif [ -x "$GOPATH_BIN/$BINARY" ]; then
-    src="$GOPATH_BIN/$BINARY"
-    echo "installed via go to $GOPATH_BIN/$BINARY" >&2
-  else
-    echo "installed via go (check GOPATH/bin)" >&2
-    return 0
-  fi
-  if [ "$src" != "$INSTALL_DIR/$BINARY" ]; then
-    mkdir -p "$INSTALL_DIR"
-    tmp_go="$(mktemp "${INSTALL_DIR}/.${BINARY}.go.XXXXXX")"
-    trap 'rm -f "$tmp_go"' EXIT
-    if cp "$src" "$tmp_go" 2>/dev/null; then
-      chmod +x "$tmp_go"
-      if "$tmp_go" --version >/dev/null 2>&1; then
-        mv -f "$tmp_go" "$INSTALL_DIR/$BINARY"
-        trap - EXIT
-        echo "copied to $INSTALL_DIR/$BINARY" >&2
-      else
-        echo "go binary verification failed" >&2
-        rm -f "$tmp_go"
-        trap - EXIT
-        return 1
-      fi
-    else
-      echo "copy to $INSTALL_DIR failed" >&2
-      trap - EXIT
+    if ! GOBIN="$go_tmp" go install "github.com/$REPO/cmd/frostgate@latest"; then
+      rm -rf "$go_tmp"
       return 1
     fi
-  fi
-  if [ -x "$INSTALL_DIR/$BINARY" ] && ! "$INSTALL_DIR/$BINARY" --version >/dev/null 2>&1; then
-    echo "installed binary failed version check" >&2
+  elif ! GOBIN="$go_tmp" go install "github.com/$REPO/cmd/frostgate@${VERSION}"; then
+    rm -rf "$go_tmp"
     return 1
   fi
+  src="$go_tmp/$BINARY"
+  if [ ! -x "$src" ]; then
+    echo "go install did not produce $BINARY" >&2
+    rm -rf "$go_tmp"
+    return 1
+  fi
+  echo "installed via go to temporary staging" >&2
+  if [ "$src" != "$INSTALL_DIR/$BINARY" ]; then
+    if ! mkdir -p "$INSTALL_DIR"; then
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    if ! tmp_go="$(mktemp "${INSTALL_DIR}/.${BINARY}.go.XXXXXX")"; then
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    if ! cp "$src" "$tmp_go" 2>/dev/null; then
+      echo "copy to $INSTALL_DIR failed" >&2
+      rm -f "$tmp_go"
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    if ! chmod +x "$tmp_go"; then
+      echo "cannot set executable permission on staged go binary" >&2
+      rm -f "$tmp_go"
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    if ! "$tmp_go" --version >/dev/null 2>&1; then
+      echo "go binary verification failed" >&2
+      rm -f "$tmp_go"
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    if ! mv -f "$tmp_go" "$INSTALL_DIR/$BINARY"; then
+      echo "atomic replacement from go staging failed" >&2
+      rm -f "$tmp_go"
+      rm -rf "$go_tmp"
+      return 1
+    fi
+    rm -rf "$go_tmp"
+    echo "copied to $INSTALL_DIR/$BINARY" >&2
+  fi
+  return 0
 }
 
 verify_checksum() {
@@ -164,10 +174,10 @@ install_via_binary() {
       echo "Use: go install github.com/$REPO/cmd/frostgate@latest  (requires Go)" >&2
       if command -v go >/dev/null 2>&1; then
         echo "Go found; falling back to go install" >&2
-        return 1
+        return 2
       fi
       echo "Install Go from https://go.dev/dl/ then rerun, or wait for future macOS binaries." >&2
-      return 1
+      return 2
     fi
     if [ "$OS" = "windows" ]; then
       if [ "$IS_MSYS" = "1" ]; then
@@ -177,12 +187,12 @@ install_via_binary() {
       return 1
     fi
     echo "no prebuilt binary for $OS/$ARCH (only linux-amd64 and linux-arm64 are published); trying go install" >&2
-    return 1
+    return 2
   fi
   case "$ARCH" in
     amd64) bin_name="${BINARY}-linux-amd64" ;;
     arm64) bin_name="${BINARY}-linux-arm64" ;;
-    *) echo "no prebuilt binary for $OS/$ARCH (only amd64/arm64)" >&2; return 1 ;;
+    *) echo "no prebuilt binary for $OS/$ARCH (only amd64/arm64)" >&2; return 2 ;;
   esac
   if [ "$VERSION" = "latest" ]; then
     url="https://github.com/$REPO/releases/latest/download/${bin_name}"
@@ -198,11 +208,16 @@ install_via_binary() {
     sums_url="https://github.com/$REPO/releases/download/${ver}/SHA256SUMS"
   fi
   echo "trying binary download: $url" >&2
-  mkdir -p "$INSTALL_DIR"
-  tmp="$(mktemp "${INSTALL_DIR}/.${BINARY}.XXXXXX")"
-  tmp_sums="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"
-  # Cleanup on failure: keep the existing binary intact.
-  trap 'rm -f "$tmp" "$tmp_sums"' EXIT
+  if ! mkdir -p "$INSTALL_DIR"; then
+    return 1
+  fi
+  if ! tmp="$(mktemp "${INSTALL_DIR}/.${BINARY}.XXXXXX")"; then
+    return 1
+  fi
+  if ! tmp_sums="$(mktemp "${INSTALL_DIR}/.SHA256SUMS.XXXXXX")"; then
+    rm -f "$tmp"
+    return 1
+  fi
   success=0
   if command -v curl >/dev/null 2>&1; then
     if curl -fsSL "$url" -o "$tmp"; then
@@ -217,43 +232,61 @@ install_via_binary() {
     wget -qO "$tmp_sums" "$sums_url" 2>/dev/null || true
   else
     echo "neither curl nor wget found" >&2
-    return 1
+    rm -f "$tmp" "$tmp_sums"
+    return 2
   fi
   if [ "$success" -ne 1 ]; then
     echo "binary download failed" >&2
-    return 1
+    rm -f "$tmp" "$tmp_sums"
+    return 2
   fi
   if [ ! -s "$tmp" ]; then
     echo "downloaded file is empty" >&2
+    rm -f "$tmp" "$tmp_sums"
     return 1
   fi
   if head -c 4 "$tmp" | grep -q "<!DO" 2>/dev/null; then
     echo "downloaded file looks like HTML, not a binary" >&2
+    rm -f "$tmp" "$tmp_sums"
     return 1
   fi
   if ! verify_checksum "$tmp" "$tmp_sums" "$bin_name"; then
     echo "checksum verification failed; existing installation kept intact" >&2
+    rm -f "$tmp" "$tmp_sums"
     return 1
   fi
-  chmod +x "$tmp"
+  if ! chmod +x "$tmp"; then
+    echo "cannot set executable permission on downloaded binary" >&2
+    rm -f "$tmp" "$tmp_sums"
+    return 1
+  fi
   # Verify the downloaded binary actually runs BEFORE replacing anything,
   # so a broken download can never clobber a working installation.
   if ! "$tmp" --version >/dev/null 2>&1; then
     echo "downloaded binary failed --version; keeping existing installation intact" >&2
-    rm -f "$tmp"
+    rm -f "$tmp" "$tmp_sums"
     return 1
   fi
   # Atomic move: the existing binary stays intact until every gate passes.
-  mv -f "$tmp" "$INSTALL_DIR/$BINARY"
+  if ! mv -f "$tmp" "$INSTALL_DIR/$BINARY"; then
+    echo "atomic replacement failed; keeping existing installation intact" >&2
+    rm -f "$tmp" "$tmp_sums"
+    return 1
+  fi
   rm -f "$tmp_sums"
-  trap - EXIT
   echo "installed $BINARY to $INSTALL_DIR/$BINARY" >&2
   return 0
 }
 
 # Main
 if [ "$VERSION" = "latest" ]; then
-  if ! install_via_binary; then
+  if install_via_binary; then
+    :
+  else
+    binary_status=$?
+    if [ "$binary_status" -ne 2 ]; then
+      exit "$binary_status"
+    fi
     echo "binary not available for $OS/$ARCH or download failed, falling back to go install..." >&2
     install_via_go
   fi
@@ -261,7 +294,13 @@ else
   # Pinned version: prefer go for exact version
   if [ "$OS" = "linux" ] && { [ "$ARCH" = "amd64" ] || [ "$ARCH" = "arm64" ]; }; then
     # try binary first for pinned version too
-    if ! install_via_binary; then
+    if install_via_binary; then
+      :
+    else
+      binary_status=$?
+      if [ "$binary_status" -ne 2 ]; then
+        exit "$binary_status"
+      fi
       install_via_go
     fi
   else

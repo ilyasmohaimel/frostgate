@@ -113,6 +113,78 @@ func TestDeriveNameFromFragment(t *testing.T) {
 	}
 }
 
+func TestDeriveNameRejectsSecretLikeFragments(t *testing.T) {
+	for _, fragment := range []string{
+		"SUPER_SECRET_TOKEN_123",
+		"access-token-abcdef",
+		"11111111-1111-4111-8111-111111111111",
+		"A1b2C3d4E5f6G7h8I9j0K1",
+		"A1b2C3d4-E5f6G7h8",
+		"A1b2C3d4E5f6G7h8+I9j0K1",
+		"pbk=SUPER_SECRET_KEY",
+		"pbk%3DSUPER_SECRET_KEY",
+		"pbk+SUPER_SECRET_KEY",
+		"pbk%2BSUPER_SECRET_KEY",
+		"pbk SUPER_SECRET_KEY",
+		"pbk%20SUPER_SECRET_KEY",
+		"access+token=abc123",
+		"access%2Btoken%3Dabc123",
+		"access%252Btoken%253Dabc123",
+		"accessToken",
+		"refreshToken",
+		"apiKey",
+		"publicKey",
+		"privateKey",
+		"clientSecret",
+		"bearerToken",
+		"abcdefghijklmnop.qrstuv",
+		"abcdefghijklmnop%2Eqrstuv",
+		"AbCdEfGhIjKlMnOp-123456",
+		"deadbeefdeadbeef-deadbeefdeadbeef",
+		"abcdefghijklmnop-qrstuv",
+		"deadbeefdeadbeef%2Ddeadbeefdeadbeef",
+		"deadbeefdeadbeef",
+		"abcdefghijklmnop",
+		"qwertyuiopasdfgh",
+		"deadbeefdeadbeef%253Aignored",
+	} {
+		link := "vless://uuid@host:443?security=reality&sni=a&pbk=b#" + fragment
+		name := DeriveNameFromLink(link, 7)
+		if name != "vless-07" {
+			t.Fatalf("secret-like fragment became route name: fragment=%q name=%q", fragment, name)
+		}
+	}
+}
+
+func TestDeriveNameKeepsHumanFragments(t *testing.T) {
+	for _, test := range []struct {
+		fragment string
+		want     string
+	}{
+		{fragment: "primary-reality-01", want: "primary-reality-01"},
+		{fragment: "Home-Office-2024", want: "home-office-2024"},
+		{fragment: "Home%2DOffice%2D2024", want: "home-office-2024"},
+		{fragment: "home-office-production-europe", want: "home-office-production-europe"},
+		{fragment: "home+office", want: "home-office"},
+		{fragment: "home%20office", want: "home-office"},
+		{fragment: "tokenizer", want: "tokenizer"},
+		{fragment: "lowercase-route-label", want: "lowercase-route-label"},
+		{fragment: "Primary-Reality-01", want: "primary-reality-01"},
+	} {
+		link := "vless://uuid@host:443?security=reality&sni=a&pbk=b#" + test.fragment
+		if got := DeriveNameFromLink(link, 1); got != test.want {
+			t.Fatalf("human fragment %q = %q, want %q", test.fragment, got, test.want)
+		}
+	}
+}
+
+func TestDeriveNamePreservesHumanFragmentWithSeparators(t *testing.T) {
+	link := "vless://uuid@host:443?security=reality&sni=a&pbk=b#primary-reality-01"
+	if got, want := DeriveNameFromLink(link, 1), "primary-reality-01"; got != want {
+		t.Fatalf("human fragment = %q, want %q", got, want)
+	}
+}
+
 func TestFingerprintDedupe(t *testing.T) {
 	link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.1:443?security=reality&sni=example.com&pbk=key&sid=id&fp=chrome#one"
 	r1, _ := ParseShareLink(link, "one")

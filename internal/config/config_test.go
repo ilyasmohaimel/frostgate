@@ -45,6 +45,20 @@ endpoints:
 	}
 }
 
+func TestLoadRejectsOverflowingDayDuration(t *testing.T) {
+	path := writeTemp(t, `
+defaults:
+  timeout: 999999999999d
+endpoints:
+  - name: a
+    host: example.com
+    port: 443
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("overflowing day duration was accepted")
+	}
+}
+
 func TestLoadRejectsUnknownType(t *testing.T) {
 	path := writeTemp(t, `
 endpoints:

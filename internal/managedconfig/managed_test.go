@@ -96,6 +96,26 @@ func TestRoundTripPacketEncoding(t *testing.T) {
 	}
 }
 
+func TestRoundTripExplicitEmptyPacketEncoding(t *testing.T) {
+	d := tempDir(t)
+	v := &setup.VLESSOutbound{Tag: "vpe-empty", Server: "203.0.113.2", ServerPort: 443, UUID: "u", SNI: "s", PBK: "p", FP: "chrome", PacketEncodingSet: true}
+	first := writeConfig(t, d, []*setup.VLESSOutbound{v}, nil)
+	loaded, err := Load(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.VLESS[0].PacketEncodingSet || loaded.VLESS[0].PacketEncoding != "" {
+		t.Fatalf("explicit empty packet_encoding presence was lost: %+v", loaded.VLESS[0])
+	}
+	second, err := loaded.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical(t, first) != canonical(t, second) {
+		t.Fatalf("explicit empty packet_encoding was rewritten:\n%s\n---\n%s", first, second)
+	}
+}
+
 func TestRoundTripHysteriaSalamander(t *testing.T) {
 	d := tempDir(t)
 	h := &setup.Hysteria2Outbound{Tag: "h1", Server: "203.0.113.3", ServerPort: 8443, Password: "pw", ObfsType: "salamander", ObfsPassword: "ob", SNI: "h.example"}
@@ -511,6 +531,77 @@ func TestSaveTransactionReportsRollbackRecoveryFailures(t *testing.T) {
 	err := m.SaveTransaction(runner)
 	if err == nil || !strings.Contains(err.Error(), "daemon failed") || !strings.Contains(err.Error(), "restore blocked") || !strings.Contains(err.Error(), "restored restart failed") {
 		t.Fatalf("rollback errors were swallowed: %v", err)
+	}
+}
+
+func TestSaveTransactionRejectsSymlinkedManagedState(t *testing.T) {
+	root := tempDir(t)
+	a := filepath.Join(root, "profile-a")
+	b := filepath.Join(root, "profile-b")
+	if err := os.MkdirAll(a, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(b, "sing-box.json")
+	original := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(a, "sing-box.json")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	m := &Managed{Dir: a, Secret: "fixture-secret"}
+	err := m.SaveTransaction(&SidecarRunner{Validator: func([]byte) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "symlinked managed state") {
+		t.Fatalf("symlinked state error = %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("profile A transaction changed profile B state: %s", got)
+	}
+}
+
+func TestSaveTransactionPreservesDanglingManagedStateSymlink(t *testing.T) {
+	d := tempDir(t)
+	link := filepath.Join(d, "sing-box.json")
+	if err := os.Symlink(filepath.Join(d, "missing.json"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	m := &Managed{Dir: d, Secret: "fixture-secret"}
+	err := m.SaveTransaction(&SidecarRunner{Validator: func([]byte) error { return nil }})
+	if err == nil || !strings.Contains(err.Error(), "symlinked managed state") {
+		t.Fatalf("dangling symlink error = %v", err)
+	}
+	target, err := os.Readlink(link)
+	if err != nil || target != filepath.Join(d, "missing.json") {
+		t.Fatalf("dangling managed state symlink changed: %q err=%v", target, err)
+	}
+}
+
+func TestLoadRejectsSymlinkedManagedState(t *testing.T) {
+	root := tempDir(t)
+	a := filepath.Join(root, "profile-a")
+	b := filepath.Join(root, "profile-b")
+	if err := os.MkdirAll(a, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(b, "controller-secret")
+	if err := os.WriteFile(target, []byte("other-profile-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(a, "controller-secret")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := Load(a); err == nil || !strings.Contains(err.Error(), "symlinked managed state") {
+		t.Fatalf("symlinked secret was read: %v", err)
 	}
 }
 

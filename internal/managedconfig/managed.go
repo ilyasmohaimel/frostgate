@@ -50,6 +50,8 @@ type SidecarRunner struct {
 	Validator        func(candidate []byte) error
 	DaemonReload     func() error
 	Enable           func() error
+	Disable          func() error
+	Stop             func() error
 	Restart          func() error
 	IsActive         func() (bool, error)
 	ControllerReady  func(expectedOutbounds []string) (bool, error)
@@ -78,6 +80,12 @@ func DefaultSidecarRunnerForService(controllerAddr, secret, service string) *Sid
 		},
 		Enable: func() error {
 			return runCmd("systemctl", "--user", "enable", service)
+		},
+		Disable: func() error {
+			return runCmd("systemctl", "--user", "disable", service)
+		},
+		Stop: func() error {
+			return runCmd("systemctl", "--user", "stop", service)
 		},
 		Restart: func() error {
 			return runCmd("systemctl", "--user", "restart", service)
@@ -122,14 +130,18 @@ func SingBoxCheckValidator() func([]byte) error {
 		}
 		path := f.Name()
 		if _, err := f.Write(candidate); err != nil {
-			f.Close()
-			os.Remove(path)
-			return err
+			return errors.Join(err, f.Close(), os.Remove(path))
 		}
-		f.Close()
-		defer os.Remove(path)
-		if out, err := outputCmd(sb, "check", "-c", path); err != nil {
-			return fmt.Errorf("sing-box check failed: %s", strings.TrimSpace(string(out)))
+		if err := f.Close(); err != nil {
+			return errors.Join(err, os.Remove(path))
+		}
+		out, checkErr := outputCmd(sb, "check", "-c", path)
+		removeErr := os.Remove(path)
+		if checkErr != nil {
+			return errors.Join(fmt.Errorf("sing-box check failed: %s", strings.TrimSpace(string(out))), removeErr)
+		}
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("remove temporary sing-box candidate: %w", removeErr)
 		}
 		return nil
 	}
@@ -171,10 +183,12 @@ func lookPath(name string) (string, error) {
 
 func Load(dir string) (*Managed, error) {
 	m := &Managed{Dir: dir, Raw: map[string]any{}, managedTags: map[string]bool{}}
-	if data, err := os.ReadFile(filepath.Join(dir, "controller-secret")); err == nil {
+	if data, err := readManagedStateFile(dir, "controller-secret"); err == nil {
 		m.Secret = strings.TrimSpace(string(data))
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read controller secret: %w", err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "sing-box.json"))
+	data, err := readManagedStateFile(dir, "sing-box.json")
 	if err != nil {
 		if os.IsNotExist(err) {
 			return m, nil
@@ -193,6 +207,21 @@ func Load(dir string) (*Managed, error) {
 	}
 	m.parseOutbounds(raw)
 	return m, nil
+}
+
+func readManagedStateFile(dir, name string) ([]byte, error) {
+	path := filepath.Join(dir, name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing to read symlinked managed state file %s", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("managed state file %s is not regular", path)
+	}
+	return os.ReadFile(path)
 }
 
 func (m *Managed) parseOutbounds(raw map[string]any) {
@@ -235,6 +264,8 @@ func parseVLESS(mm map[string]any, tag string) *setup.VLESSOutbound {
 	v.UUID, _ = mm["uuid"].(string)
 	v.Flow, _ = mm["flow"].(string)
 	v.PacketEncoding, _ = mm["packet_encoding"].(string)
+	_, v.PacketEncodingSet = mm["packet_encoding"]
+	v.Network, _ = mm["network"].(string)
 	if tlsRaw, ok := mm["tls"].(map[string]any); ok {
 		v.SNI, _ = tlsRaw["server_name"].(string)
 		if utls, ok := tlsRaw["utls"].(map[string]any); ok {
@@ -256,6 +287,7 @@ func parseHysteria(mm map[string]any, tag string) *setup.Hysteria2Outbound {
 		h.ServerPort = int(pf)
 	}
 	h.Password, _ = mm["password"].(string)
+	h.Network, _ = mm["network"].(string)
 	if obfs, ok := mm["obfs"].(map[string]any); ok {
 		h.ObfsType, _ = obfs["type"].(string)
 		h.ObfsPassword, _ = obfs["password"].(string)
@@ -300,6 +332,9 @@ func (m *Managed) BenchmarkProxyPresent() bool {
 // Generate mutates only Frostgate-owned objects. Unrelated top-level keys,
 // inbounds, route rules, log settings and protocol outbounds survive intact.
 func (m *Managed) Generate() ([]byte, error) {
+	if err := m.validateManagedRoutes(); err != nil {
+		return nil, err
+	}
 	secret := m.Secret
 	if secret == "" {
 		s, err := setup.GenerateSecret()
@@ -309,7 +344,10 @@ func (m *Managed) Generate() ([]byte, error) {
 		secret = s
 		m.Secret = secret
 	}
-	top := cloneRaw(m.Raw)
+	top, err := cloneRaw(m.Raw)
+	if err != nil {
+		return nil, fmt.Errorf("clone existing config: %w", err)
+	}
 	hasProxy := len(m.VLESS)+len(m.Hysteria) > 0
 	tags := m.ProxyTags()
 	updated := map[string]map[string]any{}
@@ -379,7 +417,9 @@ func (m *Managed) Generate() ([]byte, error) {
 	}
 	top["outbounds"] = outs
 	if hasProxy {
-		m.ensureOwnedInfrastructure(top)
+		if err := m.ensureOwnedInfrastructure(top); err != nil {
+			return nil, err
+		}
 	}
 	if _, ok := top["log"]; !ok {
 		top["log"] = map[string]any{"level": "warn", "output": filepath.Join(m.Dir, "sing-box.log")}
@@ -387,7 +427,7 @@ func (m *Managed) Generate() ([]byte, error) {
 	return json.MarshalIndent(top, "", "  ")
 }
 
-func (m *Managed) ensureOwnedInfrastructure(top map[string]any) {
+func (m *Managed) ensureOwnedInfrastructure(top map[string]any) error {
 	controller := m.ControllerAddr
 	if controller == "" {
 		controller = "127.0.0.1:9090"
@@ -402,9 +442,15 @@ func (m *Managed) ensureOwnedInfrastructure(top map[string]any) {
 	}
 	host, portStr, err := net.SplitHostPort(benchmark)
 	if err != nil {
-		host, portStr = "127.0.0.1", "2080"
+		return fmt.Errorf("invalid managed benchmark address %q: %w", benchmark, err)
 	}
-	port, _ := strconv.Atoi(portStr)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid managed benchmark port %q", portStr)
+	}
+	if !isLoopback(host) {
+		return fmt.Errorf("managed benchmark listener must be loopback, got %q", host)
+	}
 	inbounds, _ := top["inbounds"].([]any)
 	foundInbound := false
 	for i, raw := range inbounds {
@@ -469,6 +515,76 @@ func (m *Managed) ensureOwnedInfrastructure(top map[string]any) {
 		experimental["cache_file"] = map[string]any{"enabled": true, "path": filepath.Join(m.Dir, "cache.db")}
 	}
 	top["experimental"] = experimental
+	return nil
+}
+
+func (m *Managed) validateManagedRoutes() error {
+	seen := make(map[string]struct{}, len(m.VLESS)+len(m.Hysteria))
+	add := func(tag string) error {
+		if tag == "" {
+			return fmt.Errorf("managed outbound has an empty tag")
+		}
+		if _, exists := seen[tag]; exists {
+			return fmt.Errorf("duplicate managed outbound tag %q", tag)
+		}
+		seen[tag] = struct{}{}
+		return nil
+	}
+	for _, v := range m.VLESS {
+		if v == nil {
+			return fmt.Errorf("nil managed VLESS outbound")
+		}
+		if err := add(v.Tag); err != nil {
+			return err
+		}
+		if v.Server == "" || v.ServerPort < 1 || v.ServerPort > 65535 || v.UUID == "" || v.SNI == "" || v.PBK == "" {
+			return fmt.Errorf("managed VLESS outbound %q is incomplete", v.Tag)
+		}
+		if v.Network != "" && !strings.EqualFold(v.Network, "tcp") {
+			return fmt.Errorf("managed VLESS outbound %q uses unsupported network", v.Tag)
+		}
+	}
+	for _, h := range m.Hysteria {
+		if h == nil {
+			return fmt.Errorf("nil managed Hysteria2 outbound")
+		}
+		if err := add(h.Tag); err != nil {
+			return err
+		}
+		if h.Server == "" || h.ServerPort < 1 || h.ServerPort > 65535 || h.Password == "" {
+			return fmt.Errorf("managed Hysteria2 outbound %q is incomplete", h.Tag)
+		}
+		if h.ObfsType != "" && h.ObfsType != "salamander" {
+			return fmt.Errorf("managed Hysteria2 outbound %q uses unsupported obfs", h.Tag)
+		}
+		if h.ObfsType == "salamander" && h.ObfsPassword == "" {
+			return fmt.Errorf("managed Hysteria2 outbound %q has salamander without a password", h.Tag)
+		}
+		if h.Network != "" && !strings.EqualFold(h.Network, "tcp") && !strings.EqualFold(h.Network, "udp") {
+			return fmt.Errorf("managed Hysteria2 outbound %q uses unsupported network", h.Tag)
+		}
+	}
+	rawTags := map[string]int{}
+	for _, raw := range rawOutbounds(m.Raw) {
+		outbound, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag := inboundString(outbound, "tag")
+		if tag == "" {
+			continue
+		}
+		rawTags[tag]++
+		if _, exists := seen[tag]; exists && !m.managedTags[tag] {
+			return fmt.Errorf("managed outbound tag %q collides with an unrelated outbound", tag)
+		}
+	}
+	for tag, count := range rawTags {
+		if count > 1 {
+			return fmt.Errorf("duplicate outbound tag %q in managed config", tag)
+		}
+	}
+	return nil
 }
 
 func rawOutbounds(top map[string]any) []any {
@@ -513,16 +629,19 @@ func hasSelector(top map[string]any) bool {
 	return false
 }
 
-func cloneRaw(raw map[string]any) map[string]any {
+func cloneRaw(raw map[string]any) (map[string]any, error) {
 	if len(raw) == 0 {
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
-	data, _ := json.Marshal(raw)
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
 	var out map[string]any
-	if json.Unmarshal(data, &out) != nil {
-		return map[string]any{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 func controllerHostPort(raw string) string {
@@ -546,10 +665,10 @@ func vlessMap(v *setup.VLESSOutbound) map[string]any {
 		tlsCfg["reality"].(map[string]any)["spider_x"] = v.SpiderX
 	}
 	pe := v.PacketEncoding
-	if pe == "" {
+	if pe == "" && !v.PacketEncodingSet {
 		pe = "xudp"
 	}
-	return map[string]any{
+	out := map[string]any{
 		"type":            "vless",
 		"tag":             v.Tag,
 		"server":          v.Server,
@@ -559,6 +678,10 @@ func vlessMap(v *setup.VLESSOutbound) map[string]any {
 		"packet_encoding": pe,
 		"tls":             tlsCfg,
 	}
+	if v.Network != "" {
+		out["network"] = v.Network
+	}
+	return out
 }
 
 func hysteriaMap(h *setup.Hysteria2Outbound) map[string]any {
@@ -580,6 +703,9 @@ func hysteriaMap(h *setup.Hysteria2Outbound) map[string]any {
 			obfsType = "salamander"
 		}
 		ob["obfs"] = map[string]any{"type": obfsType, "password": h.ObfsPassword}
+	}
+	if h.Network != "" {
+		ob["network"] = h.Network
 	}
 	return ob
 }
@@ -633,15 +759,17 @@ func (m *Managed) SaveTransactionWithConfig(runner *SidecarRunner, configPath st
 }
 
 type transactionFile struct {
-	path      string
-	candidate []byte
-	install   bool
+	path          string
+	candidate     []byte
+	install       bool
+	followSymlink bool
 }
 
 type fileSnapshot struct {
-	path   string
-	data   []byte
-	exists bool
+	path          string
+	data          []byte
+	exists        bool
+	followSymlink bool
 }
 
 func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, configData []byte) error {
@@ -666,12 +794,25 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 		{path: filepath.Join(m.Dir, "controller-secret"), candidate: []byte(m.Secret + "\n"), install: m.Secret != ""},
 	}
 	if configPath != "" {
-		files = append(files, transactionFile{path: configPath, candidate: configData, install: true})
+		// A config symlink is a profile alias and must keep pointing at the
+		// canonical config. Managed-state files are never followed: allowing a
+		// hostile or stale state symlink would let one profile overwrite another.
+		files = append(files, transactionFile{path: configPath, candidate: configData, install: true, followSymlink: true})
 	}
 
 	snapshots := make([]fileSnapshot, 0, len(files))
 	for _, f := range files {
-		s := fileSnapshot{path: f.path}
+		s := fileSnapshot{path: f.path, followSymlink: f.followSymlink}
+		if info, lstatErr := os.Lstat(f.path); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			if !f.followSymlink {
+				return fmt.Errorf("snapshot %s: refusing symlinked managed state file", f.path)
+			}
+			if _, resolveErr := filepath.EvalSymlinks(f.path); resolveErr != nil {
+				return fmt.Errorf("snapshot %s: resolve config symlink: %w", f.path, resolveErr)
+			}
+		} else if lstatErr != nil && !os.IsNotExist(lstatErr) {
+			return fmt.Errorf("snapshot %s: %w", f.path, lstatErr)
+		}
 		if data, readErr := os.ReadFile(f.path); readErr == nil {
 			s.data = data
 			s.exists = true
@@ -685,7 +826,7 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 		if !f.install {
 			continue
 		}
-		if err := atomicWriteFile(f.path, f.candidate, 0o600); err != nil {
+		if err := atomicWrite(f.path, f.candidate, 0o600, f.followSymlink); err != nil {
 			original := fmt.Errorf("install %s: %w", f.path, err)
 			if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
 				return errors.Join(original, fmt.Errorf("rollback files: %w", rollbackErr))
@@ -749,6 +890,30 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicWithOptions(path, data, mode, false)
+}
+
+func writeConfigFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicWithOptions(path, data, mode, true)
+}
+
+func writeFileAtomicWithOptions(path string, data []byte, mode os.FileMode, followSymlink bool) (err error) {
+	// Config aliases are profile aliases, not files Frostgate may replace. An
+	// atomic rename over a symlink would silently sever that identity; resolve
+	// an existing config link and update its target instead. Managed state is
+	// deliberately different: do not follow its links across profile bounds.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if !followSymlink {
+			return fmt.Errorf("refusing to write symlinked managed state file %s", path)
+		}
+		resolved, resolveErr := filepath.EvalSymlinks(path)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve symlink %s: %w", path, resolveErr)
+		}
+		path = resolved
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -757,10 +922,17 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	installed := false
+	defer func() {
+		if installed {
+			return
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, fmt.Errorf("remove temporary config %s: %w", tmpPath, removeErr))
+		}
+	}()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -768,19 +940,31 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	installed = true
+	return nil
 }
 
 var (
-	atomicWriteFile = writeFileAtomic
-	removeFile      = os.Remove
+	atomicWriteFile       = writeFileAtomic
+	atomicWriteConfigFile = writeConfigFileAtomic
+	removeFile            = os.Remove
 )
+
+func atomicWrite(path string, data []byte, mode os.FileMode, followSymlink bool) error {
+	if followSymlink {
+		return atomicWriteConfigFile(path, data, mode)
+	}
+	return atomicWriteFile(path, data, mode)
+}
 
 func rollbackSnapshots(snapshots []fileSnapshot) error {
 	var errs []error
 	for _, snapshot := range snapshots {
 		if snapshot.exists {
-			if err := atomicWriteFile(snapshot.path, snapshot.data, 0o600); err != nil {
+			if err := atomicWrite(snapshot.path, snapshot.data, 0o600, snapshot.followSymlink); err != nil {
 				errs = append(errs, fmt.Errorf("restore %s: %w", snapshot.path, err))
 			}
 		} else {
