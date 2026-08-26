@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -397,5 +399,78 @@ endpoints:
 	}
 	if cfg.SingBox.Secret != "envsecret" {
 		t.Errorf("env override %q want envsecret", cfg.SingBox.Secret)
+	}
+}
+
+func TestConfigRejectsInvalidExplicitPorts(t *testing.T) {
+	for _, port := range []int{-1, 0, 65536, 999999} {
+		path := writeTemp(t, fmt.Sprintf("endpoints:\n  - name: tcp\n    type: tcp\n    host: example.com\n    port: %d\n", port))
+		if _, err := Load(path); err == nil {
+			t.Fatalf("port %d was accepted", port)
+		}
+	}
+}
+
+func TestConfigRejectsInvalidHTTPURLPortsButKeepsDefaults(t *testing.T) {
+	for _, raw := range []string{
+		"https://example.com:0/",
+		"https://example.com:65536/",
+		"https://example.com:999999/",
+	} {
+		path := writeTemp(t, fmt.Sprintf("endpoints:\n  - name: http\n    type: http\n    url: %s\n", raw))
+		if _, err := Load(path); err == nil {
+			t.Fatalf("URL port %q was accepted", raw)
+		}
+	}
+	for _, raw := range []string{"http://example.com/", "https://example.com/"} {
+		path := writeTemp(t, fmt.Sprintf("endpoints:\n  - name: http\n    type: http\n    url: %s\n", raw))
+		if _, err := Load(path); err != nil {
+			t.Fatalf("default HTTP port URL %q rejected: %v", raw, err)
+		}
+	}
+}
+
+func TestRemotePlaintextControllerSecretRejected(t *testing.T) {
+	tests := []struct {
+		name       string
+		controller string
+		secret     string
+		wantErr    bool
+	}{
+		{"loopback", "http://127.0.0.1:9090", "fixture-secret", false},
+		{"ipv6 loopback", "http://[::1]:9090", "fixture-secret", false},
+		{"localhost", "http://localhost:9090", "fixture-secret", false},
+		{"remote https", "https://remote.example:443", "fixture-secret", false},
+		{"remote http", "http://remote.example:9090", "fixture-secret", true},
+		{"lan http", "http://192.168.1.5:9090", "fixture-secret", true},
+		{"remote no secret", "http://remote.example:9090", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, fmt.Sprintf("singbox:\n  controller: %s\n  secret: %q\nendpoints:\n  - name: proxy\n    type: singbox\n    outbound: proxy\n", tt.controller, tt.secret))
+			_, err := Load(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Load() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRemotePlaintextControllerSecretFileRejected(t *testing.T) {
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "controller-secret")
+	if err := os.WriteFile(secretFile, []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeTemp(t, "singbox:\n  controller: http://remote.example:9090\n  secret_file: "+secretFile+"\nendpoints:\n  - name: proxy\n    type: singbox\n    outbound: proxy\n")
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "remote plaintext HTTP") {
+		t.Fatalf("remote secret_file controller error = %v", err)
+	}
+}
+
+func TestProbeBudgetCoversEverySampleAndInterval(t *testing.T) {
+	cfg := &Config{Defaults: Defaults{Timeout: Duration{Duration: 5 * time.Second}, Samples: 4, SampleInterval: Duration{Duration: 150 * time.Millisecond}}}
+	if got, want := cfg.ProbeBudget(Endpoint{}), 21*time.Second+450*time.Millisecond; got != want {
+		t.Fatalf("ProbeBudget = %s, want %s", got, want)
 	}
 }

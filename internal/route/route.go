@@ -211,11 +211,16 @@ func humanWord(word string) bool {
 	if len(word) < 1 {
 		return false
 	}
-	for i, r := range word {
+	previousLower := false
+	for index, r := range word {
 		if r >= 'a' && r <= 'z' {
+			previousLower = true
 			continue
 		}
-		if i == 0 && r >= 'A' && r <= 'Z' {
+		// Human provider labels often use camel case (HongKong). Preserve
+		// that form without treating all-caps opaque identifiers as names.
+		if r >= 'A' && r <= 'Z' && (index == 0 || previousLower) {
+			previousLower = false
 			continue
 		}
 		return false
@@ -252,9 +257,8 @@ func splitCamelCase(s string) string {
 }
 
 func parseFragment(frag string) (string, error) {
-	if decoded, err := url.QueryUnescape(frag); err == nil {
-		return decoded, nil
-	}
+	// RFC 3986 fragments are percent-encoded components, not form/query
+	// strings. QueryUnescape would silently turn a literal '+' into a space.
 	if decoded, err := url.PathUnescape(frag); err == nil {
 		return decoded, nil
 	}

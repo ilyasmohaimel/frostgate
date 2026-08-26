@@ -122,20 +122,29 @@ func run() int {
 		}
 	}
 
-	cfgPath := flag.String("config", "", "path to config file (default: $XDG_CONFIG_HOME/frostgate/config.yaml, ~/.config/frostgate/config.yaml, ./frostgate.yaml)")
-	jsonOut := flag.Bool("json", false, "emit machine-readable JSON")
-	watch := flag.Bool("watch", false, "re-probe continuously with TUI (or NDJSON if --json)")
-	interval := flag.Duration("interval", 5*time.Second, "interval between probes in --watch")
-	timeout := flag.Duration("timeout", 0, "override per-probe timeout (e.g. 3s)")
-	doctorFlag := flag.Bool("doctor", false, "run diagnostics and exit")
-	checkFlag := flag.Bool("check", false, "validate config and exit")
-	versionFlag := flag.Bool("version", false, "print version and exit")
-	verbose := flag.Bool("verbose", false, "verbose/debug output")
-	debug := flag.Bool("debug", false, "debug output (alias for --verbose)")
-	setupFlag := flag.Bool("setup", false, "run interactive setup wizard")
-	flag.Usage = func() { printHelp() }
-	flag.Parse()
-	if args := flag.Args(); len(args) > 0 {
+	fs := flag.NewFlagSet("frostgate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfgPath := fs.String("config", "", "path to config file (default: $XDG_CONFIG_HOME/frostgate/config.yaml, ~/.config/frostgate/config.yaml, ./frostgate.yaml)")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
+	watch := fs.Bool("watch", false, "re-probe continuously with TUI (or NDJSON if --json)")
+	interval := fs.Duration("interval", 5*time.Second, "interval between probes in --watch")
+	timeout := fs.Duration("timeout", 0, "override per-probe timeout (e.g. 3s)")
+	doctorFlag := fs.Bool("doctor", false, "run diagnostics and exit")
+	checkFlag := fs.Bool("check", false, "validate config and exit")
+	versionFlag := fs.Bool("version", false, "print version and exit")
+	verbose := fs.Bool("verbose", false, "verbose/debug output")
+	debug := fs.Bool("debug", false, "debug output (alias for --verbose)")
+	setupFlag := fs.Bool("setup", false, "run interactive setup wizard")
+	fs.Usage = func() { printHelp() }
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printHelp()
+			return 0
+		}
+		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		return 3
+	}
+	if args := fs.Args(); len(args) > 0 {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", sanitizeOutput(args[0]))
 		return 3
 	}
@@ -391,7 +400,7 @@ func handleAdd(args []string) int {
 		}
 	}
 	if ep != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.TimeoutFor(*ep))
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.ProbeBudget(*ep))
 		res := probe.ProbeEndpoint(ctx, cfg, *ep)
 		cancel()
 		if res.Status == "down" {
@@ -573,8 +582,23 @@ func handleImport(args []string) int {
 		fmt.Fprintln(os.Stderr, "load imported config:", sanitizeError(err))
 		return 3
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	results := probe.Run(ctx, cfg)
+	importedCfg := *cfg
+	importedCfg.Endpoints = nil
+	importedTags := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		importedTags[tag] = struct{}{}
+	}
+	for _, endpoint := range cfg.Endpoints {
+		if _, ok := importedTags[endpoint.Name]; ok {
+			importedCfg.Endpoints = append(importedCfg.Endpoints, endpoint)
+		}
+	}
+	if len(importedCfg.Endpoints) == 0 {
+		fmt.Fprintln(os.Stderr, "imported routes were not present in the saved config")
+		return 3
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeRunBudget(&importedCfg))
+	results := probe.Run(ctx, &importedCfg)
 	cancel()
 	fmt.Println("\nTESTING...")
 	for i, r := range results {
@@ -588,7 +612,7 @@ func handleImport(args []string) int {
 		}
 	}
 	fmt.Printf("\n%d/%d usable.\n", usable, len(results))
-	return 0
+	return exitCode(results)
 }
 
 // --- test ---
@@ -891,10 +915,10 @@ func handleBenchmark(args []string) int {
 	if downloadURL == "" {
 		downloadURL = benchmark.DefaultDownloadURL
 	}
-	routes := len(cfg.Endpoints)
-	totalBytes := saturatingPositiveProduct(int64(routes), bytesPerRoute)
-	if !noSpeed && routes > 10 {
-		msg := fmt.Sprintf("%d routes selected. Default benchmark will transfer ~%d MiB.\n", routes, totalBytes/1024/1024)
+	measurements := benchmarkMeasurementCount(cfg)
+	totalBytes := saturatingPositiveProduct(int64(measurements), bytesPerRoute)
+	if !noSpeed && measurements > 10 {
+		msg := fmt.Sprintf("%d unique benchmark measurements selected. Default benchmark will transfer ~%d MiB.\n", measurements, totalBytes/1024/1024)
 		if jsonOut {
 			fmt.Fprint(os.Stderr, msg)
 			fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
@@ -935,6 +959,7 @@ func handleBenchmark(args []string) int {
 	}
 	var bres []benchRes
 	downloads := map[string]float64{}
+	var benchmarkLifecycleErr error
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
 	proxyAddr, proxyUnavailableReason := benchmarkProxyAddr(cfg, cfgFile, managedDir)
 	proxyConfigured := proxyAddr != ""
@@ -950,7 +975,7 @@ func handleBenchmark(args []string) int {
 					if r.Status != "down" {
 						br.DownloadNA = proxyUnavailableReason
 					}
-				} else if probe.HasProxy(results) {
+				} else if probe.HasProxy(results) && probe.IsDirectBaseline(r.Endpoint) {
 					br.DownloadNA = "direct baseline"
 				} else {
 					sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
@@ -968,7 +993,7 @@ func handleBenchmark(args []string) int {
 			for _, r := range results {
 				if r.Endpoint.Type != config.ProbeSingBox {
 					br := newBenchRes(r)
-					if probe.HasProxy(results) {
+					if probe.HasProxy(results) && probe.IsDirectBaseline(r.Endpoint) {
 						// Direct baseline is diagnostic only.
 						br.DownloadNA = "direct baseline"
 					} else {
@@ -984,25 +1009,29 @@ func handleBenchmark(args []string) int {
 					bres = append(bres, br)
 				}
 			}
-			outboundToName := map[string]string{}
+			outboundToNames := map[string][]string{}
+			seenOutbound := map[string]bool{}
 			var routes []string
 			for _, r := range results {
 				if r.Endpoint.Type == config.ProbeSingBox && r.Status != "down" {
-					routes = append(routes, r.Endpoint.Outbound)
-					outboundToName[r.Endpoint.Outbound] = r.Endpoint.Name
+					outboundToNames[r.Endpoint.Outbound] = append(outboundToNames[r.Endpoint.Outbound], r.Endpoint.Name)
+					if !seenOutbound[r.Endpoint.Outbound] {
+						seenOutbound[r.Endpoint.Outbound] = true
+						routes = append(routes, r.Endpoint.Outbound)
+					}
 				}
 			}
 			// Attributed measurement: captures the selector, switches per
 			// route, and restores it on success/error/cancellation.
 			tp, benchErr := benchmark.BenchRoutesChecked(ctx, client, "frostgate-selector", proxyAddr, downloadURL, bytesPerRoute, routes, measure)
 			if benchErr != nil {
+				benchmarkLifecycleErr = benchErr
 				invalidateBenchmarkThroughput(tp, benchErr)
 				fmt.Fprintf(os.Stderr, "benchmark: %s\n", sanitizeError(benchErr))
 			}
 			tpByName := map[string]benchmark.RouteThroughput{}
 			for _, t := range tp {
-				name := outboundToName[t.Route]
-				if name != "" {
+				for _, name := range outboundToNames[t.Route] {
 					tpByName[name] = t
 				}
 			}
@@ -1014,7 +1043,7 @@ func handleBenchmark(args []string) int {
 				if t, ok := tpByName[r.Endpoint.Name]; ok {
 					br.Download = t.DownloadMbps
 					br.DownloadNA = t.NAReason
-				} else if benchErr != nil && r.Status != "down" {
+				} else if benchmarkLifecycleErr != nil && r.Status != "down" {
 					br.DownloadNA = "selector state unavailable"
 				}
 				downloads[r.Endpoint.Name] = br.Download
@@ -1050,7 +1079,7 @@ func handleBenchmark(args []string) int {
 			fmt.Fprintln(os.Stderr, "encode benchmark JSON:", sanitizeError(err))
 			return 3
 		}
-		if historyErr != nil {
+		if historyErr != nil || benchmarkLifecycleErr != nil {
 			return 3
 		}
 		return exitCode(results)
@@ -1092,7 +1121,7 @@ func handleBenchmark(args []string) int {
 	} else if probe.HasProxy(results) {
 		fmt.Println("\nBest proxy: none usable")
 	}
-	if historyErr != nil || recommendErr != nil {
+	if historyErr != nil || recommendErr != nil || benchmarkLifecycleErr != nil {
 		return 3
 	}
 	return exitCode(results)
@@ -1106,6 +1135,8 @@ func invalidateBenchmarkThroughput(results []benchmark.RouteThroughput, err erro
 		reason = "selector restoration failed"
 	} else if strings.Contains(err.Error(), "capture selector") {
 		reason = "selector state unavailable"
+	} else if strings.Contains(err.Error(), "switch selector") {
+		reason = "selector switch failed"
 	}
 	for i := range results {
 		results[i].DownloadMbps = 0
@@ -1119,6 +1150,27 @@ func compactReasons(reasons []string) string {
 
 func benchmarkProxyAddr(cfg *config.Config, configPath, managedDir string) (string, string) {
 	return benchmarkProxyAddrWithRunner(cfg, configPath, managedDir, nil)
+}
+
+// benchmarkMeasurementCount is the transfer count used for the confirmation
+// estimate. Endpoint aliases sharing one sing-box outbound are one network
+// measurement; each non-proxy endpoint still needs its own direct transfer.
+func benchmarkMeasurementCount(cfg *config.Config) int {
+	if cfg == nil {
+		return 0
+	}
+	uniqueOutbounds := make(map[string]struct{})
+	direct := 0
+	for _, endpoint := range cfg.Endpoints {
+		if endpoint.Type == config.ProbeSingBox && endpoint.Outbound != "" {
+			uniqueOutbounds[endpoint.Outbound] = struct{}{}
+			continue
+		}
+		if endpoint.Type != config.ProbeSingBox {
+			direct++
+		}
+	}
+	return len(uniqueOutbounds) + direct
 }
 
 // migrateLegacyProfileForBenchmark makes an old parent-directory sidecar
@@ -1275,13 +1327,19 @@ func handleDiagnose(args []string) int {
 	var layers []diagnose.Layer
 	opts := diagnose.Options{}
 	opts.SidecarService = profileForPaths(cfgFile, dir).Service
-	if mg, err := managedconfig.Load(dir); err == nil {
+	var managedStateErr error
+	if mg, err := loadManagedStateForDiagnose(dir); err != nil {
+		managedStateErr = err
+	} else {
 		opts.Managed = mg
 	}
 	if len(rest) == 0 {
 		layers = diagnose.DiagnoseAll(cfg, opts)
 	} else {
 		layers = diagnose.DiagnoseRoute(cfg, rest[0], opts)
+	}
+	if managedStateErr != nil {
+		layers = append([]diagnose.Layer{{Name: "Managed state", Status: "FAIL", Detail: sanitizeError(managedStateErr), Hint: "Restore or recreate Frostgate-managed sidecar state."}}, layers...)
 	}
 	hasFail := false
 	for _, l := range layers {
@@ -1340,6 +1398,24 @@ func handleDiagnose(args []string) int {
 	return 0
 }
 
+func loadManagedStateForDiagnose(dir string) (*managedconfig.Managed, error) {
+	statePath := filepath.Join(dir, "sing-box.json")
+	info, err := os.Lstat(statePath)
+	if os.IsNotExist(err) {
+		// An external-controller profile may legitimately keep a local
+		// controller-secret file. The managed sidecar JSON is the ownership
+		// marker, so a secret alone must not become a false diagnosis failure.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect managed state: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("managed state is not a regular file")
+	}
+	return managedconfig.Load(dir)
+}
+
 // --- network-check ---
 type networkCheckDoc struct {
 	SchemaVersion    int                 `json:"schema_version"`
@@ -1394,7 +1470,10 @@ func handleNetworkCheck(args []string) int {
 	}
 	if loaded, err := config.Load(resolvedConfig); err == nil {
 		cfg = loaded
-	} else if cfgPath != "" {
+	} else if cfgPath != "" || !os.IsNotExist(err) {
+		// An absent implicit config is valid for generic network checks; an
+		// existing but malformed/unreadable implicit config is an error, not a
+		// reason to pretend Frostgate has no configuration.
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
@@ -1433,8 +1512,9 @@ func handleNetworkCheck(args []string) int {
 		}
 		routes := proxyRoutesForMatrix(cfg, mg)
 		client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		doc.Matrix = network.DestinationMatrix(ctx, destURLs, routes, client, 6*time.Second)
+		routeTimeout := networkMatrixRouteTimeout(cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), network.MatrixBudget(len(destURLs), len(routes), routeTimeout))
+		doc.Matrix = network.DestinationMatrix(ctx, destURLs, routes, client, routeTimeout)
 		cancel()
 		for i := range doc.Matrix {
 			if label := destLabels[doc.Matrix[i].Destination]; label != "" {
@@ -1603,8 +1683,9 @@ func matrixLabel(url string, labels map[string]string) string {
 }
 
 func truncateRoute(name string) string {
-	if len(name) > 14 {
-		return name[:13] + "~"
+	runes := []rune(name)
+	if len(runes) > 14 {
+		return string(runes[:13]) + "~"
 	}
 	return name
 }
@@ -1946,7 +2027,7 @@ func handleRecommend(args []string) int {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
 		return 3
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), probeRunBudget(cfg))
 	results := probe.Run(ctx, cfg)
 	cancel()
 	rec, recommendErr := recommendFromResults(cfg, results, cfgFile, managedDir)
@@ -2164,9 +2245,41 @@ func newRecorder(cfg *config.Config, profileID string) *history.Recorder {
 }
 
 func probeRunQuick(cfg *config.Config) []probe.Result {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), probeRunBudget(cfg))
 	defer cancel()
 	return probe.Run(ctx, cfg)
+}
+
+// probeRunBudget is the whole-operation budget for concurrently probing a
+// config. Each endpoint keeps its own multi-sample contract; concurrent
+// endpoints need only the slowest endpoint budget, not a fixed magic cap.
+func probeRunBudget(cfg *config.Config) time.Duration {
+	if cfg == nil || len(cfg.Endpoints) == 0 {
+		return time.Second
+	}
+	budget := time.Second
+	for _, endpoint := range cfg.Endpoints {
+		if candidate := cfg.ProbeBudget(endpoint); candidate > budget {
+			budget = candidate
+		}
+	}
+	return budget
+}
+
+func networkMatrixRouteTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return time.Second
+	}
+	maximum := time.Second
+	for _, endpoint := range cfg.Endpoints {
+		if endpoint.Type != config.ProbeSingBox {
+			continue
+		}
+		if timeout := cfg.TimeoutFor(endpoint); timeout > maximum {
+			maximum = timeout
+		}
+	}
+	return maximum
 }
 
 // recommendFromResults builds recommend inputs from probe results and

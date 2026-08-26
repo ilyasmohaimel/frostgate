@@ -80,6 +80,7 @@ func BenchRoutesChecked(
 		return out, fmt.Errorf("capture selector state: %w", err)
 	}
 	var restoreErr error
+	var lifecycleErr error
 	restore := func() {
 		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer rcancel()
@@ -94,6 +95,13 @@ routeLoop:
 		if err := ctrl.SelectOutbound(ctx, selector, route); err != nil {
 			res.NAReason = "selector switch failed"
 			out = append(out, res)
+			// A failed selector change is not a route-speed result: Frostgate
+			// could not establish the requested attribution lifecycle. Keep the
+			// per-route N/A detail, restore the original selection, and surface a
+			// command-level failure to callers.
+			if lifecycleErr == nil {
+				lifecycleErr = fmt.Errorf("switch selector %q to %q: %w", selector, route, err)
+			}
 			continue
 		}
 		// Give the core a beat to settle connections through the new outbound.
@@ -127,6 +135,9 @@ routeLoop:
 	restore()
 	if restoreErr != nil {
 		return out, fmt.Errorf("restore selector %q: %w", selector, restoreErr)
+	}
+	if lifecycleErr != nil {
+		return out, lifecycleErr
 	}
 	return out, nil
 }

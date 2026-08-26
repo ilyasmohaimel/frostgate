@@ -36,11 +36,13 @@ func TestBuildSystemdUnitUsesActualPathsAndQuotes(t *testing.T) {
 }
 
 func TestInstallSystemdServiceSurfacesCommandFailures(t *testing.T) {
-	for _, failure := range []string{"daemon-reload", "enable"} {
+	for _, failure := range []string{"daemon-reload", "enable", "restart"} {
 		t.Run(failure, func(t *testing.T) {
 			key := "--user daemon-reload"
 			if failure == "enable" {
 				key = "--user enable --now frostgate-singbox.service"
+			} else if failure == "restart" {
+				key = "--user restart frostgate-singbox.service"
 			}
 			runner := &fakeSystemd{runErr: map[string]error{key: errors.New("boom")}}
 			path := filepath.Join(t.TempDir(), "systemd", "user", "frostgate-singbox.service")
@@ -80,8 +82,8 @@ func TestInstallSystemdServiceSuccess(t *testing.T) {
 	if err := InstallSystemdService(path, "/bin/sing-box", "/tmp/frostgate", runner); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 3 {
-		t.Fatalf("calls = %v, want daemon-reload, enable, is-active", runner.calls)
+	if len(runner.calls) != 4 {
+		t.Fatalf("calls = %v, want daemon-reload, enable, restart, is-active", runner.calls)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -109,5 +111,14 @@ func TestWriteSystemdUnitRejectsSymlink(t *testing.T) {
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != string(original) {
 		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+}
+
+func TestWriteSystemdUnitRejectsControlCharacters(t *testing.T) {
+	for _, bad := range []string{"\n", "\r", "\x00", "\x1f"} {
+		path := filepath.Join(t.TempDir(), "frostgate.service")
+		if err := WriteSystemdUnit(path, "/bin/sing-box"+bad, "/tmp/frostgate"); err == nil {
+			t.Fatalf("control character %q was accepted", bad)
+		}
 	}
 }

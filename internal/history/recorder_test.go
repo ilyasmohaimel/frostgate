@@ -11,6 +11,7 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"go.etcd.io/bbolt"
 )
 
 func withTempDataHome(t *testing.T) string {
@@ -203,7 +204,7 @@ func TestFromProbeResults(t *testing.T) {
 func TestRecorderReturnsPruneFailureAndDoesNotMarkItComplete(t *testing.T) {
 	withTempDataHome(t)
 	recorder := NewRecorder(true, time.Hour, time.Minute)
-	recorder.prune = func(*DB, time.Duration) error { return errors.New("prune blocked") }
+	recorder.commit = func(*DB, []Record, time.Duration, bool) error { return errors.New("prune blocked") }
 	if err := recorder.Record([]Record{{Route: "route", Status: "up", MedianMs: 10}}); err == nil || !strings.Contains(err.Error(), "prune blocked") {
 		t.Fatalf("prune failure was hidden: %v", err)
 	}
@@ -212,5 +213,45 @@ func TestRecorderReturnsPruneFailureAndDoesNotMarkItComplete(t *testing.T) {
 	}
 	if err := recorder.Close(); err != nil {
 		t.Fatal(err)
+	}
+	db, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	records, err := db.Query(0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("failed snapshot committed records: %+v", records)
+	}
+}
+
+func TestRecordSnapshotIsAtomicWhenLaterPutFails(t *testing.T) {
+	withTempDataHome(t)
+	db, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	puts := 0
+	db.put = func(bucket *bbolt.Bucket, key, value []byte) error {
+		puts++
+		if puts == 2 {
+			return errors.New("forced put failure")
+		}
+		return bucket.Put(key, value)
+	}
+	err = db.RecordSnapshot([]Record{{Route: "one", Status: "up"}, {Route: "two", Status: "up"}, {Route: "three", Status: "up"}}, time.Hour, true)
+	if err == nil {
+		t.Fatal("expected forced write failure")
+	}
+	records, err := db.Query(0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("partial snapshot committed: %+v", records)
 	}
 }

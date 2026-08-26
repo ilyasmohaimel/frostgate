@@ -273,6 +273,24 @@ func TestDiagnoseRouteNotFound(t *testing.T) {
 	}
 }
 
+func TestDiagnoseDNSUsesBoundedResolverContext(t *testing.T) {
+	oldLookup, oldTimeout := diagnoseLookupHost, diagnoseLookupTimeout
+	diagnoseLookupTimeout = 20 * time.Millisecond
+	diagnoseLookupHost = func(ctx context.Context, _ string) ([]string, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() {
+		diagnoseLookupHost = oldLookup
+		diagnoseLookupTimeout = oldTimeout
+	})
+	start := time.Now()
+	layer := checkDNS(&config.Config{Endpoints: []config.Endpoint{{Name: "direct", Type: config.ProbeHTTP, URL: "https://example.test/"}}})
+	if layer.Status != "FAIL" || time.Since(start) > time.Second {
+		t.Fatalf("bounded diagnose DNS layer=%+v elapsed=%s", layer, time.Since(start))
+	}
+}
+
 func TestErrStringRedactsAndTruncates(t *testing.T) {
 	long := strings.Repeat("x", 200)
 	got := errString(fmt.Errorf("vless://%s@host", long))

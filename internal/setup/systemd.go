@@ -45,6 +45,29 @@ func BuildSystemdUnit(binaryPath, configDir string) string {
 		"WantedBy=default.target\n"
 }
 
+// BuildSystemdUnitChecked rejects paths which cannot be represented safely in
+// the line-oriented unit format before any unit text is generated.
+func BuildSystemdUnitChecked(binaryPath, configDir string) (string, error) {
+	for _, path := range []string{binaryPath, configDir} {
+		if err := validateSystemdPath(path); err != nil {
+			return "", err
+		}
+	}
+	return BuildSystemdUnit(binaryPath, configDir), nil
+}
+
+func validateSystemdPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("systemd path is empty")
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("systemd path contains unsafe control character")
+		}
+	}
+	return nil
+}
+
 func systemdQuote(s string) string {
 	s = strings.ReplaceAll(s, "%", "%%")
 	s = strings.ReplaceAll(s, `\`, `\\`)
@@ -68,6 +91,11 @@ func ServiceUnitPath(service string) string {
 // WriteSystemdUnit writes a profile-scoped unit without starting it. The
 // transaction installs the candidate config before the runner starts it.
 func WriteSystemdUnit(servicePath, binaryPath, configDir string) error {
+	for _, path := range []string{servicePath, binaryPath, configDir} {
+		if err := validateSystemdPath(path); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(servicePath), 0o755); err != nil {
 		return fmt.Errorf("create systemd user directory: %w", err)
 	}
@@ -76,7 +104,11 @@ func WriteSystemdUnit(servicePath, binaryPath, configDir string) error {
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("inspect systemd unit: %w", err)
 	}
-	if err := writeFileAtomic(servicePath, []byte(BuildSystemdUnit(binaryPath, configDir)), 0o644); err != nil {
+	unit, err := BuildSystemdUnitChecked(binaryPath, configDir)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(servicePath, []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("write systemd unit: %w", err)
 	}
 	return nil
@@ -94,6 +126,12 @@ func InstallSystemdServiceNamed(servicePath, service, binaryPath, configDir stri
 	}
 	if err := runner.Run("systemctl", "--user", "enable", "--now", service); err != nil {
 		return fmt.Errorf("enable %s: %w", service, err)
+	}
+	// enable --now leaves an already active service running with its old
+	// configuration. Restart after daemon-reload so reconfigure actually
+	// activates the validated candidate.
+	if err := runner.Run("systemctl", "--user", "restart", service); err != nil {
+		return fmt.Errorf("restart %s: %w", service, err)
 	}
 	out, err := runner.Output("systemctl", "--user", "is-active", service)
 	if err != nil {

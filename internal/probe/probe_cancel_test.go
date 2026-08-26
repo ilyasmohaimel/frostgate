@@ -153,6 +153,33 @@ func TestProbeLegacySingleSample(t *testing.T) {
 	}
 }
 
+func TestMultiSampleBudgetAllowsEveryConfiguredSample(t *testing.T) {
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		time.Sleep(35 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	cfg := &config.Config{Defaults: config.Defaults{
+		Timeout:        config.Duration{Duration: 100 * time.Millisecond},
+		Samples:        4,
+		SampleInterval: config.Duration{Duration: 5 * time.Millisecond},
+		HealthyLatency: config.Duration{Duration: time.Second},
+		MaxJitter:      config.Duration{Duration: time.Second},
+	}}
+	ep := config.Endpoint{Name: "slow-but-healthy", Type: config.ProbeHTTP, URL: srv.URL}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ProbeBudget(ep))
+	defer cancel()
+	result := ProbeEndpoint(ctx, cfg, ep)
+	if got := atomic.LoadInt64(&hits); got != 4 {
+		t.Fatalf("requests = %d, want all 4 configured samples", got)
+	}
+	if result.Metrics.Attempted != 4 || result.Metrics.Succeeded != 4 {
+		t.Fatalf("metrics = %+v, want four successful samples", result.Metrics)
+	}
+}
+
 func baseCfg(samples int, interval time.Duration) *config.Config {
 	return &config.Config{
 		Defaults: config.Defaults{

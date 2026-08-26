@@ -134,3 +134,35 @@ func TestMatrixNoSelectorMutation(t *testing.T) {
 		t.Fatalf("network-check must not mutate selector state, saw %d PUTs", puts)
 	}
 }
+
+func TestMatrixBudgetCoversEveryDestinationAndRoute(t *testing.T) {
+	if got := MatrixBudget(2, 2, 30*time.Second); got <= 20*time.Second {
+		t.Fatalf("matrix budget %s still has a hidden 20-second command cap", got)
+	}
+	var calls int
+	ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/delay") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		calls++
+		time.Sleep(25 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]int{"delay": 25})
+	}))
+	defer ctrl.Close()
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer dest.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), MatrixBudget(2, 2, 100*time.Millisecond))
+	defer cancel()
+	rows := DestinationMatrix(ctx, []string{dest.URL, dest.URL + "/other"}, []RouteProbe{{Name: "a", Outbound: "a"}, {Name: "b", Outbound: "b"}}, singbox.New(ctrl.URL, ""), 100*time.Millisecond)
+	if len(rows) != 2 || calls != 4 {
+		t.Fatalf("matrix calls = %d rows=%d, want all four cells", calls, len(rows))
+	}
+	for _, row := range rows {
+		for _, cell := range row.Routes {
+			if cell.Status != "PASS" {
+				t.Fatalf("configured cell was truncated: %+v", cell)
+			}
+		}
+	}
+}

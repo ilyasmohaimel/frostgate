@@ -994,3 +994,175 @@ func relaySOCKS(client net.Conn) {
 	_, _ = io.Copy(client, upstream)
 	<-done
 }
+
+func TestRootFlagExitContract(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"--help"}, 0},
+		{[]string{"-h"}, 0},
+		{[]string{"--wat"}, 3},
+		{[]string{"--timeout"}, 3},
+		{[]string{"--timeout", "not-a-duration"}, 3},
+		{[]string{"unexpected"}, 3},
+	} {
+		_, _, code := runCLI(t, nil, tc.args...)
+		if code != tc.want {
+			t.Fatalf("%v exit = %d, want %d", tc.args, code, tc.want)
+		}
+	}
+}
+
+func TestBenchmarkMeasurementCountIncludesDirectAndUniqueOutbounds(t *testing.T) {
+	cfg := &config.Config{Endpoints: []config.Endpoint{
+		{Name: "direct", Type: config.ProbeHTTP},
+		{Name: "alias-a", Type: config.ProbeSingBox, Outbound: "shared"},
+		{Name: "alias-b", Type: config.ProbeSingBox, Outbound: "shared"},
+		{Name: "proxy-b", Type: config.ProbeSingBox, Outbound: "other"},
+	}}
+	if got, want := benchmarkMeasurementCount(cfg), 3; got != want {
+		t.Fatalf("measurement count = %d, want %d", got, want)
+	}
+}
+
+func TestBenchmarkSelectorLifecycleFailureReturnsThreeWithJSON(t *testing.T) {
+	f := newCLIFixture(t)
+	var mu sync.Mutex
+	selected := "original"
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/delay"):
+			_ = json.NewEncoder(w).Encode(map[string]int{"delay": 7})
+		case r.Method == http.MethodGet && r.URL.Path == "/proxies/frostgate-selector":
+			_ = json.NewEncoder(w).Encode(map[string]any{"type": "selector", "now": selected})
+		case r.Method == http.MethodPut && r.URL.Path == "/proxies/frostgate-selector":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["name"] == "original" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			selected = body["name"]
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer controller.Close()
+	rewriteFixtureController(t, f, controller.URL)
+	stdout, stderr, code := runCLI(t, f.env(), "benchmark", "--json")
+	if code != 3 {
+		t.Fatalf("benchmark exit = %d, stderr=%s", code, stderr)
+	}
+	requireJSON(t, stdout)
+	if !bytes.Contains(stderr, []byte("restore selector")) {
+		t.Fatalf("missing sanitized restoration error: %s", stderr)
+	}
+}
+
+func TestBenchmarkSelectorCaptureFailureReturnsThreeWithJSON(t *testing.T) {
+	f := newCLIFixture(t)
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/delay"):
+			_ = json.NewEncoder(w).Encode(map[string]int{"delay": 7})
+		case r.Method == http.MethodGet && r.URL.Path == "/proxies/frostgate-selector":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer controller.Close()
+	rewriteFixtureController(t, f, controller.URL)
+	stdout, stderr, code := runCLI(t, f.env(), "benchmark", "--json")
+	if code != 3 {
+		t.Fatalf("benchmark exit = %d, stderr=%s", code, stderr)
+	}
+	requireJSON(t, stdout)
+	if !bytes.Contains(stderr, []byte("capture selector")) {
+		t.Fatalf("missing sanitized capture error: %s", stderr)
+	}
+}
+
+func TestBenchmarkAliasesMeasureEachOutboundOnceAndFanOut(t *testing.T) {
+	f := newCLIFixture(t)
+	configData, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configData = append(configData, []byte("  - name: proxy-alias\n    type: singbox\n    outbound: proxy-out\n")...)
+	if err := os.WriteFile(f.configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--json")
+	doc := requireJSON(t, stdout).(map[string]any)
+	if got := f.benchmarkHits.Load(); got != 1 {
+		t.Fatalf("benchmark transfers = %d, want one unique outbound transfer", got)
+	}
+	measured := map[string]bool{}
+	for _, raw := range doc["results"].([]any) {
+		entry := raw.(map[string]any)
+		result := entry["result"].(map[string]any)
+		if entry["download_mbps"].(float64) > 0 {
+			measured[result["name"].(string)] = true
+		}
+	}
+	if !measured["proxy-display-name"] || !measured["proxy-alias"] {
+		t.Fatalf("alias throughput was not fanned out: %v", measured)
+	}
+}
+
+func TestNetworkCheckRejectsMalformedImplicitConfig(t *testing.T) {
+	f := newCLIFixture(t)
+	if err := os.WriteFile(f.configPath, []byte("endpoints: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, code := runCLI(t, f.env(), "network-check", "--json")
+	if code != 3 {
+		t.Fatalf("malformed implicit config exit = %d, want 3", code)
+	}
+}
+
+func TestDiagnoseManagedStateOwnershipAndCorruption(t *testing.T) {
+	dir := t.TempDir()
+	if managed, err := loadManagedStateForDiagnose(dir); err != nil || managed != nil {
+		t.Fatalf("missing external state = %v, %v", managed, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "controller-secret"), []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if managed, err := loadManagedStateForDiagnose(dir); err != nil || managed != nil {
+		t.Fatalf("external secret-only state = %v, %v", managed, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadManagedStateForDiagnose(dir); err == nil {
+		t.Fatal("malformed managed state was hidden")
+	}
+	if err := os.Remove(filepath.Join(dir, "sing-box.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "controller-secret"), filepath.Join(dir, "sing-box.json")); err == nil {
+		if _, err := loadManagedStateForDiagnose(dir); err == nil {
+			t.Fatal("symlinked managed state was accepted")
+		}
+	}
+}
+
+func rewriteFixtureController(t *testing.T, f *cliFixture, controller string) {
+	t.Helper()
+	data, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(f.controllerURL)) {
+		t.Fatalf("fixture config did not contain controller URL")
+	}
+	if err := os.WriteFile(f.configPath, bytes.Replace(data, []byte(f.controllerURL), []byte(controller), 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}

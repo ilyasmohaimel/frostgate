@@ -322,6 +322,9 @@ func applyDefaults(cfg *Config) error {
 		if env := os.Getenv("FROSTGATE_SINGBOX_SECRET"); env != "" {
 			cfg.SingBox.Secret = env
 		}
+		if cfg.SingBox.Secret != "" && remotePlaintextController(cfg.SingBox.Controller) {
+			return fmt.Errorf("singbox.controller uses remote plaintext HTTP with a controller secret; use HTTPS or a local tunnel")
+		}
 	}
 	for i, dest := range cfg.NetworkCheck.Destinations {
 		if dest.Name != "" && redact.String(dest.Name) != dest.Name {
@@ -379,16 +382,22 @@ func normalize(e *Endpoint, cfg *Config) error {
 				return fmt.Errorf("http probe with url must not have host/port/path")
 			}
 		} else {
-			if e.Host == "" || e.Port == 0 {
-				return fmt.Errorf("missing host or port (or url)")
+			if e.Host == "" {
+				return fmt.Errorf("missing host (or url)")
+			}
+			if e.Port < 1 || e.Port > 65535 {
+				return fmt.Errorf("port must be 1-65535 (or use url)")
 			}
 			if e.Outbound != "" {
 				return fmt.Errorf("http probe should not have outbound")
 			}
 		}
 	default: // tcp, tls
-		if e.Host == "" || e.Port == 0 {
-			return fmt.Errorf("missing host or port")
+		if e.Host == "" {
+			return fmt.Errorf("missing host")
+		}
+		if e.Port < 1 || e.Port > 65535 {
+			return fmt.Errorf("port must be 1-65535")
 		}
 		if e.URL != "" {
 			return fmt.Errorf("tcp/tls probe should not have url")
@@ -441,7 +450,25 @@ func validateHTTPURL(field, raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("%s must include a host", field)
 	}
+	if portText := u.Port(); portText != "" {
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("%s has invalid port", field)
+		}
+	}
 	return nil
+}
+
+// remotePlaintextController reports the only unsafe configuration shape for a
+// controller bearer secret: a non-loopback HTTP transport. localhost is
+// deliberately treated as local without DNS resolution, so validation is
+// deterministic and never depends on the host resolver.
+func remotePlaintextController(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || strings.ToLower(u.Scheme) != "http" {
+		return false
+	}
+	return !IsLoopbackHost(strings.ToLower(u.Hostname()))
 }
 
 func expandPath(p string) string {
@@ -548,6 +575,40 @@ func (c *Config) SampleIntervalFor(e Endpoint) time.Duration {
 		return e.SampleInterval.Duration
 	}
 	return c.Defaults.SampleInterval.Duration
+}
+
+// ProbeBudget is the bounded parent-operation budget for a complete endpoint
+// measurement: every configured sample, the intervals between them, and a
+// small scheduling allowance. Individual requests remain bounded by their
+// sample timeout. Saturation avoids an adversarial config wrapping duration
+// arithmetic into a short deadline.
+func (c *Config) ProbeBudget(e Endpoint) time.Duration {
+	samples := c.SamplesFor(e)
+	if samples < 1 {
+		samples = 1
+	}
+	total := saturatingDurationMul(c.TimeoutFor(e), int64(samples))
+	if samples > 1 {
+		total = saturatingDurationAdd(total, saturatingDurationMul(c.SampleIntervalFor(e), int64(samples-1)))
+	}
+	return saturatingDurationAdd(total, time.Second)
+}
+
+func saturatingDurationAdd(left, right time.Duration) time.Duration {
+	if right > 0 && left > time.Duration(math.MaxInt64)-right {
+		return time.Duration(math.MaxInt64)
+	}
+	return left + right
+}
+
+func saturatingDurationMul(value time.Duration, count int64) time.Duration {
+	if value <= 0 || count <= 0 {
+		return 0
+	}
+	if int64(value) > math.MaxInt64/count {
+		return time.Duration(math.MaxInt64)
+	}
+	return value * time.Duration(count)
 }
 
 func (c *Config) HealthyLatencyFor(e Endpoint) time.Duration {

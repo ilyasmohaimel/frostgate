@@ -115,10 +115,12 @@ func ProbeEndpoint(ctx context.Context, cfg *config.Config, e config.Endpoint) R
 	m := metrics.Compute(s)
 
 	th := health.Thresholds{
-		HealthyLatency:  cfg.HealthyLatencyFor(e),
-		MaxJitter:       cfg.MaxJitterFor(e),
-		MaxLossPct:      cfg.MaxLossFor(e),
-		DegradedLossPct: 50,
+		HealthyLatency: cfg.HealthyLatencyFor(e),
+		MaxJitter:      cfg.MaxJitterFor(e),
+		MaxLossPct:     cfg.MaxLossFor(e),
+		// Any partial loss is classified by the configured max_loss. A
+		// complete outage remains DOWN above in health.ClassifyWithReasons.
+		DegradedLossPct: 100,
 	}
 	status, reasons := health.ClassifyWithReasons(m, th)
 
@@ -334,25 +336,26 @@ func HasProxy(results []Result) bool {
 	return false
 }
 
-// DirectBaseline returns the first non-proxy result. Direct is a diagnostic
-// baseline, never a "best proxy" candidate.
+// IsDirectBaseline reports the deliberately small, backwards-compatible
+// baseline identity used by setup-generated configs. Arbitrary health probes
+// are not silently repurposed as a user's internet baseline.
+func IsDirectBaseline(e config.Endpoint) bool {
+	if e.Type != config.ProbeHTTP {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Name)) {
+	case "direct", "direct-baseline", "baseline":
+		return true
+	default:
+		return false
+	}
+}
+
+// DirectBaseline returns an explicitly identified non-proxy diagnostic
+// baseline. It never falls back to arbitrary HTTP/TCP/TLS endpoints.
 func DirectBaseline(results []Result) (Result, bool) {
 	for _, r := range results {
-		if r.Endpoint.Type == config.ProbeSingBox {
-			continue
-		}
-		name := strings.ToLower(r.Endpoint.Name)
-		if name == "direct" || name == "direct-baseline" || name == "baseline" || strings.Contains(name, "direct") || strings.Contains(name, "baseline") {
-			return r, true
-		}
-	}
-	for _, r := range results {
-		if r.Endpoint.Type == config.ProbeHTTP {
-			return r, true
-		}
-	}
-	for _, r := range results {
-		if r.Endpoint.Type != config.ProbeSingBox {
+		if IsDirectBaseline(r.Endpoint) {
 			return r, true
 		}
 	}

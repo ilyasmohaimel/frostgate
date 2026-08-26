@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestNormalizeAddrs(t *testing.T) {
@@ -55,7 +56,9 @@ func TestCheckDNSVsDoHMatch(t *testing.T) {
 	srv := dohStub(map[string]string{"A": "203.0.113.50", "AAAA": "2001:db8::1"}, 200)
 	defer srv.Close()
 	old := systemLookup
-	systemLookup = func(host string) ([]string, error) { return []string{"203.0.113.50", "2001:db8::1"}, nil }
+	systemLookup = func(_ context.Context, host string) ([]string, error) {
+		return []string{"203.0.113.50", "2001:db8::1"}, nil
+	}
 	defer func() { systemLookup = old }()
 	c := CheckDNSVsDoH("example.com", srv.URL)
 	if c.Status != "PASS" || c.Detail[:5] != "MATCH" {
@@ -67,7 +70,7 @@ func TestCheckDNSVsDoHDiffer(t *testing.T) {
 	srv := dohStub(map[string]string{"A": "203.0.113.51"}, 200)
 	defer srv.Close()
 	old := systemLookup
-	systemLookup = func(host string) ([]string, error) { return []string{"203.0.113.52"}, nil }
+	systemLookup = func(_ context.Context, host string) ([]string, error) { return []string{"203.0.113.52"}, nil }
 	defer func() { systemLookup = old }()
 	c := CheckDNSVsDoH("example.com", srv.URL)
 	want := "DIFFER for example.com (signal only - CDNs can return different addresses)"
@@ -78,11 +81,29 @@ func TestCheckDNSVsDoHDiffer(t *testing.T) {
 
 func TestCheckDNSVsDoHUnavailable(t *testing.T) {
 	old := systemLookup
-	systemLookup = func(host string) ([]string, error) { return nil, context.DeadlineExceeded }
+	systemLookup = func(_ context.Context, host string) ([]string, error) { return nil, context.DeadlineExceeded }
 	defer func() { systemLookup = old }()
 	c := CheckDNSVsDoH("example.com", "http://127.0.0.1:1/dns-query")
 	if c.Status != "UNAVAILABLE" {
 		t.Errorf("want UNAVAILABLE got %+v", c)
+	}
+}
+
+func TestSystemDNSLookupUsesBoundedContext(t *testing.T) {
+	oldLookup, oldTimeout := systemLookup, systemLookupTimeout
+	systemLookupTimeout = 20 * time.Millisecond
+	systemLookup = func(ctx context.Context, _ string) ([]string, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() {
+		systemLookup = oldLookup
+		systemLookupTimeout = oldTimeout
+	})
+	start := time.Now()
+	check := checkDNS()
+	if check.Status != "FAIL" || time.Since(start) > time.Second {
+		t.Fatalf("bounded DNS check = %+v after %s", check, time.Since(start))
 	}
 }
 

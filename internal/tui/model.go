@@ -100,40 +100,13 @@ func ProbeBudget(cfg *config.Config) time.Duration {
 	if cfg == nil || len(cfg.Endpoints) == 0 {
 		return 5 * time.Second
 	}
-	var longest time.Duration
+	longest := time.Second
 	for _, ep := range cfg.Endpoints {
-		samples := cfg.SamplesFor(ep)
-		if samples < 1 {
-			samples = 1
-		}
-		budget := saturatingDurationProduct(samples, cfg.TimeoutFor(ep))
-		if samples > 1 {
-			budget = saturatingDurationAdd(budget, saturatingDurationProduct(samples-1, cfg.SampleIntervalFor(ep)))
-		}
-		if budget > longest {
+		if budget := cfg.ProbeBudget(ep); budget > longest {
 			longest = budget
 		}
 	}
-	return saturatingDurationAdd(longest, time.Second)
-}
-
-func saturatingDurationProduct(count int, duration time.Duration) time.Duration {
-	if count <= 0 || duration <= 0 {
-		return 0
-	}
-	const maxDuration = time.Duration(1<<63 - 1)
-	if int64(count) > int64(maxDuration/duration) {
-		return maxDuration
-	}
-	return time.Duration(count) * duration
-}
-
-func saturatingDurationAdd(left, right time.Duration) time.Duration {
-	const maxDuration = time.Duration(1<<63 - 1)
-	if left >= maxDuration-right {
-		return maxDuration
-	}
-	return left + right
+	return longest
 }
 
 func (m Model) tickCmd() tea.Cmd {
@@ -351,8 +324,15 @@ func formatDur(d time.Duration) string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	if n == 1 {
+		return "…"
+	}
+	return string(runes[:n-1]) + "…"
 }

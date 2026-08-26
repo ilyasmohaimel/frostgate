@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"time"
@@ -25,14 +26,16 @@ func New(controller, secret string) *Client {
 	return &Client{
 		Controller: trimmed,
 		Secret:     secret,
-		HTTP: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+		// Request contexts are the single timeout authority. Callers that
+		// perform controller I/O must supply an explicit bounded context.
+		HTTP: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 	}
 }
 
 type delayResponse struct {
-	Delay uint16 `json:"delay"`
+	Delay int64 `json:"delay"`
 }
 
 type proxiesResponse struct {
@@ -225,10 +228,7 @@ func (c *Client) Delay(ctx context.Context, outboundTag, testURL string, timeout
 		if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
 			return 0, fmt.Errorf("singbox-api: malformed delay response: %w", err)
 		}
-		if dr.Delay == 0 {
-			return 0, fmt.Errorf("proxy-test: zero delay from controller")
-		}
-		return time.Duration(dr.Delay) * time.Millisecond, nil
+		return delayDuration(dr.Delay)
 	case http.StatusUnauthorized:
 		return 0, fmt.Errorf("singbox-api: unauthorized")
 	case http.StatusNotFound:
@@ -276,5 +276,18 @@ func ParseDelay(b []byte) (time.Duration, error) {
 	if err := json.Unmarshal(b, &dr); err != nil {
 		return 0, err
 	}
-	return time.Duration(dr.Delay) * time.Millisecond, nil
+	return delayDuration(dr.Delay)
+}
+
+func delayDuration(delayMS int64) (time.Duration, error) {
+	if delayMS < 0 {
+		return 0, fmt.Errorf("proxy-test: negative delay from controller")
+	}
+	if delayMS == 0 {
+		return 0, fmt.Errorf("proxy-test: zero delay from controller")
+	}
+	if delayMS > math.MaxInt64/int64(time.Millisecond) {
+		return 0, fmt.Errorf("proxy-test: delay from controller overflows duration")
+	}
+	return time.Duration(delayMS) * time.Millisecond, nil
 }

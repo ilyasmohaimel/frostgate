@@ -68,7 +68,13 @@ func StatDB() (os.FileInfo, error) {
 }
 
 type DB struct {
-	db *bbolt.DB
+	db  *bbolt.DB
+	put func(*bbolt.Bucket, []byte, []byte) error
+}
+
+type preparedRecord struct {
+	record Record
+	data   []byte
 }
 
 func Open() (*DB, error) {
@@ -107,22 +113,58 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) Add(r Record) error {
-	if r.Timestamp.IsZero() {
-		r.Timestamp = time.Now()
+	return d.RecordSnapshot([]Record{r}, 0, false)
+}
+
+// RecordSnapshot atomically writes one logical probe snapshot and, when
+// requested, its retention maintenance. A returned error therefore never
+// misrepresents a partially committed snapshot as failed.
+func (d *DB) RecordSnapshot(records []Record, retention time.Duration, prune bool) error {
+	prepared := make([]preparedRecord, 0, len(records))
+	now := time.Now()
+	for _, r := range records {
+		if r.Timestamp.IsZero() {
+			r.Timestamp = now
+		}
+		r.Route = redact.String(r.Route)
+		r.Network = sanitizeNetworkLabel(r.Network)
+		r.Category = redact.String(r.Category)
+		data, err := json.Marshal(r)
+		if err != nil {
+			return err
+		}
+		prepared = append(prepared, preparedRecord{record: r, data: data})
 	}
-	r.Route = redact.String(r.Route)
-	r.Network = sanitizeNetworkLabel(r.Network)
-	r.Category = redact.String(r.Category)
-	// Never store secrets: ensure no URL/password in record (we only store route name)
-	// Prune old before adding? Do lazy
-	data, err := json.Marshal(r)
-	if err != nil {
-		return err
+	if retention == 0 {
+		retention = 90 * 24 * time.Hour
 	}
-	key := fmt.Sprintf("%d-%s-%d", r.Timestamp.UnixNano(), r.Route, time.Now().UnixNano())
 	return d.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte("history"))
-		return b.Put([]byte(key), data)
+		if b == nil {
+			return fmt.Errorf("history bucket missing")
+		}
+		for _, record := range prepared {
+			sequence, err := b.NextSequence()
+			if err != nil {
+				return err
+			}
+			// The route name is never used raw as a bbolt key. Its hash keeps
+			// keys deterministic/safe while the sequence makes concurrent writes
+			// collision-free inside the transaction.
+			hash := sha256.Sum256([]byte(record.record.Route))
+			key := fmt.Sprintf("%020d-%020d-%x", record.record.Timestamp.UnixNano(), sequence, hash[:8])
+			put := d.put
+			if put == nil {
+				put = func(bucket *bbolt.Bucket, key, value []byte) error { return bucket.Put(key, value) }
+			}
+			if err := put(b, []byte(key), record.data); err != nil {
+				return err
+			}
+		}
+		if prune {
+			return pruneBucket(b, retention, now)
+		}
+		return nil
 	})
 }
 
@@ -183,33 +225,37 @@ func (d *DB) Prune(retention time.Duration) error {
 	if retention == 0 {
 		retention = 90 * 24 * time.Hour
 	}
-	cutoff := time.Now().Add(-retention)
 	return d.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte("history"))
 		if b == nil {
 			return nil
 		}
-		var toDelete [][]byte
-		if err := b.ForEach(func(k, v []byte) error {
-			var r Record
-			if err := json.Unmarshal(v, &r); err != nil {
-				toDelete = append(toDelete, append([]byte(nil), k...))
-				return nil
-			}
-			if r.Timestamp.Before(cutoff) {
-				toDelete = append(toDelete, append([]byte(nil), k...))
-			}
+		return pruneBucket(b, retention, time.Now())
+	})
+}
+
+func pruneBucket(b *bbolt.Bucket, retention time.Duration, now time.Time) error {
+	cutoff := now.Add(-retention)
+	var toDelete [][]byte
+	if err := b.ForEach(func(k, v []byte) error {
+		var r Record
+		if err := json.Unmarshal(v, &r); err != nil {
+			toDelete = append(toDelete, append([]byte(nil), k...))
 			return nil
-		}); err != nil {
-			return err
 		}
-		for _, k := range toDelete {
-			if err := b.Delete(k); err != nil {
-				return err
-			}
+		if r.Timestamp.Before(cutoff) {
+			toDelete = append(toDelete, append([]byte(nil), k...))
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	for _, k := range toDelete {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Summary holds aggregated stats for a route

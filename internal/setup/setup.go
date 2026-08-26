@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,16 +67,19 @@ func RunInteractive(opts Options) error {
 
 	// Preflight: existing config?
 	existingConfig := filepath.Join(dir, "config.yaml")
-	existingSingBox := filepath.Join(dir, "sing-box.json")
-	existingSecret := filepath.Join(dir, "controller-secret")
 	hasExisting := false
+	var err error
 	if _, err := os.Stat(existingConfig); err == nil {
 		hasExisting = true
 	}
+	var transaction *setupTransaction
 	if hasExisting {
 		fmt.Printf("Existing Frostgate config found at %s\n", existingConfig)
 		fmt.Printf("[a] Add route  [r] Reconfigure  [x] Reset  [c] Cancel\n")
-		choice := prompt(opts.Stdin, "Choose [a/r/x/c] (default c): ")
+		choice, err := prompt(opts.Stdin, "Choose [a/r/x/c] (default c): ")
+		if err != nil {
+			return err
+		}
 		switch strings.ToLower(strings.TrimSpace(choice)) {
 		case "a":
 			return addRouteFlow(opts, dir)
@@ -84,8 +88,15 @@ func RunInteractive(opts Options) error {
 			if err := backupExisting(dir); err != nil {
 				return err
 			}
+			transaction, err = beginSetupTransaction(dir)
+			if err != nil {
+				return err
+			}
 		case "x":
-			confirm := prompt(opts.Stdin, "Type YES to reset and delete existing config: ")
+			confirm, err := prompt(opts.Stdin, "Type YES to reset and delete existing config: ")
+			if err != nil {
+				return err
+			}
 			if confirm != "YES" {
 				fmt.Println("Cancelled")
 				return nil
@@ -93,12 +104,11 @@ func RunInteractive(opts Options) error {
 			if err := backupExisting(dir); err != nil {
 				return err
 			}
-			for _, path := range []string{existingConfig, existingSingBox, existingSecret} {
-				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("remove existing setup: %w", err)
-				}
+			transaction, err = beginSetupTransaction(dir)
+			if err != nil {
+				return err
 			}
-			fmt.Println("Existing config removed")
+			fmt.Println("Existing setup will be replaced transactionally")
 		default:
 			fmt.Println("Cancelled; no changes made")
 			return nil
@@ -109,6 +119,12 @@ func RunInteractive(opts Options) error {
 	if err := EnsureConfigDir(dir); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
+	if transaction == nil {
+		transaction, err = beginSetupTransaction(dir)
+		if err != nil {
+			return err
+		}
+	}
 	fmt.Printf("config directory ready: %s (0700)\n", dir)
 
 	// Choose setup type
@@ -116,29 +132,46 @@ func RunInteractive(opts Options) error {
 	fmt.Println("  1) Import proxy route(s) (VLESS/Hysteria2 share links)")
 	fmt.Println("  2) Use existing sing-box controller (advanced)")
 	fmt.Println("  3) Direct internet checks only (no proxy)")
-	choice := prompt(opts.Stdin, "Choose [1/2/3] (default 1): ")
+	choice, err := prompt(opts.Stdin, "Choose [1/2/3] (default 1): ")
+	if err != nil {
+		return err
+	}
 	if choice == "" {
 		choice = "1"
 	}
+	var setupErr error
 	switch choice {
 	case "1":
 		sbPath, err := prepareSingBoxForImport(opts)
 		if err != nil {
-			return err
+			setupErr = err
+			break
 		}
-		return importFlow(opts, dir, sbPath)
+		setupErr = importFlow(opts, dir, sbPath, transaction)
 	case "2":
-		return existingControllerFlow(opts, dir)
+		setupErr = existingControllerFlow(opts, dir)
 	case "3":
-		return directOnlyFlow(opts, dir)
+		setupErr = directOnlyFlow(opts, dir)
 	default:
 		fmt.Println("Invalid choice, defaulting to import")
 		sbPath, err := prepareSingBoxForImport(opts)
 		if err != nil {
-			return err
+			setupErr = err
+			break
 		}
-		return importFlow(opts, dir, sbPath)
+		setupErr = importFlow(opts, dir, sbPath, transaction)
 	}
+	if setupErr != nil {
+		return transaction.rollback(setupErr)
+	}
+	cfg, err := config.Load(existingConfig)
+	if err != nil {
+		return transaction.rollback(fmt.Errorf("validate candidate Frostgate config: %w", err))
+	}
+	if err := transaction.finish(hasProxyEndpoints(cfg)); err != nil {
+		return transaction.rollback(err)
+	}
+	return nil
 }
 
 // prepareSingBoxForImport checks for the proxy engine only after the user
@@ -149,7 +182,10 @@ func prepareSingBoxForImport(opts Options) (string, error) {
 	if err != nil {
 		fmt.Println("\nsing-box not found in PATH")
 		fmt.Println("Frostgate uses sing-box as the protocol engine (no proxy protocols are reimplemented in Frostgate).")
-		install := prompt(opts.Stdin, "Install sing-box now? [Y/n]: ")
+		install, promptErr := prompt(opts.Stdin, "Install sing-box now? [Y/n]: ")
+		if promptErr != nil {
+			return "", promptErr
+		}
 		if !isNo(install) {
 			sbPath, err = tryInstallSingBox(opts)
 			if err != nil {
@@ -168,10 +204,16 @@ func prepareSingBoxForImport(opts Options) (string, error) {
 	return sbPath, nil
 }
 
-func prompt(r *bufio.Reader, msg string) string {
+func prompt(r *bufio.Reader, msg string) (string, error) {
 	fmt.Print(msg)
-	s, _ := r.ReadString('\n')
-	return strings.TrimSpace(s)
+	s, err := r.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("setup input ended unexpectedly")
+		}
+		return "", fmt.Errorf("read setup input: %w", err)
+	}
+	return strings.TrimSpace(s), nil
 }
 
 func isNo(s string) bool {
@@ -340,7 +382,7 @@ func getSingBoxVersion(path string) string {
 	return s
 }
 
-func importFlow(opts Options, dir, singBoxPath string) error {
+func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransaction) error {
 	var vlessOut []*VLESSOutbound
 	var hystOut []*Hysteria2Outbound
 
@@ -348,12 +390,18 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	fmt.Println("Paste your share links (vless:// or hysteria2:// / hy2://)")
 	fmt.Println("Leave empty to finish. Your input is not logged.")
 	for {
-		link := prompt(opts.Stdin, "\nPaste share link (empty to finish): ")
+		link, err := prompt(opts.Stdin, "\nPaste share link (empty to finish): ")
+		if err != nil {
+			return err
+		}
 		if link == "" {
 			if len(vlessOut)+len(hystOut) == 0 {
 				// allow direct only fallback
 				fmt.Println("No routes added yet.")
-				cont := prompt(opts.Stdin, "Add direct baseline instead? [Y/n]: ")
+				cont, err := prompt(opts.Stdin, "Add direct baseline instead? [Y/n]: ")
+				if err != nil {
+					return err
+				}
 				if !isNo(cont) {
 					break
 				}
@@ -361,7 +409,10 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 			}
 			break
 		}
-		tag := prompt(opts.Stdin, "Name for this route (e.g. reality-primary): ")
+		tag, err := prompt(opts.Stdin, "Name for this route (e.g. reality-primary): ")
+		if err != nil {
+			return err
+		}
 		if tag == "" {
 			fmt.Println("Name required")
 			continue
@@ -391,7 +442,10 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 			fmt.Printf("Unsupported link (must be vless:// or hysteria2://)\n")
 			continue
 		}
-		more := prompt(opts.Stdin, "Add another route? [y/N]: ")
+		more, err := prompt(opts.Stdin, "Add another route? [y/N]: ")
+		if err != nil {
+			return err
+		}
 		if !strings.EqualFold(more, "y") && !strings.EqualFold(more, "yes") {
 			if more == "" {
 				break
@@ -403,10 +457,16 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	}
 	// Direct baseline offer
 	testURL := "https://www.gstatic.com/generate_204"
-	useDirect := prompt(opts.Stdin, fmt.Sprintf("Add direct baseline (%s)? [Y/n]: ", testURL))
+	useDirect, err := prompt(opts.Stdin, fmt.Sprintf("Add direct baseline (%s)? [Y/n]: ", testURL))
+	if err != nil {
+		return err
+	}
 	addDirect := true
 	if isNo(useDirect) {
-		custom := prompt(opts.Stdin, "Custom test URL (empty to skip direct): ")
+		custom, err := prompt(opts.Stdin, "Custom test URL (empty to skip direct): ")
+		if err != nil {
+			return err
+		}
 		if custom != "" {
 			testURL = custom
 			addDirect = true
@@ -499,23 +559,27 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 	}
 	fmt.Printf("wrote %s (0600)\n", fgPath)
 
-	// Sidecar service
-	if runtime.GOOS == "linux" && singBoxPath != "" {
-		offer := prompt(opts.Stdin, "Install systemd user service for sing-box sidecar? [Y/n]: ")
-		if !isNo(offer) {
-			if err := installSystemdService(dir, singBoxPath); err != nil {
-				fmt.Printf("Failed to install service: %s\n", redact.Error(err))
-			} else {
-				fmt.Println("systemd service installed and started")
-			}
-		}
-	}
-
-	// Validate
+	// Validate the full candidate before it can replace an active managed
+	// sidecar. A requested service installation is an activation step, not a
+	// substitute for candidate validation.
 	fmt.Println("\nValidating...")
 	if err := runValidation(dir, singBoxPath); err != nil {
 		fmt.Printf("Validation failed: %s\n", redact.Error(err))
 		return err
+	}
+
+	// Sidecar service
+	if runtime.GOOS == "linux" && singBoxPath != "" {
+		offer, err := prompt(opts.Stdin, "Install systemd user service for sing-box sidecar? [Y/n]: ")
+		if err != nil {
+			return err
+		}
+		if !isNo(offer) {
+			if err := installSystemdService(dir, singBoxPath, transaction); err != nil {
+				return fmt.Errorf("install requested systemd service: %w", err)
+			}
+			fmt.Println("systemd service installed and started")
+		}
 	}
 
 	fmt.Println("\nFrostgate setup complete.")
@@ -541,15 +605,24 @@ func importFlow(opts Options, dir, singBoxPath string) error {
 
 func existingControllerFlow(opts Options, dir string) error {
 	fmt.Println("\nUse existing sing-box controller")
-	controller := prompt(opts.Stdin, "Controller URL [http://127.0.0.1:9090]: ")
+	controller, err := prompt(opts.Stdin, "Controller URL [http://127.0.0.1:9090]: ")
+	if err != nil {
+		return err
+	}
 	if controller == "" {
 		controller = "http://127.0.0.1:9090"
 	}
-	secret := prompt(opts.Stdin, "Controller secret (leave empty if none): ")
+	secret, err := prompt(opts.Stdin, "Controller secret (leave empty if none): ")
+	if err != nil {
+		return err
+	}
 	secretFile := ""
 	if secret != "" {
 		// offer to save to file
-		save := prompt(opts.Stdin, "Save secret to controller-secret file? [Y/n]: ")
+		save, err := prompt(opts.Stdin, "Save secret to controller-secret file? [Y/n]: ")
+		if err != nil {
+			return err
+		}
 		if !isNo(save) {
 			secretFile = filepath.Join(dir, "controller-secret")
 			if err := WriteSecretFile(secretFile, secret); err != nil {
@@ -560,7 +633,10 @@ func existingControllerFlow(opts Options, dir string) error {
 	}
 	// Ask for outbound tags
 	fmt.Println("Enter your existing sing-box outbound tags (comma or space separated)")
-	tagsStr := prompt(opts.Stdin, "Tags (e.g. reality,hysteria): ")
+	tagsStr, err := prompt(opts.Stdin, "Tags (e.g. reality,hysteria): ")
+	if err != nil {
+		return err
+	}
 	var tags []string
 	for _, t := range strings.FieldsFunc(tagsStr, func(r rune) bool { return r == ',' || r == ' ' }) {
 		if t != "" {
@@ -595,7 +671,10 @@ func existingControllerFlow(opts Options, dir string) error {
 
 func directOnlyFlow(opts Options, dir string) error {
 	testURL := config.DefaultTestURL
-	custom := prompt(opts.Stdin, fmt.Sprintf("Test URL [%s]: ", testURL))
+	custom, err := prompt(opts.Stdin, fmt.Sprintf("Test URL [%s]: ", testURL))
+	if err != nil {
+		return err
+	}
 	if custom != "" {
 		testURL = custom
 	}
@@ -616,12 +695,18 @@ func directOnlyFlow(opts Options, dir string) error {
 
 func addRouteFlow(opts Options, dir string) error {
 	fmt.Println("Add route to existing setup")
-	link := prompt(opts.Stdin, "Paste new share link (vless:// or hysteria2://): ")
+	link, err := prompt(opts.Stdin, "Paste new share link (vless:// or hysteria2://): ")
+	if err != nil {
+		return err
+	}
 	if link == "" {
 		fmt.Println("No link provided")
 		return nil
 	}
-	tag := prompt(opts.Stdin, "Name for this route: ")
+	tag, err := prompt(opts.Stdin, "Name for this route: ")
+	if err != nil {
+		return err
+	}
 	if tag == "" {
 		return fmt.Errorf("name required")
 	}
@@ -638,10 +723,24 @@ func addRouteFlow(opts Options, dir string) error {
 	return nil
 }
 
-func installSystemdService(dir, binaryPath string) error {
+func installSystemdService(dir, binaryPath string, transaction *setupTransaction) error {
+	if err := transaction.serviceInstallationAllowed(); err != nil {
+		return err
+	}
 	serviceDir := filepath.Join(filepath.Dir(dir), "systemd", "user")
 	servicePath := filepath.Join(serviceDir, "frostgate-singbox.service")
-	return InstallSystemdService(servicePath, binaryPath, dir, nil)
+	if unit, err := os.ReadFile(servicePath); err == nil && !unitOwnedByFrostgate(string(unit), filepath.Join(dir, "sing-box.json")) {
+		return fmt.Errorf("existing systemd unit does not prove Frostgate ownership")
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect existing Frostgate systemd unit: %w", err)
+	}
+	if err := InstallSystemdServiceNamed(servicePath, "frostgate-singbox.service", binaryPath, dir, systemdRunnerFactory()); err != nil {
+		return err
+	}
+	if transaction != nil {
+		transaction.candidateServiceInstalled = true
+	}
+	return nil
 }
 
 func runValidation(dir string, knownSingBoxPath ...string) error {

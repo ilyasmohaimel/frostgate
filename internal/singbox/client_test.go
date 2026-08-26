@@ -3,6 +3,7 @@ package singbox
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -143,6 +144,16 @@ func TestGetSelectedOutboundTimeout(t *testing.T) {
 	}
 }
 
+func TestClientUsesRequestContextRatherThanHiddenGlobalTimeout(t *testing.T) {
+	c := New("http://127.0.0.1:9090", "")
+	if c.HTTP.Timeout != 0 {
+		t.Fatalf("client timeout = %v, want no second timeout authority", c.HTTP.Timeout)
+	}
+	if c.HTTP.CheckRedirect == nil {
+		t.Fatal("controller client must retain explicit redirect policy")
+	}
+}
+
 func TestSelectOutboundSuccess(t *testing.T) {
 	f := newFake()
 	srv := httptest.NewServer(f.handler())
@@ -214,5 +225,29 @@ func TestSelectOutboundVerifyMalformed(t *testing.T) {
 	_ = f
 	if err := c.SelectOutbound(context.Background(), "frostgate-selector", "B"); err == nil {
 		t.Fatal("expected verify malformed error")
+	}
+}
+
+func TestParseDelayRangeValidation(t *testing.T) {
+	maxMS := int64(^uint64(0)>>1) / int64(time.Millisecond)
+	for _, tc := range []struct {
+		body    string
+		wantErr bool
+		want    time.Duration
+	}{
+		{`{"delay":1}`, false, time.Millisecond},
+		{`{"delay":65535}`, false, 65535 * time.Millisecond},
+		{`{"delay":65536}`, false, 65536 * time.Millisecond},
+		{`{"delay":120000}`, false, 120 * time.Second},
+		{fmt.Sprintf(`{"delay":%d}`, maxMS), false, time.Duration(maxMS) * time.Millisecond},
+		{fmt.Sprintf(`{"delay":%d}`, maxMS+1), true, 0},
+		{`{"delay":-1}`, true, 0},
+		{`{"delay":0}`, true, 0},
+		{`{`, true, 0},
+	} {
+		got, err := ParseDelay([]byte(tc.body))
+		if (err != nil) != tc.wantErr || (!tc.wantErr && got != tc.want) {
+			t.Fatalf("ParseDelay(%s) = %s, %v", tc.body, got, err)
+		}
 	}
 }

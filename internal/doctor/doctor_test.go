@@ -1,10 +1,14 @@
 package doctor
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
 func TestFormatIsPlain(t *testing.T) {
@@ -118,5 +122,47 @@ endpoints:
 		if check.Name == "Test URL" && check.Status != "SKIP" {
 			t.Fatalf("sing-box test URL = %+v, want SKIP", check)
 		}
+	}
+}
+
+func TestDoctorDNSUsesBoundedResolverContext(t *testing.T) {
+	oldLookup, oldTimeout := doctorLookupHost, doctorLookupTimeout
+	doctorLookupTimeout = 20 * time.Millisecond
+	doctorLookupHost = func(ctx context.Context, _ string) ([]string, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() {
+		doctorLookupHost = oldLookup
+		doctorLookupTimeout = oldTimeout
+	})
+	start := time.Now()
+	if err := checkDNS(); err == nil || time.Since(start) > time.Second {
+		t.Fatalf("bounded doctor DNS error=%v elapsed=%s", err, time.Since(start))
+	}
+}
+
+func TestDirectOnlyDoctorSurfacesOwnedActiveSidecar(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(home, "xdg")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	dir := filepath.Join(xdg, "frostgate")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(xdg, "systemd", "user", "frostgate-singbox.service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(setup.BuildSystemdUnit("/bin/sing-box", dir)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldStatus := systemdStatus
+	systemdStatus = func(string) string { return "active" }
+	t.Cleanup(func() { systemdStatus = oldStatus })
+	check := directOnlySidecarCheck(filepath.Join(dir, "config.yaml"), dir)
+	if check == nil || check.Status != "FAIL" || !strings.Contains(check.Detail, "stale") {
+		t.Fatalf("stale owned sidecar check = %+v", check)
 	}
 }

@@ -32,6 +32,11 @@ type Options struct {
 	SidecarService string
 }
 
+var (
+	diagnoseLookupTimeout = 5 * time.Second
+	diagnoseLookupHost    = net.DefaultResolver.LookupHost
+)
+
 func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
 	var out []Layer
 	out = append(out, checkLocalNetwork())
@@ -178,7 +183,9 @@ func checkDNS(cfg *config.Config) Layer {
 	if net.ParseIP(host) != nil {
 		return Layer{Name: "DNS", Status: "PASS", Detail: "not required for IP literal"}
 	}
-	ips, err := net.LookupHost(host)
+	ctx, cancel := context.WithTimeout(context.Background(), diagnoseLookupTimeout)
+	defer cancel()
+	ips, err := diagnoseLookupHost(ctx, host)
 	if err != nil || len(ips) == 0 {
 		return Layer{Name: "DNS", Status: "FAIL", Detail: errString(err)}
 	}
@@ -189,10 +196,9 @@ func checkDNSForHost(routeName, host string) Layer {
 	if host == "" {
 		return Layer{Name: fmt.Sprintf("DNS %s", routeName), Status: "SKIP", Detail: "no server host"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), diagnoseLookupTimeout)
 	defer cancel()
-	var r net.Resolver
-	addrs, err := r.LookupHost(ctx, host)
+	addrs, err := diagnoseLookupHost(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return Layer{
 			Name:   fmt.Sprintf("DNS %s", routeName),

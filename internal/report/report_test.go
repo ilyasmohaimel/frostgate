@@ -285,6 +285,16 @@ func TestDiagnosisMissingDirectAllProxiesDown(t *testing.T) {
 	}
 }
 
+func TestDiagnosisDoesNotInventDirectBaselineFromHealthEndpoint(t *testing.T) {
+	results := []probe.Result{
+		mkResult("github-health", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0),
+		mkResult("proxy-a", config.ProbeSingBox, probe.StatusDown, 0, 100),
+	}
+	if got := diagnosis(results); got != "" {
+		t.Fatalf("diagnosis = %q, want no invented baseline diagnosis", got)
+	}
+}
+
 func TestDiagnosisDirectOnlyAndEmpty(t *testing.T) {
 	for name, results := range map[string][]probe.Result{
 		"direct only": {mkResult("direct", config.ProbeHTTP, probe.StatusUp, 20*time.Millisecond, 0)},

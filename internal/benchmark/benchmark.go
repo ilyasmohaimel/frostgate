@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -48,7 +49,7 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if err != nil {
 		return 0, 0, err
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -87,19 +88,31 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if err != nil {
 		return 0, 0, err
 	}
-	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, contextForwardDialer{})
 	if err != nil {
 		return 0, 0, fmt.Errorf("socks5: %w", err)
 	}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		},
-		ForceAttemptHTTP2: false,
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return 0, 0, fmt.Errorf("socks5 dialer does not support context cancellation")
 	}
+	transport := &http.Transport{
+		DialContext: func(_ context.Context, network, address string) (net.Conn, error) {
+			// net/http may supply an internal dial context that outlives the
+			// request after Do returns. The measurement context is the public
+			// cancellation contract and must bound SOCKS TCP + handshake I/O.
+			return contextDialer.DialContext(ctx, network, address)
+		},
+		// Count bytes actually transferred on the benchmark connection, not
+		// transparently decompressed application bytes.
+		DisableCompression: true,
+		ForceAttemptHTTP2:  false,
+	}
+	// The context watcher attached to the SOCKS connection must not survive a
+	// successful one-off measurement through an idle keep-alive connection.
+	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
@@ -130,6 +143,51 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	}
 	mbps := float64(n) * 8 / elapsed.Seconds() / 1e6
 	return mbps, elapsed, nil
+}
+
+// contextForwardDialer gives x/net's SOCKS state machine a connection whose
+// read/write operations are interrupted when its context ends. x/net's
+// ContextDialer covers the TCP connect, but its SOCKS greeting can otherwise
+// block in I/O after a successful connection.
+type contextForwardDialer struct{}
+
+func (contextForwardDialer) Dial(network, address string) (net.Conn, error) {
+	return net.Dial(network, address)
+}
+
+func (contextForwardDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return watchContextConn(ctx, conn), nil
+}
+
+type watchedConn struct {
+	net.Conn
+	stop      chan struct{}
+	closeOnce sync.Once
+}
+
+func watchContextConn(ctx context.Context, conn net.Conn) *watchedConn {
+	wrapped := &watchedConn{Conn: conn, stop: make(chan struct{})}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-wrapped.stop:
+		}
+	}()
+	return wrapped
+}
+
+func (c *watchedConn) Close() error {
+	c.closeOnce.Do(func() { close(c.stop) })
+	return c.Conn.Close()
 }
 
 func boundedReadLimit(bytes, slack int64) int64 {

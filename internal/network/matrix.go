@@ -3,11 +3,48 @@ package network
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
+
+const directMatrixTimeout = 5 * time.Second
+
+// MatrixBudget covers sequential direct and proxy cells without a fixed global
+// deadline silently cancelling later destinations. Each cell remains bounded
+// individually; this is only the command-level safety limit.
+func MatrixBudget(destinations, routes int, routeTimeout time.Duration) time.Duration {
+	if destinations <= 0 {
+		return time.Second
+	}
+	if routes < 0 {
+		routes = 0
+	}
+	if routeTimeout <= 0 {
+		routeTimeout = time.Second
+	}
+	perRow := saturatingDurationAdd(directMatrixTimeout, saturatingDurationMul(routeTimeout, int64(routes)))
+	return saturatingDurationAdd(saturatingDurationMul(perRow, int64(destinations)), time.Second)
+}
+
+func saturatingDurationAdd(left, right time.Duration) time.Duration {
+	if right > 0 && left > time.Duration(math.MaxInt64)-right {
+		return time.Duration(math.MaxInt64)
+	}
+	return left + right
+}
+
+func saturatingDurationMul(value time.Duration, count int64) time.Duration {
+	if value <= 0 || count <= 0 {
+		return 0
+	}
+	if int64(value) > math.MaxInt64/count {
+		return time.Duration(math.MaxInt64)
+	}
+	return value * time.Duration(count)
+}
 
 // RouteProbe describes one proxy column of the destination matrix.
 type RouteProbe struct {
@@ -70,7 +107,7 @@ func DestinationMatrix(ctx context.Context, dests []string, routes []RouteProbe,
 }
 
 func checkDirectStatus(ctx context.Context, url string) (string, string) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, directMatrixTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

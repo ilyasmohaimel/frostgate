@@ -34,10 +34,12 @@ const (
 
 func DefaultThresholds() Thresholds {
 	return Thresholds{
-		HealthyLatency:  800 * time.Millisecond,
-		MaxJitter:       80 * time.Millisecond,
-		MaxLossPct:      0,
-		DegradedLossPct: 50,
+		HealthyLatency: 800 * time.Millisecond,
+		MaxJitter:      80 * time.Millisecond,
+		MaxLossPct:     0,
+		// Partial loss is governed by the caller's MaxLossPct. A route is
+		// DOWN for loss only when it has no successful samples.
+		DegradedLossPct: 100,
 	}
 }
 

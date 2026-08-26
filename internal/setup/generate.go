@@ -34,7 +34,7 @@ func WriteSecretFile(path, secret string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte(secret+"\n"), 0o600); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)
@@ -283,7 +283,7 @@ func WriteFileSecure(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)

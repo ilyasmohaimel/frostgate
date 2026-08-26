@@ -116,7 +116,9 @@ func checkCaptive() Check {
 }
 
 func checkDNS() Check {
-	addrs, err := net.LookupHost("www.gstatic.com")
+	ctx, cancel := context.WithTimeout(context.Background(), systemLookupTimeout)
+	defer cancel()
+	addrs, err := systemLookup(ctx, "www.gstatic.com")
 	if err != nil || len(addrs) == 0 {
 		return Check{Name: "System resolver", Status: "FAIL", Detail: errString(err)}
 	}
@@ -136,8 +138,13 @@ func checkDoH() Check {
 // DefaultDoHURL is the public resolver used when no override is configured.
 const DefaultDoHURL = "https://cloudflare-dns.com/dns-query"
 
-// systemLookup is swappable for tests.
-var systemLookup = net.LookupHost
+var systemLookupTimeout = 5 * time.Second
+
+// systemLookup is swappable for tests. The production path always supplies a
+// context so a broken OS resolver cannot make Frostgate wait indefinitely.
+var systemLookup = func(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
 
 // NormalizeAddrs lowercases, trims and sorts an address set.
 func NormalizeAddrs(in []string) []string {
@@ -257,7 +264,7 @@ func FetchDoHAnswers(ctx context.Context, client *http.Client, dohBase, host str
 func CheckDNSVsDoH(host, dohBase string) Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	sys, sysErr := systemLookup(host)
+	sys, sysErr := systemLookup(ctx, host)
 	doh, dohErr := FetchDoHAnswers(ctx, http.DefaultClient, dohBase, host)
 	switch {
 	case sysErr != nil && dohErr != nil:
@@ -315,8 +322,9 @@ func errString(err error) string {
 		return ""
 	}
 	s := redact.Error(err)
-	if len(s) > 80 {
-		s = s[:80]
+	runes := []rune(s)
+	if len(runes) > 80 {
+		s = string(runes[:80])
 	}
 	return s
 }

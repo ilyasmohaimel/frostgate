@@ -1,6 +1,7 @@
 package ranking
 
 import (
+	"math"
 	"reflect"
 	"sort"
 	"testing"
@@ -103,6 +104,18 @@ func TestOrderingIsTransitive(t *testing.T) {
 				t.Fatalf("global order contradicts pair order: %s before %s globally, pair=%v", ordered[i].Name, ordered[j].Name, names(pair))
 			}
 		}
+	}
+}
+
+func TestHealthStatusIsStrictRankingTier(t *testing.T) {
+	candidates := []Candidate{
+		{Name: "up-extreme", IsProxy: true, Status: "up", Median: time.Duration(1<<63 - 1), DownloadMbps: 0},
+		{Name: "degraded-infinite-download", IsProxy: true, Status: "degraded", DownloadMbps: math.Inf(1)},
+		{Name: "down-fast", IsProxy: true, Status: "down", Median: 0},
+	}
+	got := Sort(candidates)
+	if names(got)[0] != "up-extreme" || names(got)[1] != "degraded-infinite-download" || names(got)[2] != "down-fast" {
+		t.Fatalf("status tiers crossed: %v", names(got))
 	}
 }
 

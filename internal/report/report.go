@@ -170,17 +170,12 @@ func diagnosis(results []probe.Result) string {
 	if len(results) == 0 {
 		return ""
 	}
-	// find direct baseline if exists (type http/tcp/tls with name containing direct/baseline)
+	// Keep diagnosis on the same explicit baseline identity as benchmark and
+	// recommend. An arbitrary health endpoint is not evidence about the direct
+	// internet path.
 	var direct *probe.Result
-	for i := range results {
-		n := results[i].Endpoint.Name
-		if n == "direct" || n == "direct-baseline" || n == "baseline" {
-			direct = &results[i]
-			break
-		}
-		if results[i].Endpoint.Type == "http" && (contains(n, "direct") || contains(n, "baseline") || contains(n, "cloudflare") || contains(n, "gstatic")) {
-			direct = &results[i]
-		}
+	if baseline, ok := probe.DirectBaseline(results); ok {
+		direct = &baseline
 	}
 	directUp := direct != nil && direct.OK()
 	proxyCount := 0
@@ -218,39 +213,6 @@ func diagnosis(results []probe.Result) string {
 		}
 	}
 	return ""
-}
-
-func contains(s, sub string) bool {
-	if len(s) < len(sub) {
-		return false
-	}
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-		// case-insensitive quick check
-	}
-	// fallback case-insensitive by lower
-	ls := toLower(s)
-	lsub := toLower(sub)
-	for i := 0; i <= len(ls)-len(lsub); i++ {
-		if ls[i:i+len(lsub)] == lsub {
-			return true
-		}
-	}
-	return false
-}
-
-func toLower(s string) string {
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
 }
 
 type JSONResult struct {

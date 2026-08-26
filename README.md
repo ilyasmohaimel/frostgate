@@ -115,7 +115,7 @@ frostgate benchmark --no-speed
 frostgate benchmark --network home
 ```
 
-The default download is 8 MiB per usable route from `https://speed.cloudflare.com/__down`. Approximate traffic is `benchmark.download_bytes × usable routes`. Use `--no-speed` on metered connections.
+The default download is 8 MiB per usable outbound from `https://speed.cloudflare.com/__down`. Approximate traffic is `benchmark.download_bytes × (unique usable outbounds + non-proxy endpoints)`. Use `--no-speed` on metered connections.
 
 Example:
 
@@ -188,6 +188,7 @@ defaults:
   sample_interval: 150ms
   healthy_latency: 800ms
   max_jitter: 80ms
+  max_loss: 0
 
 singbox:
   controller: http://127.0.0.1:9090
@@ -220,6 +221,10 @@ endpoints:
     outbound: primary-reality
     priority: 10
 ```
+
+`max_loss` is authoritative for partial loss from 0 to 100. A route is DOWN for loss only when every sample fails.
+
+When a controller secret is configured, plaintext `http://` controllers are allowed only on loopback (`127.0.0.0/8`, `::1`, or `localhost`). Use HTTPS or a local tunnel for remote controllers.
 
 `benchmark.download_url` must be HTTP or HTTPS. Frostgate appends the configured byte count to its `bytes` query parameter. `singbox.benchmark_proxy` must be a loopback `host:port` and belongs to the managed sidecar; omit it for an external controller that has no proven benchmark listener.
 

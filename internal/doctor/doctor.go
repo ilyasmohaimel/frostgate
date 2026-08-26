@@ -25,6 +25,12 @@ type Check struct {
 	Detail string
 }
 
+var (
+	doctorLookupTimeout = 5 * time.Second
+	doctorLookupHost    = net.DefaultResolver.LookupHost
+	systemdStatus       = getSystemdStatus
+)
+
 func Run(cfgPath string, verbose bool) []Check {
 	resolved := config.ResolveConfigPath(cfgPath)
 	return RunForProfile(resolved, filepath.Dir(resolved), verbose)
@@ -105,9 +111,13 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 	}
 
 	if !hasSBEndpoints {
+		if stale := directOnlySidecarCheck(resolved, managedDir); stale != nil {
+			out = append(out, *stale)
+		} else {
+			out = append(out, Check{Name: "Sidecar service", Status: "SKIP", Detail: "no proxy routes configured"})
+		}
 		out = append(out,
 			Check{Name: "sing-box", Status: "SKIP", Detail: "no proxy routes configured"},
-			Check{Name: "Sidecar service", Status: "SKIP", Detail: "no proxy routes configured"},
 			Check{Name: "Controller", Status: "SKIP", Detail: "no proxy routes configured"},
 		)
 		return out
@@ -171,7 +181,7 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 		identity := profile.ForPath(profile.CanonicalPath(resolved), managedCanonical != "" && managedCanonical == defaultCanonical)
 		servicePath := setup.ServiceUnitPath(identity.Service)
 		if _, err := os.Stat(servicePath); err == nil {
-			status := getSystemdStatus(identity.Service)
+			status := systemdStatus(identity.Service)
 			if strings.Contains(status, "active (running)") {
 				out = append(out, Check{Name: "Sidecar service", Status: "PASS", Detail: strings.TrimSuffix(identity.Service, ".service") + " active"})
 			} else if status != "" {
@@ -181,6 +191,29 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 	}
 
 	return out
+}
+
+func directOnlySidecarCheck(resolved, managedDir string) *Check {
+	defaultDir := setup.ConfigDir(setup.DefaultHomeDir())
+	managedCanonical := profile.CanonicalPath(managedDir)
+	defaultCanonical := profile.CanonicalPath(defaultDir)
+	identity := profile.ForPath(profile.CanonicalPath(resolved), managedCanonical != "" && managedCanonical == defaultCanonical)
+	unitPath := setup.ServiceUnitPath(identity.Service)
+	unit, err := os.ReadFile(unitPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return &Check{Name: "Sidecar service", Status: "WARN", Detail: "cannot inspect Frostgate unit"}
+	}
+	if !setup.IsOwnedSystemdUnit(string(unit), filepath.Join(managedDir, "sing-box.json")) {
+		return nil
+	}
+	status := systemdStatus(identity.Service)
+	if status == "active" || strings.HasPrefix(status, "active ") {
+		return &Check{Name: "Sidecar service", Status: "FAIL", Detail: "stale Frostgate sidecar remains active for direct-only config"}
+	}
+	return &Check{Name: "Sidecar service", Status: "WARN", Detail: "stale Frostgate sidecar unit remains for direct-only config"}
 }
 
 func managedBenchmarkProxy(dir string) (string, bool) {
@@ -200,7 +233,9 @@ func privateFileCheck(name, path string) Check {
 }
 
 func checkDNS() error {
-	addrs, err := net.LookupHost("www.gstatic.com")
+	ctx, cancel := context.WithTimeout(context.Background(), doctorLookupTimeout)
+	defer cancel()
+	addrs, err := doctorLookupHost(ctx, "www.gstatic.com")
 	if err != nil {
 		return err
 	}

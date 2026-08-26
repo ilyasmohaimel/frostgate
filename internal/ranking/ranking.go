@@ -91,6 +91,19 @@ func scoreFloat(value float64) int64 {
 	return int64(value)
 }
 
+func statusTier(status string) int {
+	switch status {
+	case "up":
+		return 0
+	case "degraded":
+		return 1
+	case "down":
+		return 2
+	default:
+		return 3
+	}
+}
+
 func Sort(cands []Candidate) []Candidate {
 	out := make([]Candidate, len(cands))
 	copy(out, cands)
@@ -122,6 +135,12 @@ func Sort(cands []Candidate) []Candidate {
 		return saturatingAdd(rankScore(c), adjustment)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := statusTier(out[i].Status), statusTier(out[j].Status)
+		if ti != tj {
+			// Health is a strict, non-negotiable ordering tier. No finite
+			// performance/history score can cross it.
+			return ti < tj
+		}
 		si := adjustedScore(out[i])
 		sj := adjustedScore(out[j])
 		if si == sj {

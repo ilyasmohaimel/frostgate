@@ -16,7 +16,7 @@ func TestClassify(t *testing.T) {
 	}{
 		{"healthy perfect", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 100 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusUp},
 		{"some loss -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 3, Failed: 1, LossPct: 25, Median: 100 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDegraded},
-		{"high loss -> down", metrics.Metrics{Attempted: 4, Succeeded: 1, Failed: 3, LossPct: 75, Median: 100 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDown},
+		{"high partial loss -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 1, Failed: 3, LossPct: 75, Median: 100 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDegraded},
 		{"all fail -> down", metrics.Metrics{Attempted: 4, Succeeded: 0, Failed: 4, LossPct: 100}, StatusDown},
 		{"slow median -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 900 * time.Millisecond, Jitter: 10 * time.Millisecond}, StatusDegraded},
 		{"high measured jitter -> degraded", metrics.Metrics{Attempted: 4, Succeeded: 4, Failed: 0, LossPct: 0, Median: 100 * time.Millisecond, Jitter: 100 * time.Millisecond, JitterKnown: true}, StatusDegraded},

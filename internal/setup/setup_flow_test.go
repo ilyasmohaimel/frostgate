@@ -90,7 +90,7 @@ func TestImportFlowCustomDirectUsesGenericStatus(t *testing.T) {
 	}))
 	defer server.Close()
 	input := "\n\nn\n" + server.URL + "\n"
-	if err := importFlow(Options{Stdin: bufio.NewReader(strings.NewReader(input))}, dir, ""); err != nil {
+	if err := importFlow(Options{Stdin: bufio.NewReader(strings.NewReader(input))}, dir, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Load(filepath.Join(dir, "config.yaml"))

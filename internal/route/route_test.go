@@ -146,6 +146,7 @@ func TestDeriveNameRejectsSecretLikeFragments(t *testing.T) {
 		"deadbeefdeadbeef",
 		"abcdefghijklmnop",
 		"qwertyuiopasdfgh",
+		"UPPERCASEOPAQUE",
 		"deadbeefdeadbeef%253Aignored",
 	} {
 		link := "vless://uuid@host:443?security=reality&sni=a&pbk=b#" + fragment

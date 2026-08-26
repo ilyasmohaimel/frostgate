@@ -43,7 +43,7 @@ type Recorder struct {
 	db            *DB
 	lastWrite     time.Time
 	lastPrune     time.Time
-	prune         func(*DB, time.Duration) error
+	commit        func(*DB, []Record, time.Duration, bool) error
 }
 
 // NewRecorder builds a Recorder from resolved config values.
@@ -61,7 +61,9 @@ func NewRecorderForProfile(enabled bool, retention, watchInterval time.Duration,
 	if profile == "" {
 		profile = DefaultProfile
 	}
-	return &Recorder{enabled: enabled, retention: retention, watchInterval: watchInterval, profile: profile, prune: func(db *DB, retention time.Duration) error { return db.Prune(retention) }}
+	return &Recorder{enabled: enabled, retention: retention, watchInterval: watchInterval, profile: profile, commit: func(db *DB, records []Record, retention time.Duration, prune bool) error {
+		return db.RecordSnapshot(records, retention, prune)
+	}}
 }
 
 // Enabled reports whether history recording is active.
@@ -107,19 +109,19 @@ func (r *Recorder) write(recs []Record, throttled bool) (bool, error) {
 		r.db = db
 		r.lastPrune = time.Time{}
 	}
-	for _, rec := range recs {
+	prepared := make([]Record, len(recs))
+	for i, rec := range recs {
 		if rec.Profile == "" {
 			rec.Profile = r.profile
 		}
-		if err := r.db.Add(rec); err != nil {
-			return false, err
-		}
+		prepared[i] = rec
+	}
+	shouldPrune := r.lastPrune.IsZero() || now.Sub(r.lastPrune) >= r.watchInterval
+	if err := r.commit(r.db, prepared, r.retention, shouldPrune); err != nil {
+		return false, err
 	}
 	r.lastWrite = now
-	if r.lastPrune.IsZero() || now.Sub(r.lastPrune) >= r.watchInterval {
-		if err := r.prune(r.db, r.retention); err != nil {
-			return false, err
-		}
+	if shouldPrune {
 		r.lastPrune = now
 	}
 	return true, nil
