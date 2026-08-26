@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,5 +78,42 @@ func TestLoadRejectsEmpty(t *testing.T) {
 	path := writeTemp(t, "defaults:\n  timeout: 1s\n")
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for config with no endpoints, got nil")
+	}
+}
+
+func TestLoadEndpointLimit(t *testing.T) {
+	endpointConfig := func(count int) string {
+		var body strings.Builder
+		body.WriteString("endpoints:\n")
+		for i := 0; i < count; i++ {
+			fmt.Fprintf(&body, "  - name: endpoint-%d\n    type: tcp\n    host: example.com\n    port: 443\n", i)
+		}
+		return body.String()
+	}
+
+	tests := []struct {
+		count   int
+		wantErr string
+	}{
+		{count: 0, wantErr: "has no endpoints"},
+		{count: 1},
+		{count: 31},
+		{count: MaxEndpoints},
+		{count: MaxEndpoints + 1, wantErr: "too many endpoints: 33 configured, maximum is 32"},
+		{count: 100, wantErr: "too many endpoints: 100 configured, maximum is 32"},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d_endpoints", tt.count), func(t *testing.T) {
+			_, err := Load(writeTemp(t, endpointConfig(tt.count)))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Load() error = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }

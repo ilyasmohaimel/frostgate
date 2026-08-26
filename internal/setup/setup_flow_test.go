@@ -2,10 +2,12 @@ package setup
 
 import (
 	"bufio"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +81,48 @@ func TestExistingControllerFlowUsesDefaultGenerate204Status(t *testing.T) {
 	}
 	if cfg.Endpoints[0].ExpectedStatus != http.StatusNoContent {
 		t.Fatalf("default direct endpoint expected status = %d", cfg.Endpoints[0].ExpectedStatus)
+	}
+}
+
+func TestExistingControllerFlowRejectsEndpointOverflowBeforeWritingSecret(t *testing.T) {
+	dir := t.TempDir()
+	tags := make([]string, config.MaxEndpoints)
+	for i := range tags {
+		tags[i] = "route-" + strconv.Itoa(i)
+	}
+	input := "\nfixture-secret\ny\n" + strings.Join(tags, ",") + "\n"
+	err := existingControllerFlow(Options{Stdin: bufio.NewReader(strings.NewReader(input))}, dir)
+	if err == nil || !strings.Contains(err.Error(), "too many endpoints: 33 configured, maximum is 32") {
+		t.Fatalf("setup error = %v", err)
+	}
+	for _, name := range []string{"config.yaml", "controller-secret", "sing-box.json"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("setup overflow wrote %s: %v", name, statErr)
+		}
+	}
+}
+
+func TestImportFlowRejectsEndpointOverflowBeforeWritingManagedFiles(t *testing.T) {
+	dir := t.TempDir()
+	link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&type=tcp&sni=example.com&fp=chrome&pbk=fixture-key&sid=abcd&flow=xtls-rprx-vision"
+	var input strings.Builder
+	for i := 0; i < config.MaxEndpoints; i++ {
+		fmt.Fprintf(&input, "%s\nroute-%d\n", link, i)
+		if i+1 < config.MaxEndpoints {
+			input.WriteString("y\n")
+		} else {
+			input.WriteString("n\n")
+		}
+	}
+	input.WriteString("\n") // accept the direct baseline, producing 33 endpoints
+	err := importFlow(Options{Stdin: bufio.NewReader(strings.NewReader(input.String()))}, dir, "", nil)
+	if err == nil || !strings.Contains(err.Error(), "too many endpoints: 33 configured, maximum is 32") {
+		t.Fatalf("setup import error = %v", err)
+	}
+	for _, name := range []string{"config.yaml", "controller-secret", "sing-box.json"} {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("setup import overflow wrote %s: %v", name, statErr)
+		}
 	}
 }
 

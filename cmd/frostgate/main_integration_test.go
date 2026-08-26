@@ -61,6 +61,7 @@ func TestMain(m *testing.M) {
 type cliFixture struct {
 	home            string
 	configPath      string
+	probeHits       atomic.Int32
 	benchmarkHits   atomic.Int32
 	destinationHits atomic.Int32
 	downloadBytes   int64
@@ -76,6 +77,7 @@ func newCLIFixture(t *testing.T) *cliFixture {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/generate_204":
+			f.probeHits.Add(1)
 			w.WriteHeader(http.StatusOK)
 		case "/custom":
 			if r.URL.Query().Get("bytes") == strconv.FormatInt(f.downloadBytes, 10) {
@@ -210,6 +212,60 @@ func requireJSON(t *testing.T, out []byte) any {
 		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
 	}
 	return value
+}
+
+func writeEndpointConfig(t *testing.T, path string, count int, targetURL string) {
+	t.Helper()
+	var body strings.Builder
+	body.WriteString("defaults:\n  timeout: 100ms\n  samples: 1\nendpoints:\n")
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&body, "  - name: endpoint-%d\n    type: http\n    url: %s/generate_204\n    expected_status: 204\n", i, targetURL)
+	}
+	if err := os.WriteFile(path, []byte(body.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEndpointLimitFailsBeforeCLIWork(t *testing.T) {
+	f := newCLIFixture(t)
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		f.probeHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer probeServer.Close()
+	writeEndpointConfig(t, f.configPath, config.MaxEndpoints+1, probeServer.URL)
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "default config"},
+		{name: "explicit config", args: []string{"--config", f.configPath}},
+		{name: "benchmark", args: []string{"benchmark", "--config", f.configPath}},
+		{name: "recommend", args: []string{"recommend", "--config", f.configPath}},
+		{name: "doctor", args: []string{"doctor", "--config", f.configPath}},
+		{name: "doctor flag", args: []string{"--doctor", "--config", f.configPath}},
+		{name: "diagnose", args: []string{"diagnose", "--config", f.configPath}},
+		{name: "network check", args: []string{"network-check", "--config", f.configPath}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := f.probeHits.Load()
+			stdout, stderr, code := runCLI(t, f.env(), tt.args...)
+			if code != 3 {
+				t.Fatalf("exit code = %d, want 3; stderr: %s", code, stderr)
+			}
+			if len(stdout) != 0 {
+				t.Fatalf("unexpected stdout before config validation: %s", stdout)
+			}
+			if !strings.Contains(string(stderr), "too many endpoints: 33 configured, maximum is 32") {
+				t.Fatalf("missing endpoint-limit error: %s", stderr)
+			}
+			if got := f.probeHits.Load(); got != before {
+				t.Fatalf("probe started before config validation: before=%d after=%d", before, got)
+			}
+		})
+	}
 }
 
 func TestConfigContractAffectsRuntime(t *testing.T) {

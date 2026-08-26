@@ -77,6 +77,19 @@ Supported shells are Fish, Bash, and Zsh. Completion reads no network state.
 
 Run `frostgate --help` for command flags.
 
+## Exit status and failures
+
+For commands that report route health (`frostgate`, `import` post-import checks, and `benchmark`):
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Success: all relevant routes are healthy. |
+| `1` | Degraded or mixed result. |
+| `2` | All relevant routes are down. |
+| `3` | Configuration, validation, command, or other operational error. |
+
+Malformed config or invalid endpoint settings return `3`. A controller that is unreachable or unauthorized, a missing outbound, or a stopped managed sidecar makes the affected proxy route down, contributing to `1` or `2`. Setup/import candidate validation or transaction failures return `3`. Benchmark selector capture, switch, or restoration failures also return `3`, even when latency probes are healthy.
+
 ## Add and import routes
 
 Quote share links because query strings contain shell-special characters:
@@ -180,6 +193,8 @@ Most users should use `frostgate setup`, `add`, or `import`. The generated confi
 An explicit `--config /path/to/config.yaml` is an isolated profile. Its managed state is the hidden sibling `.frostgate-<profile-id>/`, keyed by the canonical config file. Two configs in one directory stay separate; relative and symlink aliases of one config share one profile. The default config keeps its historical XDG paths, service, and ports. Custom profiles use deterministic service and loopback bindings.
 
 Legacy custom state beside an explicit config is adopted only when its config, routes, controller, listener, and secret prove ownership. If a legacy unit exists, it must point at that state before Frostgate quiesces it. Ambiguous legacy state is left untouched.
+
+A Frostgate config supports up to 32 endpoints. This is an intentional supported limit. Config validation rejects 33 or more endpoints before probing or managed changes, with an error such as `too many endpoints: 33 configured, maximum is 32`.
 
 ```yaml
 defaults:

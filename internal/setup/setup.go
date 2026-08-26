@@ -474,6 +474,13 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 			addDirect = false
 		}
 	}
+	endpointCount := len(vlessOut) + len(hystOut)
+	if addDirect {
+		endpointCount++
+	}
+	if err := config.ValidateEndpointCount(endpointCount); err != nil {
+		return err
+	}
 	if len(vlessOut)+len(hystOut) == 0 {
 		if !addDirect {
 			return fmt.Errorf("at least one route or direct baseline is required")
@@ -617,6 +624,7 @@ func existingControllerFlow(opts Options, dir string) error {
 		return err
 	}
 	secretFile := ""
+	secretToSave := ""
 	if secret != "" {
 		// offer to save to file
 		save, err := prompt(opts.Stdin, "Save secret to controller-secret file? [Y/n]: ")
@@ -625,9 +633,7 @@ func existingControllerFlow(opts Options, dir string) error {
 		}
 		if !isNo(save) {
 			secretFile = filepath.Join(dir, "controller-secret")
-			if err := WriteSecretFile(secretFile, secret); err != nil {
-				return err
-			}
+			secretToSave = secret
 			secret = "" // use file
 		}
 	}
@@ -648,6 +654,14 @@ func existingControllerFlow(opts Options, dir string) error {
 	}
 	if len(tags) == 0 {
 		return fmt.Errorf("no tags provided")
+	}
+	if err := config.ValidateEndpointCount(len(tags) + 1); err != nil {
+		return err
+	}
+	if secretToSave != "" {
+		if err := WriteSecretFile(secretFile, secretToSave); err != nil {
+			return err
+		}
 	}
 	testURL := config.DefaultTestURL
 	fgConfig := BuildExternalControllerConfig(tags, testURL, controller, secretFile)

@@ -640,6 +640,9 @@ func routeConfigCandidate(path, dir string, tags []string, identity profile.Iden
 	secretFile := filepath.Join(dir, "controller-secret")
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
+		if err := config.ValidateEndpointCount(len(tags) + 1); err != nil {
+			return nil, "", "", err
+		}
 		data, marshalErr := setup.MarshalFrostgateConfig(tags, nil, config.DefaultTestURL, controller, secretFile)
 		if marshalErr != nil {
 			return nil, "", "", marshalErr
@@ -655,6 +658,9 @@ func routeConfigCandidate(path, dir string, tags []string, identity profile.Iden
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
+		return nil, "", "", err
+	}
+	if err := config.ValidateEndpointCount(len(cfg.Endpoints) + len(tags)); err != nil {
 		return nil, "", "", err
 	}
 	if bootstrap {
@@ -747,6 +753,9 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 	}
 	if endpoints.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("Frostgate config endpoints must be a list")
+	}
+	if err := config.ValidateEndpointCount(len(endpoints.Content) + len(tags)); err != nil {
+		return nil, err
 	}
 	maxPriority := 0
 	for _, endpoint := range endpoints.Content {

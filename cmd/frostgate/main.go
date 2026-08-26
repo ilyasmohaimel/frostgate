@@ -85,14 +85,7 @@ func run() int {
 				fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 				return 3
 			}
-			checks := doctor.RunForProfile(path, managedDir, *verbose)
-			fmt.Print(doctor.FormatColor(checks))
-			for _, c := range checks {
-				if c.Status == "FAIL" {
-					return 1
-				}
-			}
-			return 0
+			return runDoctor(path, managedDir, *verbose)
 		case "add":
 			return handleAdd(os.Args[2:])
 		case "import":
@@ -176,14 +169,7 @@ func run() int {
 			fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 			return 3
 		}
-		checks := doctor.RunForProfile(path, managedDir, *verbose)
-		fmt.Print(doctor.FormatColor(checks))
-		for _, c := range checks {
-			if c.Status == "FAIL" {
-				return 1
-			}
-		}
-		return 0
+		return runDoctor(path, managedDir, *verbose)
 	}
 	resolved, managedDir, pathErr := commandPathsChecked(*cfgPath)
 	if pathErr != nil {
@@ -203,7 +189,7 @@ func run() int {
 	}
 	cfg, err := config.Load(resolved)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "frostgate:", sanitizeError(err))
+		printConfigError(err)
 		if *verbose {
 			fmt.Fprintf(os.Stderr, "config path: %s\n", resolved)
 		}
@@ -243,6 +229,21 @@ func run() int {
 		return 3
 	}
 	return exitCode(res)
+}
+
+func runDoctor(path, managedDir string, verbose bool) int {
+	if _, err := config.Load(path); err != nil {
+		printConfigError(err)
+		return 3
+	}
+	checks := doctor.RunForProfile(path, managedDir, verbose)
+	fmt.Print(doctor.FormatColor(checks))
+	for _, c := range checks {
+		if c.Status == "FAIL" {
+			return 1
+		}
+	}
+	return 0
 }
 
 func handleSetup(args []string) int {
@@ -420,6 +421,10 @@ func handleAdd(args []string) int {
 
 func sanitizeError(err error) string {
 	return redact.Error(err)
+}
+
+func printConfigError(err error) {
+	fmt.Fprintln(os.Stderr, "config:", sanitizeError(err))
 }
 
 func sanitizeOutput(s string) string {
@@ -890,7 +895,7 @@ func handleBenchmark(args []string) int {
 	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		printConfigError(err)
 		return 3
 	}
 	// A pre-v0.4.9 explicit profile stored its sidecar beside the config. A
@@ -903,7 +908,7 @@ func handleBenchmark(args []string) int {
 	} else if migrated {
 		cfg, err = config.Load(cfgFile)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, sanitizeError(err))
+			printConfigError(err)
 			return 3
 		}
 	}
@@ -1321,7 +1326,7 @@ func handleDiagnose(args []string) int {
 	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		printConfigError(err)
 		return 3
 	}
 	var layers []diagnose.Layer
@@ -1474,7 +1479,7 @@ func handleNetworkCheck(args []string) int {
 		// An absent implicit config is valid for generic network checks; an
 		// existing but malformed/unreadable implicit config is an error, not a
 		// reason to pretend Frostgate has no configuration.
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		printConfigError(err)
 		return 3
 	}
 	if cfg != nil && len(cfg.NetworkCheck.Destinations) > 0 {
@@ -2024,7 +2029,7 @@ func handleRecommend(args []string) int {
 	}
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, sanitizeError(err))
+		printConfigError(err)
 		return 3
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeRunBudget(cfg))

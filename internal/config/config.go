@@ -189,6 +189,9 @@ type Config struct {
 }
 
 const (
+	// MaxEndpoints is the supported maximum number of endpoints in one config.
+	MaxEndpoints = 32
+
 	DefaultTimeout           = 5 * time.Second
 	DefaultSamples           = 4
 	DefaultSampleInterval    = 150 * time.Millisecond
@@ -197,6 +200,16 @@ const (
 	DefaultTestURL           = "https://www.gstatic.com/generate_204"
 	DefaultSingBoxController = "http://127.0.0.1:9090"
 )
+
+// ValidateEndpointCount enforces Frostgate's supported per-config endpoint
+// limit. Candidate builders use the same check before any managed files or
+// services are changed.
+func ValidateEndpointCount(count int) error {
+	if count > MaxEndpoints {
+		return fmt.Errorf("too many endpoints: %d configured, maximum is %d", count, MaxEndpoints)
+	}
+	return nil
+}
 
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
@@ -212,6 +225,9 @@ func Load(path string) (*Config, error) {
 	}
 	if len(cfg.Endpoints) == 0 {
 		return nil, fmt.Errorf("config %s has no endpoints", path)
+	}
+	if err := ValidateEndpointCount(len(cfg.Endpoints)); err != nil {
+		return nil, err
 	}
 	seen := make(map[string]struct{})
 	for i := range cfg.Endpoints {

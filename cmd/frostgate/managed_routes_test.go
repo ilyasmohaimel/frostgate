@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,6 +295,77 @@ func TestDirectOnlyAddBootstrapsCompleteManagedSidecar(t *testing.T) {
 	}
 	if enabled != 1 {
 		t.Fatalf("direct-only upgrade did not enable the managed sidecar: %d", enabled)
+	}
+}
+
+func writeEndpointLimitConfig(t *testing.T, path string, count int) []byte {
+	t.Helper()
+	var body strings.Builder
+	body.WriteString("singbox:\n  controller: http://127.0.0.1:9090\nendpoints:\n")
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&body, "  - name: endpoint-%d\n    type: singbox\n    outbound: endpoint-%d\n", i, i)
+	}
+	data := []byte(body.String())
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestAddEndpointLimitLeavesManagedStateUntouched(t *testing.T) {
+	_, dir, configPath := writeExistingManagedFixture(t)
+	originalConfig := writeEndpointLimitConfig(t, configPath, config.MaxEndpoints)
+	originalSidecar, err := os.ReadFile(filepath.Join(dir, "sing-box.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSecret, err := os.ReadFile(filepath.Join(dir, "controller-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = addManagedRoute(dir, configPath, "vless://22222222-2222-4222-8222-222222222222@203.0.113.20:443?security=reality&type=tcp&sni=example.net&fp=chrome&pbk=fixture-key&sid=abcd", "overflow-route", nil)
+	if err == nil || !strings.Contains(err.Error(), "too many endpoints: 33 configured, maximum is 32") {
+		t.Fatalf("add error = %v", err)
+	}
+	if got, readErr := os.ReadFile(configPath); readErr != nil || !bytes.Equal(got, originalConfig) {
+		t.Fatalf("config changed after rejected add: %q, %v", got, readErr)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(dir, "sing-box.json")); readErr != nil || !bytes.Equal(got, originalSidecar) {
+		t.Fatalf("sidecar changed after rejected add: %v", readErr)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(dir, "controller-secret")); readErr != nil || !bytes.Equal(got, originalSecret) {
+		t.Fatalf("secret changed after rejected add: %v", readErr)
+	}
+}
+
+func TestImportEndpointLimitLeavesManagedStateUntouched(t *testing.T) {
+	_, dir, configPath := writeExistingManagedFixture(t)
+	originalConfig := writeEndpointLimitConfig(t, configPath, config.MaxEndpoints)
+	originalSidecar, err := os.ReadFile(filepath.Join(dir, "sing-box.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSecret, err := os.ReadFile(filepath.Join(dir, "controller-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintln(w, "vless://22222222-2222-4222-8222-222222222222@203.0.113.20:443?security=reality&type=tcp&sni=example.net&fp=chrome&pbk=fixture-key&sid=abcd#overflow-route")
+	}))
+	defer subscription.Close()
+
+	if code := handleImport([]string{"--allow-insecure-http", "--config", configPath, subscription.URL}); code != 3 {
+		t.Fatalf("import exit code = %d, want 3", code)
+	}
+	if got, readErr := os.ReadFile(configPath); readErr != nil || !bytes.Equal(got, originalConfig) {
+		t.Fatalf("config changed after rejected import: %q, %v", got, readErr)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(dir, "sing-box.json")); readErr != nil || !bytes.Equal(got, originalSidecar) {
+		t.Fatalf("sidecar changed after rejected import: %v", readErr)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(dir, "controller-secret")); readErr != nil || !bytes.Equal(got, originalSecret) {
+		t.Fatalf("secret changed after rejected import: %v", readErr)
 	}
 }
 
