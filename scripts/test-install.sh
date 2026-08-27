@@ -58,7 +58,7 @@ GOOD_SUM="$(sha256sum "$FIXTURE/good-binary" | awk '{print $1}')"
 BAD_SUM="$(sha256sum "$FIXTURE/broken-binary" | awk '{print $1}')"
 
 make_sums() { # $1 = hash, $2 = file
-  printf '%s  frostgate-linux-amd64\n' "$1" > "$2"
+  printf '%s  %s\n' "$1" "${3:-frostgate-linux-amd64}" > "$2"
 }
 
 # --- shims (scripts created BEFORE symlinking tools so nothing is clobbered) ---
@@ -93,7 +93,7 @@ case "$url" in
   *SHA256SUMS)
     [ "${FT_MODE:-}" = "no-sums" ] && exit 22
     cp "$FT_SUMS" "$out"; exit 0 ;;
-  *frostgate-linux-*)
+  *frostgate-*)
     [ "${FT_MODE:-}" = "download-fail" ] && exit 22
     cp "$FT_BINARY" "$out"; exit 0 ;;
 esac
@@ -116,7 +116,7 @@ case "$url" in
   *SHA256SUMS)
     [ "${FT_MODE:-}" = "no-sums" ] && exit 8
     cp "$FT_SUMS" "$out"; exit 0 ;;
-  *frostgate-linux-*)
+  *frostgate-*)
     [ "${FT_MODE:-}" = "download-fail" ] && exit 8
     cp "$FT_BINARY" "$out"; exit 0 ;;
 esac
@@ -190,6 +190,23 @@ BASE_ENV="PATH=$SHIMS"
 GO_ENV="PATH=$GOSHIMS:/usr/bin:/bin"
 WGET_ENV="PATH=$WGETSHIMS"
 
+# Darwin fixture: exercise the same prebuilt path without requiring a macOS host.
+DARWINSHIMS="$WORK/darwinshims"
+mkdir -p "$DARWINSHIMS"
+for f in "$SHIMS"/*; do ln -sf "$f" "$DARWINSHIMS/$(basename "$f")"; done
+REAL_UNAME="$(command -v uname)"
+rm -f "$DARWINSHIMS/uname"
+cat > "$DARWINSHIMS/uname" <<EOF
+#!/bin/sh
+case "\${1:-}" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+  -r) echo test-kernel ;;
+  *) exec "$REAL_UNAME" "\$@" ;;
+esac
+EOF
+chmod +x "$DARWINSHIMS/uname"
+
 # --- Case 1: valid binary + checksum -> success replaces binary ---
 reset_env
 SUMS="$WORK/sums.1"; make_sums "$GOOD_SUM" "$SUMS"
@@ -214,6 +231,17 @@ ok=0
 cmp -s "$WORK/bin/frostgate" "$FIXTURE/good-binary" && \
   grep -q "checksum verified" "$LAST_ERR" && ok=1
 check "wget binary path verifies and installs" $ok
+
+# --- Case 1c: macOS arm64 uses the published prebuilt binary ---
+reset_env
+SUMS="$WORK/sums.1c"; make_sums "$GOOD_SUM" "$SUMS" frostgate-darwin-arm64
+LOG="$WORK/darwin.log"; : > "$LOG"
+run_installer "PATH=$DARWINSHIMS" \
+  "INSTALL_DIR=$WORK/bin" \
+  "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=$LOG"
+ok=0
+"$WORK/bin/frostgate" --version >/dev/null 2>&1 && grep -q "frostgate-darwin-arm64" "$LOG" && ok=1
+check "macOS arm64 prebuilt binary installs" $ok
 
 # --- Case 2: checksum mismatch -> fail closed, old binary preserved ---
 reset_env

@@ -37,7 +37,7 @@ case "$OS" in
   linux) OS="linux" ;;
   darwin) OS="darwin" ;;
   windows) OS="windows" ;;
-  *) echo "unsupported OS: $OS_RAW ($OS). Prebuilt binaries support Linux; Darwin can use go install" >&2; ;;
+  *) echo "unsupported OS: $OS_RAW ($OS). Prebuilt binaries support Linux and macOS; other platforms can use go install" >&2; ;;
 esac
 
 case "$ARCH" in
@@ -168,17 +168,7 @@ verify_checksum() {
 }
 
 install_via_binary() {
-  if [ "$OS" != "linux" ]; then
-    if [ "$OS" = "darwin" ]; then
-      echo "macOS detected: prebuilt darwin binaries are not yet published (planned)." >&2
-      echo "Use: go install github.com/$REPO/cmd/frostgate@latest  (requires Go)" >&2
-      if command -v go >/dev/null 2>&1; then
-        echo "Go found; falling back to go install" >&2
-        return 2
-      fi
-      echo "Install Go from https://go.dev/dl/ then rerun, or wait for future macOS binaries." >&2
-      return 2
-    fi
+  if [ "$OS" != "linux" ] && [ "$OS" != "darwin" ]; then
     if [ "$OS" = "windows" ]; then
       if [ "$IS_MSYS" = "1" ]; then
         echo "Windows (MSYS/Git Bash) detected: native Windows binaries are planned but not yet first-class." >&2
@@ -186,13 +176,15 @@ install_via_binary() {
       fi
       return 1
     fi
-    echo "no prebuilt binary for $OS/$ARCH (only linux-amd64 and linux-arm64 are published); trying go install" >&2
+    echo "no prebuilt binary for $OS/$ARCH (only Linux and macOS amd64/arm64 are published); trying go install" >&2
     return 2
   fi
-  case "$ARCH" in
-    amd64) bin_name="${BINARY}-linux-amd64" ;;
-    arm64) bin_name="${BINARY}-linux-arm64" ;;
-    *) echo "no prebuilt binary for $OS/$ARCH (only amd64/arm64)" >&2; return 2 ;;
+  case "$OS/$ARCH" in
+    linux/amd64) bin_name="${BINARY}-linux-amd64" ;;
+    linux/arm64) bin_name="${BINARY}-linux-arm64" ;;
+    darwin/amd64) bin_name="${BINARY}-darwin-amd64" ;;
+    darwin/arm64) bin_name="${BINARY}-darwin-arm64" ;;
+    *) echo "no prebuilt binary for $OS/$ARCH (only Linux and macOS amd64/arm64 are published); trying go install" >&2; return 2 ;;
   esac
   if [ "$VERSION" = "latest" ]; then
     url="https://github.com/$REPO/releases/latest/download/${bin_name}"
@@ -292,7 +284,7 @@ if [ "$VERSION" = "latest" ]; then
   fi
 else
   # Pinned version: prefer go for exact version
-  if [ "$OS" = "linux" ] && { [ "$ARCH" = "amd64" ] || [ "$ARCH" = "arm64" ]; }; then
+  if { [ "$OS" = "linux" ] || [ "$OS" = "darwin" ]; } && { [ "$ARCH" = "amd64" ] || [ "$ARCH" = "arm64" ]; }; then
     # try binary first for pinned version too
     if install_via_binary; then
       :

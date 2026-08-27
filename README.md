@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/ilyasmohaimel/frostgate/main/instal
 frostgate --version
 ```
 
-The installer places the binary in `~/.local/bin` by default. Linux `amd64` and `arm64` use static release binaries; other platforms use `go install` when Go is available.
+The installer places the binary in `~/.local/bin` by default. Linux and macOS `amd64` and `arm64` use static release binaries; other platforms use `go install` when Go is available.
 
 Release downloads fail closed: the installer requires `SHA256SUMS`, verifies the checksum, and runs `--version` before replacing an existing binary. It never installs proxy configuration or credentials.
 
@@ -290,7 +290,7 @@ For a custom profile, use `frostgate doctor --config /path/to/config.yaml`; it r
 
 - Frostgate tests routes; it does not route normal device traffic.
 - Speed depends on the target and current network conditions.
-- Only Linux `amd64` and `arm64` release binaries are published.
+- Linux and macOS `amd64` and `arm64` release binaries are published.
 - Automatic failover and push alerts are not available.
 
 ## Development

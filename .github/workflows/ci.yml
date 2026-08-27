@@ -45,3 +45,9 @@ jobs:
 
       - name: Cross-compile (linux/arm64)
         run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/frostgate
+
+      - name: Cross-compile (darwin/amd64)
+        run: GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/frostgate
+
+      - name: Cross-compile (darwin/arm64)
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/frostgate
