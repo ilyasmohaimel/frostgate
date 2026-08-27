@@ -239,8 +239,50 @@ func TestDirectOnlyConversionRemovesOwnedSidecar(t *testing.T) {
 	}
 }
 
-func TestDirectOnlyConversionLeavesUnownedUnitAlone(t *testing.T) {
+func TestManagedToExternalTransitionRemovesOwnedSidecarState(t *testing.T) {
 	home, _, _, _, unitPath := existingSetupForTransaction(t)
+	t.Setenv("PATH", "")
+	fake := &transactionSystemd{
+		output: map[string][]byte{
+			"--user is-enabled frostgate-singbox.service": []byte("enabled\n"),
+		},
+		outputSequence: map[string][][]byte{
+			"--user is-active frostgate-singbox.service": {[]byte("active\n"), []byte("inactive\n")},
+		},
+	}
+	oldFactory := systemdRunnerFactory
+	systemdRunnerFactory = func() SystemdRunner { return fake }
+	t.Cleanup(func() { systemdRunnerFactory = oldFactory })
+
+	input := "r\n2\nhttps://controller.example.test/base/\nnew-controller-secret\ny\nremote-route\n"
+	if err := RunInteractive(Options{HomeDir: home, Stdin: bufio.NewReader(strings.NewReader(input))}); err != nil {
+		t.Fatalf("managed to external transition: %v", err)
+	}
+
+	cfg, err := config.Load(filepath.Join(ConfigDir(home), "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SingBox.Controller != "https://controller.example.test/base/" {
+		t.Fatalf("external controller = %q", cfg.SingBox.Controller)
+	}
+	if _, err := os.Stat(filepath.Join(ConfigDir(home), "sing-box.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale managed sing-box state remains: %v", err)
+	}
+	secret, err := os.ReadFile(filepath.Join(ConfigDir(home), "controller-secret"))
+	if err != nil || string(secret) != "new-controller-secret\n" {
+		t.Fatalf("external controller secret = %q err=%v", secret, err)
+	}
+	if _, err := os.Stat(unitPath); !os.IsNotExist(err) {
+		t.Fatalf("stale managed systemd unit remains: %v", err)
+	}
+	if containsCall(fake.calls, "--user restart frostgate-singbox.service") {
+		t.Fatalf("external transition restarted the removed local sidecar: %v", fake.calls)
+	}
+}
+
+func TestDirectOnlyConversionLeavesUnownedUnitAlone(t *testing.T) {
+	home, oldConfig, oldSing, oldSecret, unitPath := existingSetupForTransaction(t)
 	original := []byte("[Unit]\nDescription=unrelated service\n")
 	if err := os.WriteFile(unitPath, original, 0o644); err != nil {
 		t.Fatal(err)
@@ -249,8 +291,8 @@ func TestDirectOnlyConversionLeavesUnownedUnitAlone(t *testing.T) {
 	oldFactory := systemdRunnerFactory
 	systemdRunnerFactory = func() SystemdRunner { return fake }
 	t.Cleanup(func() { systemdRunnerFactory = oldFactory })
-	if err := RunInteractive(Options{HomeDir: home, Stdin: bufio.NewReader(strings.NewReader("r\n3\n\n"))}); err != nil {
-		t.Fatalf("direct-only conversion: %v", err)
+	if err := RunInteractive(Options{HomeDir: home, Stdin: bufio.NewReader(strings.NewReader("r\n3\n\n"))}); err == nil {
+		t.Fatal("direct-only conversion unexpectedly removed ambiguous state")
 	}
 	got, err := os.ReadFile(unitPath)
 	if err != nil || string(got) != string(original) {
@@ -258,6 +300,15 @@ func TestDirectOnlyConversionLeavesUnownedUnitAlone(t *testing.T) {
 	}
 	if len(fake.calls) != 0 {
 		t.Fatalf("unowned unit caused systemd calls: %v", fake.calls)
+	}
+	for _, want := range []struct {
+		name string
+		data []byte
+	}{{"config.yaml", oldConfig}, {"sing-box.json", oldSing}, {"controller-secret", oldSecret}} {
+		got, readErr := os.ReadFile(filepath.Join(ConfigDir(home), want.name))
+		if readErr != nil || string(got) != string(want.data) {
+			t.Fatalf("ambiguous cleanup changed %s: %q, %v", want.name, got, readErr)
+		}
 	}
 }
 

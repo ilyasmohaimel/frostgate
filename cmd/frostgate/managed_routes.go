@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/route"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
@@ -27,10 +29,10 @@ var (
 	writeSystemdUnit = setup.WriteSystemdUnit
 	newSidecarRunner = managedconfig.DefaultSidecarRunnerForService
 	runUserSystemctl = func(args ...string) error {
-		return exec.Command("systemctl", append([]string{"--user"}, args...)...).Run()
+		return process.Run(context.Background(), process.ServiceTimeout, "systemctl", append([]string{"--user"}, args...)...)
 	}
 	runUserSystemctlOutput = func(args ...string) ([]byte, error) {
-		return exec.Command("systemctl", append([]string{"--user"}, args...)...).CombinedOutput()
+		return process.Output(context.Background(), process.QuickTimeout, "systemctl", append([]string{"--user"}, args...)...)
 	}
 )
 
@@ -447,6 +449,16 @@ func copyLegacyStateFile(src, dst string) error {
 // parses with route.ParseShareLink, updates the managed sing-box model, and
 // installs sing-box.json and config.yaml in one transaction.
 func addManagedRoute(dir, configPath, link, tag string, runner *managedconfig.SidecarRunner) (managedRouteResult, error) {
+	return addManagedRouteContext(context.Background(), dir, configPath, link, tag, runner)
+}
+
+func addManagedRouteContext(ctx context.Context, dir, configPath, link, tag string, runner *managedconfig.SidecarRunner) (managedRouteResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return managedRouteResult{}, err
+	}
 	if err := route.ValidateName(tag); err != nil {
 		return managedRouteResult{}, fmt.Errorf("invalid route name %q: %w", tag, err)
 	}
@@ -474,13 +486,20 @@ func addManagedRoute(dir, configPath, link, tag string, runner *managedconfig.Si
 		mg.AddHysteria(r.Hysteria)
 	}
 
-	if err := commitManagedRoutes(mg, configPath, []string{tag}, runner); err != nil {
+	if err := commitManagedRoutesContext(ctx, mg, configPath, []string{tag}, runner); err != nil {
 		return managedRouteResult{}, err
 	}
 	return managedRouteResult{Tag: tag, ConfigPath: configPath}, nil
 }
 
 func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []string, runner *managedconfig.SidecarRunner) error {
+	return commitManagedRoutesContext(context.Background(), mg, configPath, tags, runner)
+}
+
+func commitManagedRoutesContext(ctx context.Context, mg *managedconfig.Managed, configPath string, tags []string, runner *managedconfig.SidecarRunner) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	identity := profileForPaths(configPath, mg.Dir)
 	newSidecar := !mg.HasManagedSidecar()
 	needsProfileBindings := newSidecar || (identity.ID != profile.DefaultID && !mg.UsesProfileBindings(identity.ControllerAddr, identity.BenchmarkAddr))
@@ -488,6 +507,9 @@ func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []st
 		if err := identity.CheckAvailable(); err != nil {
 			return err
 		}
+	}
+	if err := ensureManagedUnitOwnership(setup.ServiceUnitPath(identity.Service), filepath.Join(mg.Dir, "sing-box.json")); err != nil {
+		return err
 	}
 	configData, controller, configuredSecret, err := routeConfigCandidate(configPath, mg.Dir, tags, identity, newSidecar)
 	if err != nil {
@@ -523,7 +545,7 @@ func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []st
 		}
 		runner = newSidecarRunner(controller, mg.Secret, identity.Service)
 	}
-	if err := mg.SaveTransactionWithConfig(runner, configPath, configData); err != nil {
+	if err := mg.SaveTransactionWithConfigContext(ctx, runner, configPath, configData); err != nil {
 		if restoreUnit != nil {
 			var recovery error
 			quiesced := true
@@ -563,6 +585,27 @@ func commitManagedRoutes(mg *managedconfig.Managed, configPath string, tags []st
 	return nil
 }
 
+func ensureManagedUnitOwnership(path, configPath string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect systemd unit: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("existing systemd unit does not prove Frostgate ownership")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read systemd unit: %w", err)
+	}
+	if !setup.IsOwnedSystemdUnit(string(data), configPath) {
+		return fmt.Errorf("existing systemd unit does not prove Frostgate ownership")
+	}
+	return nil
+}
+
 // writeManagedUnit snapshots a profile unit so failed first-route bootstraps
 // do not leave a sidecar registered for a configuration that was rolled back.
 func writeManagedUnit(path, binaryPath, configDir string) (func() error, bool, error) {
@@ -582,6 +625,9 @@ func writeManagedUnit(path, binaryPath, configDir string) (func() error, bool, e
 	existed := err == nil
 	if err != nil && !os.IsNotExist(err) {
 		return nil, false, fmt.Errorf("snapshot service unit: %w", err)
+	}
+	if existed && !setup.IsOwnedSystemdUnit(string(before), filepath.Join(configDir, "sing-box.json")) {
+		return nil, false, fmt.Errorf("existing systemd unit does not prove Frostgate ownership")
 	}
 	if err := writeSystemdUnit(path, binaryPath, configDir); err != nil {
 		return nil, false, err
@@ -766,7 +812,10 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 			maxPriority = priority
 		}
 	}
-	nextPriority := ((maxPriority / 10) + 1) * 10
+	nextPriority, err := config.NextPriority(maxPriority)
+	if err != nil {
+		return nil, err
+	}
 	for _, tag := range tags {
 		for _, endpoint := range endpoints.Content {
 			if endpoint.Kind != yaml.MappingNode {
@@ -787,6 +836,9 @@ func appendSingBoxEndpoints(raw []byte, tags []string) ([]byte, error) {
 			return nil, fmt.Errorf("encode endpoint: %w", err)
 		}
 		endpoints.Content = append(endpoints.Content, endpoint.Content[0])
+		if nextPriority > int(^uint(0)>>1)-10 {
+			return nil, fmt.Errorf("priority overflow while adding route %q", tag)
+		}
 		nextPriority += 10
 	}
 	data, err := yaml.Marshal(&doc)

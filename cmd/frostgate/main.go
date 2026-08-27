@@ -30,9 +30,11 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/doctor"
 	"github.com/ilyasmohaimel/frostgate/internal/history"
 	"github.com/ilyasmohaimel/frostgate/internal/importer"
+	"github.com/ilyasmohaimel/frostgate/internal/lockfile"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/network"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/ranking"
 	"github.com/ilyasmohaimel/frostgate/internal/recommend"
@@ -54,13 +56,21 @@ func init() {
 	}
 }
 
-func main() { os.Exit(run()) }
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	os.Exit(runContext(ctx))
+}
 
 func run() int {
+	return runContext(context.Background())
+}
+
+func runContext(ctx context.Context) int {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
 		switch os.Args[1] {
 		case "setup":
-			return handleSetup(os.Args[2:])
+			return handleSetupContext(ctx, os.Args[2:])
 		case "doctor":
 			fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 			fs.SetOutput(io.Discard)
@@ -85,17 +95,17 @@ func run() int {
 				fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 				return 3
 			}
-			return runDoctor(path, managedDir, *verbose)
+			return runDoctorContext(ctx, path, managedDir, *verbose)
 		case "add":
-			return handleAdd(os.Args[2:])
+			return handleAddContext(ctx, os.Args[2:])
 		case "import":
-			return handleImport(os.Args[2:])
+			return handleImportContext(ctx, os.Args[2:])
 		case "test":
-			return handleTest(os.Args[2:])
+			return handleTestContext(ctx, os.Args[2:])
 		case "benchmark":
-			return handleBenchmark(os.Args[2:])
+			return handleBenchmarkContext(ctx, os.Args[2:])
 		case "diagnose":
-			return handleDiagnose(os.Args[2:])
+			return handleDiagnoseContext(ctx, os.Args[2:])
 		case "network-check", "network_check":
 			return handleNetworkCheck(os.Args[2:])
 		case "compare":
@@ -157,7 +167,7 @@ func run() int {
 		if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 			home = h
 		}
-		if err := runInteractiveSetup(home); err != nil {
+		if err := runInteractiveSetupContext(ctx, home); err != nil {
 			fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
 			return 3
 		}
@@ -169,7 +179,7 @@ func run() int {
 			fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 			return 3
 		}
-		return runDoctor(path, managedDir, *verbose)
+		return runDoctorContext(ctx, path, managedDir, *verbose)
 	}
 	resolved, managedDir, pathErr := commandPathsChecked(*cfgPath)
 	if pathErr != nil {
@@ -195,11 +205,13 @@ func run() int {
 		}
 		return 3
 	}
+	if *timeout < 0 {
+		fmt.Fprintln(os.Stderr, "--timeout must be non-negative")
+		return 3
+	}
 	if *timeout > 0 {
 		applyTimeoutOverride(cfg, *timeout)
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 	if *watch {
 		if *interval <= 0 {
 			fmt.Fprintln(os.Stderr, "--interval must be positive in --watch mode")
@@ -214,7 +226,10 @@ func run() int {
 	res := probe.Run(ctx, cfg)
 	profileID := historyProfileForPaths(resolved, managedDir)
 	rec := newRecorder(cfg, profileID)
-	historyErr := rec.Record(history.FromProbeResults(res, nil, "", profileID))
+	var historyErr error
+	if ctx.Err() == nil {
+		historyErr = rec.Record(history.FromProbeResults(res, nil, "", profileID))
+	}
 	if closeErr := rec.Close(); closeErr != nil {
 		historyErr = errors.Join(historyErr, closeErr)
 	}
@@ -232,6 +247,10 @@ func run() int {
 }
 
 func runDoctor(path, managedDir string, verbose bool) int {
+	return runDoctorContext(context.Background(), path, managedDir, verbose)
+}
+
+func runDoctorContext(_ context.Context, path, managedDir string, verbose bool) int {
 	if _, err := config.Load(path); err != nil {
 		printConfigError(err)
 		return 3
@@ -247,6 +266,10 @@ func runDoctor(path, managedDir string, verbose bool) int {
 }
 
 func handleSetup(args []string) int {
+	return handleSetupContext(context.Background(), args)
+}
+
+func handleSetupContext(ctx context.Context, args []string) int {
 	if len(args) > 0 {
 		if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
 			fmt.Fprintln(os.Stdout, "usage: frostgate setup")
@@ -263,7 +286,7 @@ func handleSetup(args []string) int {
 	if h := os.Getenv("FROSTGATE_TEST_HOME"); h != "" {
 		home = h
 	}
-	if err := runInteractiveSetup(home); err != nil {
+	if err := runInteractiveSetupContext(ctx, home); err != nil {
 		fmt.Fprintln(os.Stderr, "setup:", sanitizeError(err))
 		return 3
 	}
@@ -271,10 +294,21 @@ func handleSetup(args []string) int {
 }
 
 func runInteractiveSetup(home string) error {
+	return runInteractiveSetupContext(context.Background(), home)
+}
+
+func runInteractiveSetupContext(ctx context.Context, home string) error {
+	cfgPath := filepath.Join(setup.ConfigDir(home), "config.yaml")
+	lock, err := lockfile.Acquire(ctx, "profile:"+profile.CanonicalPath(cfgPath))
+	if err != nil {
+		return fmt.Errorf("profile is busy: %w", err)
+	}
+	defer lock.Close()
 	return setup.RunInteractive(setup.Options{
 		HomeDir: home,
+		Context: ctx,
 		AddRoute: func(dir, link, tag string) error {
-			result, err := addManagedRoute(dir, filepath.Join(dir, "config.yaml"), strings.TrimSpace(link), tag, nil)
+			result, err := addManagedRouteContext(ctx, dir, filepath.Join(dir, "config.yaml"), strings.TrimSpace(link), tag, nil)
 			if err != nil {
 				return err
 			}
@@ -309,6 +343,10 @@ func printHelp() {
 
 // --- add ---
 func handleAdd(args []string) int {
+	return handleAddContext(context.Background(), args)
+}
+
+func handleAddContext(ctx context.Context, args []string) int {
 	nameFlag := ""
 	cfgPath := ""
 	var positionals []string
@@ -348,6 +386,12 @@ func handleAdd(args []string) int {
 		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 		return 3
 	}
+	lock, lockErr := lockfile.Acquire(ctx, "profile:"+profile.CanonicalPath(cfgPath2))
+	if lockErr != nil {
+		fmt.Fprintln(os.Stderr, "profile:", sanitizeError(lockErr))
+		return 3
+	}
+	defer lock.Close()
 	rollbackMigration, finalizeMigration, err := prepareManagedStateWithRollback(cfgPath2, dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(err))
@@ -365,7 +409,7 @@ func handleAdd(args []string) int {
 		tag = route.SanitizeName(route.DeriveNameFromLink(link, 1))
 	}
 	fmt.Println("Importing route...")
-	result, err := addManagedRoute(dir, cfgPath2, link, tag, nil)
+	result, err := addManagedRouteContext(ctx, dir, cfgPath2, link, tag, nil)
 	if err != nil {
 		if rollbackErr := rollbackMigration(); rollbackErr != nil {
 			err = errors.Join(err, rollbackErr)
@@ -401,8 +445,8 @@ func handleAdd(args []string) int {
 		}
 	}
 	if ep != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.ProbeBudget(*ep))
-		res := probe.ProbeEndpoint(ctx, cfg, *ep)
+		probeCtx, cancel := context.WithTimeout(ctx, cfg.ProbeBudget(*ep))
+		res := probe.ProbeEndpoint(probeCtx, cfg, *ep)
 		cancel()
 		if res.Status == "down" {
 			fmt.Printf("end-to-end test failed: %s\n", sanitizeError(fmt.Errorf("%s", res.Category)))
@@ -433,6 +477,10 @@ func sanitizeOutput(s string) string {
 
 // --- import ---
 func handleImport(args []string) int {
+	return handleImportContext(context.Background(), args)
+}
+
+func handleImportContext(ctx context.Context, args []string) int {
 	cfgPath := ""
 	allowInsecure := false
 	var positionals []string
@@ -464,9 +512,15 @@ func handleImport(args []string) int {
 		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 		return 3
 	}
+	lock, lockErr := lockfile.Acquire(ctx, "profile:"+profile.CanonicalPath(cfgPath2))
+	if lockErr != nil {
+		fmt.Fprintln(os.Stderr, "profile:", sanitizeError(lockErr))
+		return 3
+	}
+	defer lock.Close()
 	subURL := positionals[0]
 	fmt.Fprintln(os.Stderr, "Fetching subscription...")
-	data, err := importer.FetchSubscriptionWithOpts(context.Background(), subURL, allowInsecure)
+	data, err := importer.FetchSubscriptionWithOpts(ctx, subURL, allowInsecure)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fetch failed: %v\n", sanitizeError(err))
 		return 3
@@ -564,7 +618,7 @@ func handleImport(args []string) int {
 	for _, imported := range toAdd {
 		tags = append(tags, imported.Tag)
 	}
-	if err := commitManagedRoutes(mg, cfgPath2, tags, nil); err != nil {
+	if err := commitManagedRoutesContext(ctx, mg, cfgPath2, tags, nil); err != nil {
 		if rollbackErr := rollbackMigration(); rollbackErr != nil {
 			err = errors.Join(err, rollbackErr)
 		}
@@ -602,8 +656,8 @@ func handleImport(args []string) int {
 		fmt.Fprintln(os.Stderr, "imported routes were not present in the saved config")
 		return 3
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), probeRunBudget(&importedCfg))
-	results := probe.Run(ctx, &importedCfg)
+	probeCtx, cancel := context.WithTimeout(ctx, probeRunBudget(&importedCfg))
+	results := probe.Run(probeCtx, &importedCfg)
 	cancel()
 	fmt.Println("\nTESTING...")
 	for i, r := range results {
@@ -623,6 +677,10 @@ func handleImport(args []string) int {
 // --- test ---
 
 func handleTest(args []string) (exitCode int) {
+	return handleTestContext(context.Background(), args)
+}
+
+func handleTestContext(ctx context.Context, args []string) (exitCode int) {
 	jsonOut := false
 	var positionals []string
 	for i := 0; i < len(args); i++ {
@@ -727,17 +785,17 @@ func handleTest(args []string) (exitCode int) {
 		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("secure temporary sing-box config: %w", err), 3)
 	}
 	if sbPath, err := exec.LookPath("sing-box"); err == nil {
-		cmd := exec.Command(sbPath, "check", "-c", singPath)
+		cmd, cancel := process.CommandContext(ctx, process.ValidationTimeout, sbPath, "check", "-c", singPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
+			cancel()
 			return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box check failed: %s", sanitizeOutput(string(out))), 3)
 		}
+		cancel()
 	} else {
 		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box not found"), 3)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 40*time.Second)
 	defer cancel()
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	sbPath, err := exec.LookPath("sing-box")
 	if err != nil {
 		return testCommandFailure(jsonOut, r.Protocol, "error", fmt.Errorf("sing-box not found: %w", err), 3)
@@ -766,7 +824,15 @@ func handleTest(args []string) (exitCode int) {
 	client := singbox.New(controller, secret)
 	var ready bool
 	for i := 0; i < 25; i++ {
-		time.Sleep(200 * time.Millisecond)
+		readyTimer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !readyTimer.Stop() {
+				<-readyTimer.C
+			}
+			return testCommandFailure(jsonOut, r.Protocol, "error", ctx.Err(), 3)
+		case <-readyTimer.C:
+		}
 		cctx, ccancel := context.WithTimeout(ctx, 1*time.Second)
 		_, err := client.GetProxies(cctx)
 		ccancel()
@@ -853,6 +919,10 @@ func freePort() (int, error) {
 
 // --- benchmark ---
 func handleBenchmark(args []string) int {
+	return handleBenchmarkContext(context.Background(), args)
+}
+
+func handleBenchmarkContext(ctx context.Context, args []string) int {
 	networkLabel := ""
 	noSpeed := false
 	jsonOut := false
@@ -893,6 +963,12 @@ func handleBenchmark(args []string) int {
 		fmt.Fprintln(os.Stderr, sanitizeError(pathErr))
 		return 3
 	}
+	lock, lockErr := lockfile.Acquire(ctx, "profile:"+profile.CanonicalPath(cfgFile))
+	if lockErr != nil {
+		fmt.Fprintln(os.Stderr, "profile:", sanitizeError(lockErr))
+		return 3
+	}
+	defer lock.Close()
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		printConfigError(err)
@@ -902,7 +978,7 @@ func handleBenchmark(args []string) int {
 	// benchmark needs the managed listener, so it is the one read-oriented
 	// command that must complete a proven legacy migration before measuring.
 	// Otherwise it could silently use or report the wrong profile's listener.
-	if migrated, migrateErr := migrateLegacyProfileForBenchmarkIfNeeded(cfg, cfgFile, managedDir); migrateErr != nil {
+	if migrated, migrateErr := migrateLegacyProfileForBenchmarkIfNeededContext(ctx, cfg, cfgFile, managedDir); migrateErr != nil {
 		fmt.Fprintln(os.Stderr, sanitizeError(migrateErr))
 		return 3
 	} else if migrated {
@@ -950,8 +1026,6 @@ func handleBenchmark(args []string) int {
 			return 0
 		}
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 	results := probe.Run(ctx, cfg)
 	type benchRes struct {
 		Result     probe.Result      `json:"-"`
@@ -966,7 +1040,7 @@ func handleBenchmark(args []string) int {
 	downloads := map[string]float64{}
 	var benchmarkLifecycleErr error
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	proxyAddr, proxyUnavailableReason := benchmarkProxyAddr(cfg, cfgFile, managedDir)
+	proxyAddr, proxyUnavailableReason := benchmarkProxyAddrWithContext(ctx, cfg, cfgFile, managedDir, nil)
 	proxyConfigured := proxyAddr != ""
 	if !noSpeed {
 		measure := benchmark.MeasureSOCKSMbps
@@ -980,8 +1054,8 @@ func handleBenchmark(args []string) int {
 					if r.Status != "down" {
 						br.DownloadNA = proxyUnavailableReason
 					}
-				} else if probe.HasProxy(results) && probe.IsDirectBaseline(r.Endpoint) {
-					br.DownloadNA = "direct baseline"
+				} else if !probe.IsDirectBaseline(r.Endpoint) {
+					br.DownloadNA = "health check endpoint"
 				} else {
 					sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
 					mbps, _, measureErr := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
@@ -998,9 +1072,8 @@ func handleBenchmark(args []string) int {
 			for _, r := range results {
 				if r.Endpoint.Type != config.ProbeSingBox {
 					br := newBenchRes(r)
-					if probe.HasProxy(results) && probe.IsDirectBaseline(r.Endpoint) {
-						// Direct baseline is diagnostic only.
-						br.DownloadNA = "direct baseline"
+					if !probe.IsDirectBaseline(r.Endpoint) {
+						br.DownloadNA = "health check endpoint"
 					} else {
 						sctx, scancel := context.WithTimeout(ctx, 30*time.Second)
 						mbps, _, measureErr := benchmark.MeasureDirect(sctx, downloadURL, bytesPerRoute)
@@ -1064,7 +1137,7 @@ func handleBenchmark(args []string) int {
 	profileID := historyProfileForPaths(cfgFile, managedDir)
 	recCfg := newRecorder(cfg, profileID)
 	var historyErr error
-	if recCfg.Enabled() {
+	if recCfg.Enabled() && ctx.Err() == nil {
 		historyErr = recCfg.Record(history.FromProbeResults(results, func(name string) float64 { return downloads[name] }, networkLabel, profileID))
 	}
 	if closeErr := recCfg.Close(); closeErr != nil {
@@ -1154,7 +1227,7 @@ func compactReasons(reasons []string) string {
 }
 
 func benchmarkProxyAddr(cfg *config.Config, configPath, managedDir string) (string, string) {
-	return benchmarkProxyAddrWithRunner(cfg, configPath, managedDir, nil)
+	return benchmarkProxyAddrWithContext(context.Background(), cfg, configPath, managedDir, nil)
 }
 
 // benchmarkMeasurementCount is the transfer count used for the confirmation
@@ -1171,7 +1244,7 @@ func benchmarkMeasurementCount(cfg *config.Config) int {
 			uniqueOutbounds[endpoint.Outbound] = struct{}{}
 			continue
 		}
-		if endpoint.Type != config.ProbeSingBox {
+		if endpoint.Type != config.ProbeSingBox && probe.IsDirectBaseline(endpoint) {
 			direct++
 		}
 	}
@@ -1184,6 +1257,10 @@ func benchmarkMeasurementCount(cfg *config.Config) int {
 // state by definition, whereas doctor and diagnose must never start or move a
 // user service as a side effect.
 func migrateLegacyProfileForBenchmark(configPath, managedDir string) (bool, error) {
+	return migrateLegacyProfileForBenchmarkContext(context.Background(), configPath, managedDir)
+}
+
+func migrateLegacyProfileForBenchmarkContext(ctx context.Context, configPath, managedDir string) (bool, error) {
 	if managedDir != profile.StateDir(configPath) {
 		return false, nil
 	}
@@ -1209,7 +1286,7 @@ func migrateLegacyProfileForBenchmark(configPath, managedDir string) (bool, erro
 		}
 		return false, fmt.Errorf("load migrated managed config: %w", err)
 	}
-	if err := commitManagedRoutes(mg, configPath, nil, nil); err != nil {
+	if err := commitManagedRoutesContext(ctx, mg, configPath, nil, nil); err != nil {
 		if rollbackErr := rollback(); rollbackErr != nil {
 			err = errors.Join(err, rollbackErr)
 		}
@@ -1222,13 +1299,21 @@ func migrateLegacyProfileForBenchmark(configPath, managedDir string) (bool, erro
 }
 
 func migrateLegacyProfileForBenchmarkIfNeeded(cfg *config.Config, configPath, managedDir string) (bool, error) {
+	return migrateLegacyProfileForBenchmarkIfNeededContext(context.Background(), cfg, configPath, managedDir)
+}
+
+func migrateLegacyProfileForBenchmarkIfNeededContext(ctx context.Context, cfg *config.Config, configPath, managedDir string) (bool, error) {
 	if !hasProxyEndpoints(cfg) {
 		return false, nil
 	}
-	return migrateLegacyProfileForBenchmark(configPath, managedDir)
+	return migrateLegacyProfileForBenchmarkContext(ctx, configPath, managedDir)
 }
 
 func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir string, runner *managedconfig.SidecarRunner) (string, string) {
+	return benchmarkProxyAddrWithContext(context.Background(), cfg, configPath, managedDir, runner)
+}
+
+func benchmarkProxyAddrWithContext(ctx context.Context, cfg *config.Config, configPath, managedDir string, runner *managedconfig.SidecarRunner) (string, string) {
 	dir := managedDir
 	if dir == "" {
 		dir = filepath.Dir(configPath)
@@ -1236,8 +1321,9 @@ func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir str
 	if addr := cfg.BenchmarkProxyAddr(); addr != "" {
 		return addr, ""
 	}
-	if addr, ok := managedconfig.DiscoverBenchmarkProxy(dir); ok {
-		return addr, ""
+	mg, err := managedconfig.Load(dir)
+	if err != nil {
+		return "", "benchmark_proxy not configured"
 	}
 	seen := map[string]bool{}
 	var outbounds []string
@@ -1247,14 +1333,18 @@ func benchmarkProxyAddrWithRunner(cfg *config.Config, configPath, managedDir str
 			outbounds = append(outbounds, ep.Outbound)
 		}
 	}
-	mg, err := managedconfig.Load(dir)
-	if err != nil || !mg.IsLegacyManagedBenchmarkConfig(cfg.SingBox.Controller, outbounds) {
+	if mg.HasManagedSidecar() {
+		if addr, ok := managedconfig.DiscoverBenchmarkProxy(dir); ok {
+			return addr, ""
+		}
+	}
+	if !mg.IsLegacyManagedBenchmarkConfig(cfg.SingBox.Controller, outbounds) {
 		return "", "benchmark_proxy not configured"
 	}
 	// Legacy migration shares the normal managed-route transaction so an
 	// explicit profile gets matching config bindings and service lifecycle.
 	mg.AdoptLegacyRoutes()
-	if err := commitManagedRoutes(mg, configPath, nil, runner); err != nil {
+	if err := commitManagedRoutesContext(ctx, mg, configPath, nil, runner); err != nil {
 		return "", "managed benchmark migration failed"
 	}
 	if addr, ok := managedconfig.DiscoverBenchmarkProxy(dir); ok {
@@ -1292,6 +1382,13 @@ func saturatingPositiveProduct(left, right int64) int64 {
 
 // --- diagnose ---
 func handleDiagnose(args []string) int {
+	return handleDiagnoseContext(context.Background(), args)
+}
+
+func handleDiagnoseContext(ctx context.Context, args []string) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfgPath := ""
 	jsonOut := false
 	var positionals []string
@@ -2385,9 +2482,11 @@ func watchJSON(ctx context.Context, cfg *config.Config, profileID string, interv
 		default:
 		}
 		results := probe.Run(ctx, cfg)
-		if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
-			fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
-			return 3
+		if ctx.Err() == nil {
+			if _, err := rec.RecordThrottled(history.FromProbeResults(results, nil, "", profileID)); err != nil {
+				fmt.Fprintf(os.Stderr, "history: %s\n", sanitizeError(err))
+				return 3
+			}
 		}
 		line, err := report.NDJSONLine(results)
 		if err != nil {
@@ -2427,7 +2526,7 @@ func watchTUI(ctx context.Context, cfg *config.Config, profileID string, interva
 		}
 	}()
 	observer := func(results []probe.Result) {
-		if len(results) == 0 {
+		if len(results) == 0 || ctx.Err() != nil {
 			return
 		}
 		// Throttling (watch_interval) is owned by the recorder; manual

@@ -26,10 +26,12 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/history"
 	"github.com/ilyasmohaimel/frostgate/internal/importer"
+	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
 	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/route"
+	"github.com/ilyasmohaimel/frostgate/internal/setup"
 )
 
 var integrationBinary string
@@ -745,8 +747,8 @@ func TestBenchmarkDoesNotGuessProxyForExternalController(t *testing.T) {
 			if entry["download_na"] != "benchmark_proxy not configured" || entry["download_mbps"].(float64) != 0 {
 				t.Fatalf("external controller was assigned a guessed listener: %v", entry)
 			}
-			if f.benchmarkHits.Load() != 0 {
-				t.Fatal("external controller benchmark made a throughput request")
+			if f.benchmarkHits.Load() != 1 {
+				t.Fatalf("external controller benchmark made %d throughput requests; want only the direct baseline", f.benchmarkHits.Load())
 			}
 			return
 		}
@@ -767,6 +769,31 @@ func TestBenchmarkHumanOutputIsCompact(t *testing.T) {
 	if !strings.Contains(output, "Why: ") || !strings.Contains(output, " - ") {
 		t.Fatalf("benchmark reasons are not compact:\n%s", output)
 	}
+}
+
+func TestBenchmarkDoesNotAttributeHealthEndpointThroughput(t *testing.T) {
+	f := newCLIFixture(t)
+	data, err := os.ReadFile(f.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, []byte("  - name: redirect-check\n    type: http\n    url: "+f.controllerURL+"/redirect-check\n")...)
+	if err := os.WriteFile(f.configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--json")
+	doc := requireJSON(t, stdout).(map[string]any)
+	for _, raw := range doc["results"].([]any) {
+		entry := raw.(map[string]any)
+		result := entry["result"].(map[string]any)
+		if result["name"] == "redirect-check" {
+			if entry["download_mbps"].(float64) != 0 || entry["download_na"] != "health check endpoint" {
+				t.Fatalf("health endpoint received fake throughput: %v", entry)
+			}
+			return
+		}
+	}
+	t.Fatal("redirect-check result missing")
 }
 
 func extractBenchmarkProxy(data []byte) string {
@@ -962,6 +989,303 @@ func TestWatchJSONIsNDJSON(t *testing.T) {
 	}
 }
 
+func TestSetupInterruptRollsBackCandidateState(t *testing.T) {
+	home := t.TempDir()
+	xdgConfig := filepath.Join(home, "xdg-config")
+	configDir := filepath.Join(xdgConfig, "frostgate")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig := []byte("singbox:\n  controller: http://127.0.0.1:9090\n  test_url: https://example.test/\nendpoints:\n  - name: old-route\n    type: singbox\n    outbound: old-route\n")
+	oldSingBox := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	oldSecret := []byte("AUDIT_SECRET_UUID_123\n")
+	for _, file := range []struct {
+		name string
+		data []byte
+	}{{"config.yaml", oldConfig}, {"sing-box.json", oldSingBox}, {"controller-secret", oldSecret}} {
+		if err := os.WriteFile(filepath.Join(configDir, file.name), file.data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "sing-box-check-started")
+	singBox := filepath.Join(binDir, "sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo sing-box-test; exit 0; fi\nif [ \"$1\" = check ]; then : > \"$FROSTGATE_CHECK_MARKER\"; exec /usr/bin/sleep 60; fi\nexit 0\n"
+	if err := os.WriteFile(singBox, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?encryption=none&security=reality&sni=example.com&pbk=fixture-key&type=raw#new"
+	cmd := exec.Command(integrationBinary, "setup")
+	cmd.Dir = home
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"FROSTGATE_TEST_HOME="+home,
+		"XDG_CONFIG_HOME="+xdgConfig,
+		"XDG_RUNTIME_DIR="+filepath.Join(home, "runtime"),
+		"PATH="+binDir,
+		"FROSTGATE_CHECK_MARKER="+marker,
+	)
+	cmd.Stdin = strings.NewReader("r\n1\n" + link + "\nnew-route\nn\nn\n\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			t.Fatalf("sing-box check did not start\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 3 {
+		t.Fatalf("interrupted setup error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	for _, file := range []struct {
+		name string
+		data []byte
+	}{{"config.yaml", oldConfig}, {"sing-box.json", oldSingBox}, {"controller-secret", oldSecret}} {
+		got, readErr := os.ReadFile(filepath.Join(configDir, file.name))
+		if readErr != nil || !bytes.Equal(got, file.data) {
+			t.Fatalf("interrupted setup changed %s: %q err=%v", file.name, got, readErr)
+		}
+	}
+}
+
+func TestTestInterruptRemovesTemporarySecretState(t *testing.T) {
+	home := t.TempDir()
+	tmpRoot := filepath.Join(home, "tmp")
+	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "sing-box-check-started")
+	singBox := filepath.Join(binDir, "sing-box")
+	script := "#!/bin/sh\nif [ \"$1\" = check ]; then : > \"$FROSTGATE_CHECK_MARKER\"; exec /usr/bin/sleep 60; fi\nif [ \"$1\" = run ]; then exec /usr/bin/sleep 60; fi\nexit 0\n"
+	if err := os.WriteFile(singBox, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?encryption=none&security=reality&sni=example.com&pbk=fixture-key&type=raw#temporary"
+	cmd := exec.Command(integrationBinary, "test", link)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"TMPDIR="+tmpRoot,
+		"PATH="+binDir,
+		"FROSTGATE_CHECK_MARKER="+marker,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			t.Fatalf("sing-box check did not start\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 3 {
+		t.Fatalf("interrupted test error = %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	entries, err := os.ReadDir(tmpRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary test state remains after interrupt: %v", entries)
+	}
+}
+
+func TestConcurrentCLIAddsPreserveBothRoutes(t *testing.T) {
+	home := t.TempDir()
+	xdgConfig := filepath.Join(home, "xdg-config")
+	configDir := filepath.Join(xdgConfig, "frostgate")
+	runtimeDir := filepath.Join(home, "runtime")
+	dataDir := filepath.Join(home, "xdg-data")
+	for _, dir := range []string{configDir, runtimeDir, dataDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	knownRoutes := map[string]bool{"existing-route": true}
+	var routesMu sync.RWMutex
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/proxies":
+			routesMu.RLock()
+			proxies := map[string]any{"frostgate-selector": map[string]any{"type": "selector", "now": "existing-route"}}
+			for routeName := range knownRoutes {
+				proxies[routeName] = map[string]any{"type": "vless"}
+			}
+			routesMu.RUnlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"proxies": proxies})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/delay"):
+			_ = json.NewEncoder(w).Encode(map[string]int{"delay": 1})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer controller.Close()
+
+	existing := &setup.VLESSOutbound{
+		Tag: "existing-route", Server: "203.0.113.10", ServerPort: 443,
+		UUID: "11111111-1111-4111-8111-111111111111", SNI: "example.com",
+		PBK: "fixture-key", FP: "chrome", Network: "tcp",
+	}
+	secret := "AUDIT_SECRET_CONTROLLER_456"
+	singData, err := setup.GenerateSingBoxConfig(secret, []*setup.VLESSOutbound{existing}, nil, configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var singMap map[string]any
+	if err := json.Unmarshal(singData, &singMap); err != nil {
+		t.Fatal(err)
+	}
+	experimental := singMap["experimental"].(map[string]any)
+	clashAPI := experimental["clash_api"].(map[string]any)
+	clashAPI["external_controller"] = strings.TrimPrefix(controller.URL, "http://")
+	singData, err = json.Marshal(singMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "sing-box.json"), singData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "controller-secret"), []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "config.yaml")
+	configData := fmt.Sprintf(`singbox:
+  controller: %s
+  secret_file: %s
+  benchmark_proxy: 127.0.0.1:2080
+  test_url: %s
+history:
+  enabled: false
+endpoints:
+  - name: existing-route
+    type: singbox
+    outbound: existing-route
+`, controller.URL, filepath.Join(configDir, "controller-secret"), controller.URL+"/health")
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(home, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	singBox := filepath.Join(binDir, "sing-box")
+	if err := os.WriteFile(singBox, []byte("#!/bin/sh\nif [ \"$1\" = check ]; then exit 0; fi\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	systemctl := filepath.Join(binDir, "systemctl")
+	systemctlScript := "#!/bin/sh\n/usr/bin/sleep 0.03\nif [ \"$2\" = is-active ]; then echo active; fi\nexit 0\n"
+	if err := os.WriteFile(systemctl, []byte(systemctlScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"HOME="+home,
+		"FROSTGATE_TEST_HOME="+home,
+		"XDG_CONFIG_HOME="+xdgConfig,
+		"XDG_DATA_HOME="+dataDir,
+		"XDG_RUNTIME_DIR="+runtimeDir,
+		"PATH="+binDir+":/usr/bin:/bin",
+	)
+	for round := 0; round < 3; round++ {
+		routeA := fmt.Sprintf("route-a-%d", round)
+		routeB := fmt.Sprintf("route-b-%d", round)
+		linkA := fmt.Sprintf("vless://22222222-2222-4222-8222-%012d@203.0.113.%d:443?security=reality&type=tcp&sni=example.com&pbk=fixture-key#%s", round+1, 20+round, routeA)
+		linkB := fmt.Sprintf("vless://33333333-3333-4333-8333-%012d@203.0.113.%d:443?security=reality&type=tcp&sni=example.com&pbk=fixture-key#%s", round+1, 30+round, routeB)
+		routesMu.Lock()
+		knownRoutes[routeA] = true
+		knownRoutes[routeB] = true
+		routesMu.Unlock()
+		type result struct {
+			name   string
+			stdout string
+			stderr string
+			err    error
+		}
+		results := make(chan result, 2)
+		for _, command := range []struct{ name, link string }{{routeA, linkA}, {routeB, linkB}} {
+			command := command
+			go func() {
+				cmd := exec.Command(integrationBinary, "add", "--config", configPath, "--name", command.name, command.link)
+				cmd.Env = env
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				err := cmd.Run()
+				results <- result{name: command.name, stdout: stdout.String(), stderr: stderr.String(), err: err}
+			}()
+		}
+		for i := 0; i < 2; i++ {
+			got := <-results
+			if got.err != nil {
+				t.Fatalf("concurrent add %s failed: %v\nstdout=%s\nstderr=%s", got.name, got.err, got.stdout, got.stderr)
+			}
+		}
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := map[string]bool{}
+	for _, endpoint := range cfg.Endpoints {
+		if endpoint.Type == config.ProbeSingBox {
+			endpoints[endpoint.Outbound] = true
+		}
+	}
+	managed, err := managedconfig.Load(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedRoutes := map[string]bool{}
+	for _, route := range managed.VLESS {
+		managedRoutes[route.Tag] = true
+	}
+	for routeName := range knownRoutes {
+		if !endpoints[routeName] || !managedRoutes[routeName] {
+			t.Fatalf("route %q missing from config/state: config=%v managed=%v", routeName, endpoints[routeName], managedRoutes[routeName])
+		}
+	}
+}
+
 func startSOCKSRelay(t *testing.T) (string, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1070,6 +1394,14 @@ func TestRootFlagExitContract(t *testing.T) {
 	}
 }
 
+func TestNegativeTimeoutOverrideIsRejected(t *testing.T) {
+	f := newCLIFixture(t)
+	_, stderr, code := runCLI(t, f.env(), "--timeout=-1s")
+	if code != 3 || !strings.Contains(string(stderr), "non-negative") {
+		t.Fatalf("negative timeout: code=%d stderr=%q", code, stderr)
+	}
+}
+
 func TestBenchmarkMeasurementCountIncludesDirectAndUniqueOutbounds(t *testing.T) {
 	cfg := &config.Config{Endpoints: []config.Endpoint{
 		{Name: "direct", Type: config.ProbeHTTP},
@@ -1155,8 +1487,8 @@ func TestBenchmarkAliasesMeasureEachOutboundOnceAndFanOut(t *testing.T) {
 	}
 	stdout, _, _ := runCLI(t, f.env(), "benchmark", "--json")
 	doc := requireJSON(t, stdout).(map[string]any)
-	if got := f.benchmarkHits.Load(); got != 1 {
-		t.Fatalf("benchmark transfers = %d, want one unique outbound transfer", got)
+	if got := f.benchmarkHits.Load(); got != 2 {
+		t.Fatalf("benchmark transfers = %d, want one unique outbound plus the direct baseline", got)
 	}
 	measured := map[string]bool{}
 	for _, raw := range doc["results"].([]any) {

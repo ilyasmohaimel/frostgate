@@ -36,6 +36,10 @@ type setupTransaction struct {
 	// candidateServiceInstalled is set only after the newly written unit has
 	// been reloaded, enabled, restarted, and verified active.
 	candidateServiceInstalled bool
+	// candidateManaged distinguishes a Frostgate-owned local sidecar from an
+	// external/manual controller configuration.
+	candidateManaged         bool
+	preserveControllerSecret bool
 }
 
 var systemdRunnerFactory = func() SystemdRunner { return execSystemdRunner{} }
@@ -46,7 +50,7 @@ func beginSetupTransaction(dir string) (*setupTransaction, error) {
 		service: "frostgate-singbox.service",
 		runner:  systemdRunnerFactory(),
 	}
-	for _, name := range []string{"config.yaml", "sing-box.json", "controller-secret"} {
+	for _, name := range []string{"config.yaml", "sing-box.json", "controller-secret", "cache.db", "sing-box.log"} {
 		snapshot, err := snapshotSetupPath(filepath.Join(dir, name))
 		if err != nil {
 			return nil, fmt.Errorf("snapshot existing Frostgate file: %w", err)
@@ -164,7 +168,7 @@ func (t *setupTransaction) finish(candidateHasProxy bool) error {
 	if t == nil {
 		return nil
 	}
-	if !candidateHasProxy {
+	if !candidateHasProxy || !t.candidateManaged {
 		return t.removeOwnedSidecar(true)
 	}
 	// A user who declines a service during reconfigure selected the documented
@@ -177,6 +181,9 @@ func (t *setupTransaction) finish(candidateHasProxy bool) error {
 }
 
 func (t *setupTransaction) removeOwnedSidecar(removeState bool) error {
+	if t.unit.exists && !t.state.owned {
+		return fmt.Errorf("existing systemd unit does not prove Frostgate ownership; refusing sidecar cleanup")
+	}
 	if t.unit.exists && t.state.owned {
 		if err := t.runner.Run("systemctl", "--user", "disable", "--now", t.service); err != nil {
 			return fmt.Errorf("stop Frostgate sidecar: %w", err)
@@ -197,7 +204,8 @@ func (t *setupTransaction) removeOwnedSidecar(removeState bool) error {
 	}
 	if removeState {
 		for _, snapshot := range t.files {
-			if filepath.Base(snapshot.path) == "config.yaml" {
+			base := filepath.Base(snapshot.path)
+			if base == "config.yaml" || (base == "controller-secret" && t.preserveControllerSecret) {
 				continue
 			}
 			if err := os.Remove(snapshot.path); err != nil && !os.IsNotExist(err) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ilyasmohaimel/frostgate/internal/directhttp"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
 
@@ -126,12 +127,11 @@ func checkDirectStatus(ctx context.Context, url string) (string, string) {
 	return "FAIL", fmt.Sprintf("status %d", resp.StatusCode)
 }
 
-var directMatrixClient = &http.Client{
-	Timeout: 6 * time.Second,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var directMatrixClient = func() *http.Client {
+	client := directhttp.ClientWithTimeout(6 * time.Second)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	return client
+}()
 
 // DefaultDestinations is used when no network_check.destinations are
 // configured.

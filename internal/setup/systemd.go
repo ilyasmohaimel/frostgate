@@ -1,11 +1,13 @@
 package setup
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 )
 
 type SystemdRunner interface {
@@ -13,14 +15,27 @@ type SystemdRunner interface {
 	Output(name string, args ...string) ([]byte, error)
 }
 
+type contextSystemdRunner interface {
+	RunContext(ctx context.Context, name string, args ...string) error
+	OutputContext(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
 type execSystemdRunner struct{}
 
 func (execSystemdRunner) Run(name string, args ...string) error {
-	return exec.Command(name, args...).Run()
+	return process.Run(context.Background(), process.ServiceTimeout, name, args...)
 }
 
 func (execSystemdRunner) Output(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).Output()
+	return process.Output(context.Background(), process.QuickTimeout, name, args...)
+}
+
+func (execSystemdRunner) RunContext(ctx context.Context, name string, args ...string) error {
+	return process.Run(ctx, process.ServiceTimeout, name, args...)
+}
+
+func (execSystemdRunner) OutputContext(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return process.Output(ctx, process.QuickTimeout, name, args...)
 }
 
 // BuildSystemdUnit creates a user unit using the exact paths supplied by the
@@ -76,7 +91,7 @@ func systemdQuote(s string) string {
 }
 
 func InstallSystemdService(servicePath, binaryPath, configDir string, runner SystemdRunner) error {
-	return InstallSystemdServiceNamed(servicePath, "frostgate-singbox.service", binaryPath, configDir, runner)
+	return InstallSystemdServiceNamedContext(context.Background(), servicePath, "frostgate-singbox.service", binaryPath, configDir, runner)
 }
 
 func ServiceUnitPath(service string) string {
@@ -115,25 +130,50 @@ func WriteSystemdUnit(servicePath, binaryPath, configDir string) error {
 }
 
 func InstallSystemdServiceNamed(servicePath, service, binaryPath, configDir string, runner SystemdRunner) error {
+	return InstallSystemdServiceNamedContext(context.Background(), servicePath, service, binaryPath, configDir, runner)
+}
+
+func InstallSystemdServiceNamedContext(ctx context.Context, servicePath, service, binaryPath, configDir string, runner SystemdRunner) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if runner == nil {
 		runner = execSystemdRunner{}
+	}
+	run := func(args ...string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if contextRunner, ok := runner.(contextSystemdRunner); ok {
+			return contextRunner.RunContext(ctx, "systemctl", args...)
+		}
+		return runner.Run("systemctl", args...)
+	}
+	output := func(args ...string) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if contextRunner, ok := runner.(contextSystemdRunner); ok {
+			return contextRunner.OutputContext(ctx, "systemctl", args...)
+		}
+		return runner.Output("systemctl", args...)
 	}
 	if err := WriteSystemdUnit(servicePath, binaryPath, configDir); err != nil {
 		return err
 	}
-	if err := runner.Run("systemctl", "--user", "daemon-reload"); err != nil {
+	if err := run("--user", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemd daemon-reload: %w", err)
 	}
-	if err := runner.Run("systemctl", "--user", "enable", "--now", service); err != nil {
+	if err := run("--user", "enable", "--now", service); err != nil {
 		return fmt.Errorf("enable %s: %w", service, err)
 	}
 	// enable --now leaves an already active service running with its old
 	// configuration. Restart after daemon-reload so reconfigure actually
 	// activates the validated candidate.
-	if err := runner.Run("systemctl", "--user", "restart", service); err != nil {
+	if err := run("--user", "restart", service); err != nil {
 		return fmt.Errorf("restart %s: %w", service, err)
 	}
-	out, err := runner.Output("systemctl", "--user", "is-active", service)
+	out, err := output("--user", "is-active", service)
 	if err != nil {
 		return fmt.Errorf("check %s: %w", service, err)
 	}

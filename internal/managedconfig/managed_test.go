@@ -1,6 +1,7 @@
 package managedconfig
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -624,5 +625,54 @@ func TestSaveTransactionWithConfigRejectsInvalidCandidateBeforeMutation(t *testi
 	gotConfig, _ := os.ReadFile(configPath)
 	if string(gotSing) != string(originalSing) || string(gotConfig) != string(originalConfig) {
 		t.Fatal("invalid config candidate mutated files")
+	}
+}
+
+func TestSaveTransactionContextRollsBackWhenActivationIsCancelled(t *testing.T) {
+	d := tempDir(t)
+	configPath := filepath.Join(d, "config.yaml")
+	oldSing := []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
+	oldSecret := []byte("old-fixture-secret\n")
+	oldConfig := []byte("endpoints:\n  - name: old\n    type: http\n    url: https://example.test/\n")
+	for _, file := range []struct {
+		name string
+		data []byte
+	}{{"sing-box.json", oldSing}, {"controller-secret", oldSecret}, {"config.yaml", oldConfig}} {
+		if err := os.WriteFile(filepath.Join(d, file.name), file.data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Managed{Dir: d, Secret: "new-fixture-secret"}
+	m.AddVLESS(&setup.VLESSOutbound{Tag: "new", Server: "203.0.113.10", ServerPort: 443, UUID: "uuid", SNI: "example.com", PBK: "fixture-key"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activationCall := true
+	var rollbackRestart bool
+	runner := &SidecarRunner{
+		Validator: func([]byte) error { return nil },
+		RestartContext: func(got context.Context) error {
+			if activationCall {
+				activationCall = false
+				cancel()
+				return context.Canceled
+			}
+			rollbackRestart = true
+			return nil
+		},
+	}
+	if err := m.SaveTransactionWithConfigContext(ctx, runner, configPath, []byte("endpoints:\n  - name: new\n    type: singbox\n    outbound: new\n")); err == nil {
+		t.Fatal("cancelled activation unexpectedly succeeded")
+	}
+	if !rollbackRestart {
+		t.Fatal("rollback did not attempt to restore the sidecar")
+	}
+	for _, file := range []struct {
+		name string
+		want []byte
+	}{{"sing-box.json", oldSing}, {"controller-secret", oldSecret}, {"config.yaml", oldConfig}} {
+		got, err := os.ReadFile(filepath.Join(d, file.name))
+		if err != nil || string(got) != string(file.want) {
+			t.Fatalf("cancelled transaction changed %s: %q err=%v", file.name, got, err)
+		}
 	}
 }

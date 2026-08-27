@@ -1,11 +1,13 @@
 package importer
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -42,10 +44,10 @@ func FetchSubscriptionWithOpts(ctx context.Context, subURL string, allowInsecure
 	if err != nil {
 		return nil, fmt.Errorf("invalid url: %w", err)
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
+	if !strings.EqualFold(u.Scheme, "https") && !strings.EqualFold(u.Scheme, "http") {
 		return nil, fmt.Errorf("unsupported scheme %q (want https)", u.Scheme)
 	}
-	if u.Scheme == "http" && !allowInsecure {
+	if strings.EqualFold(u.Scheme, "http") && !allowInsecure {
 		return nil, fmt.Errorf("http subscription requires --allow-insecure-http (use https)")
 	}
 	if strings.EqualFold(u.Scheme, "file") || strings.EqualFold(u.Scheme, "data") || strings.EqualFold(u.Scheme, "javascript") {
@@ -58,17 +60,17 @@ func FetchSubscriptionWithOpts(ctx context.Context, subURL string, allowInsecure
 		return nil, err
 	}
 	req.Header.Set("User-Agent", UserAgent)
-	origIsHTTPS := u.Scheme == "https"
+	origIsHTTPS := strings.EqualFold(u.Scheme, "https")
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
 			}
-			if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
+			if !strings.EqualFold(req.URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "http") {
 				return fmt.Errorf("unsupported redirect scheme %q", req.URL.Scheme)
 			}
-			if origIsHTTPS && req.URL.Scheme == "http" && !allowInsecure {
+			if origIsHTTPS && strings.EqualFold(req.URL.Scheme, "http") && !allowInsecure {
 				return fmt.Errorf("https to http downgrade blocked (use --allow-insecure-http)")
 			}
 			return nil
@@ -181,7 +183,7 @@ func tryBase64Decode(data []byte) ([]byte, error) {
 }
 
 func isLikelyDecoded(b []byte) bool {
-	s := string(b)
+	s := strings.ToLower(string(b))
 	return strings.Contains(s, "vless://") || strings.Contains(s, "hysteria2://") || strings.Contains(s, "hy2://") || strings.Contains(s, "proxies:") || strings.Contains(s, "outbounds")
 }
 
@@ -239,8 +241,8 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 			uuid, _ := mm["uuid"].(string)
 			server, _ := mm["server"].(string)
 			portVal := mm["port"]
-			port := toInt(portVal)
-			if server == "" || port == 0 || uuid == "" {
+			port, portErr := importedPort(portVal)
+			if server == "" || portErr != nil || uuid == "" {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
@@ -412,24 +414,69 @@ func parseClashYAML(data []byte) (links []string, skipped []Skipped) {
 }
 
 func toInt(v any) int {
+	port, _ := importedPort(v)
+	return port
+}
+
+func importedPort(v any) (int, error) {
 	switch x := v.(type) {
 	case int:
-		return x
+		if x < 1 || x > 65535 {
+			return 0, fmt.Errorf("port must be 1-65535")
+		}
+		return x, nil
 	case int64:
-		return int(x)
+		if x < 1 || x > 65535 {
+			return 0, fmt.Errorf("port must be 1-65535")
+		}
+		return int(x), nil
 	case float64:
-		return int(x)
+		if math.IsNaN(x) || math.IsInf(x, 0) || math.Trunc(x) != x || x < 1 || x > 65535 {
+			return 0, fmt.Errorf("port must be an integer in 1-65535")
+		}
+		return int(x), nil
+	case json.Number:
+		if strings.ContainsAny(string(x), ".eE") {
+			return 0, fmt.Errorf("port must be a JSON integer in 1-65535")
+		}
+		n, err := strconv.ParseInt(string(x), 10, 64)
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("port must be a JSON integer in 1-65535")
+		}
+		return int(n), nil
 	case string:
-		n, _ := strconv.Atoi(x)
-		return n
+		n, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("port must be 1-65535")
+		}
+		return n, nil
 	}
-	return 0
+	return 0, fmt.Errorf("port must be an integer in 1-65535")
+}
+
+func nativePort(v any) (int, error) {
+	switch v.(type) {
+	case string, float64:
+		return 0, fmt.Errorf("port must be a JSON integer in 1-65535")
+	}
+	return importedPort(v)
 }
 
 func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&m); err != nil {
 		skipped = append(skipped, Skipped{Reason: "invalid json: " + err.Error(), Line: ""})
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			skipped = append(skipped, Skipped{Reason: "invalid json: multiple documents", Line: ""})
+		} else {
+			skipped = append(skipped, Skipped{Reason: "invalid json: " + err.Error(), Line: ""})
+		}
 		return
 	}
 	outbounds, ok := m["outbounds"].([]any)
@@ -447,9 +494,9 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 		switch typ {
 		case "vless":
 			server, _ := mm["server"].(string)
-			port := toInt(mm["server_port"])
+			port, portErr := nativePort(mm["server_port"])
 			uuid, _ := mm["uuid"].(string)
-			if server == "" || port == 0 || uuid == "" {
+			if server == "" || portErr != nil || uuid == "" {
 				skipped = append(skipped, Skipped{Reason: "malformed VLESS route", Line: typ})
 				continue
 			}
@@ -540,10 +587,14 @@ func parseSingBoxJSON(data []byte) (links []string, skipped []Skipped) {
 			links = append(links, link)
 		case "hysteria2":
 			server, _ := mm["server"].(string)
-			port := toInt(mm["server_port"])
+			port, portErr := nativePort(mm["server_port"])
 			password, _ := mm["password"].(string)
-			if server == "" || port == 0 || password == "" {
+			if server == "" || portErr != nil || password == "" {
 				skipped = append(skipped, Skipped{Reason: "malformed Hysteria2 route", Line: typ})
+				continue
+			}
+			if reason := nativeHysteriaReason(mm); reason != "" {
+				skipped = append(skipped, Skipped{Reason: reason, Line: typ})
 				continue
 			}
 			q := url.Values{}
@@ -670,6 +721,11 @@ func nativeVLESSReason(m map[string]any) string {
 			return "unsupported VLESS network"
 		}
 	}
+	if flow, ok := m["flow"]; ok {
+		if _, ok := flow.(string); !ok {
+			return "malformed VLESS flow"
+		}
+	}
 	if packet, ok := m["packet_encoding"]; ok {
 		if _, ok := packet.(string); !ok {
 			return "malformed VLESS packet encoding"
@@ -714,6 +770,20 @@ func nativeVLESSTLSReason(tlsRaw map[string]any) string {
 				return "unsupported VLESS uTLS setting: " + key
 			}
 		}
+		if enabled, present := utls["enabled"]; present {
+			value, ok := enabled.(bool)
+			if !ok {
+				return "malformed VLESS uTLS enabled setting"
+			}
+			if !value {
+				return "unsupported VLESS uTLS setting: enabled=false"
+			}
+		}
+		if fingerprint, present := utls["fingerprint"]; present {
+			if _, ok := fingerprint.(string); !ok {
+				return "malformed VLESS uTLS fingerprint"
+			}
+		}
 	}
 	if realityValue, present := tlsRaw["reality"]; present {
 		reality, ok := realityValue.(map[string]any)
@@ -727,6 +797,18 @@ func nativeVLESSTLSReason(tlsRaw map[string]any) string {
 				return "unsupported VLESS REALITY setting: " + key
 			}
 		}
+		if enabled, present := reality["enabled"]; present {
+			if _, ok := enabled.(bool); !ok {
+				return "malformed VLESS REALITY enabled setting"
+			}
+		}
+		for _, key := range []string{"public_key", "short_id", "spider_x"} {
+			if value, present := reality[key]; present {
+				if _, ok := value.(string); !ok {
+					return "malformed VLESS REALITY " + key
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -735,6 +817,85 @@ func nativeVLESSTLSReason(tlsRaw map[string]any) string {
 // capability check without exposing the detailed rejection reason.
 func nativeVLESSRaw(m map[string]any) bool {
 	return nativeVLESSReason(m) == ""
+}
+
+func nativeHysteriaReason(m map[string]any) string {
+	for key := range m {
+		switch key {
+		case "type", "tag", "server", "server_port", "password", "network", "obfs", "tls":
+		default:
+			return "unsupported Hysteria2 setting: " + key
+		}
+	}
+	if networkValue, present := m["network"]; present {
+		network, ok := networkValue.(string)
+		if !ok {
+			return "malformed Hysteria2 network"
+		}
+		if network != "" && !strings.EqualFold(network, "tcp") && !strings.EqualFold(network, "udp") {
+			return "unsupported Hysteria2 network"
+		}
+	}
+	if tlsValue, ok := m["tls"]; ok {
+		tlsRaw, ok := tlsValue.(map[string]any)
+		if !ok {
+			return "malformed Hysteria2 TLS settings"
+		}
+		for key := range tlsRaw {
+			switch key {
+			case "enabled", "server_name", "insecure":
+			default:
+				return "unsupported Hysteria2 TLS setting: " + key
+			}
+		}
+		if enabledValue, present := tlsRaw["enabled"]; present {
+			enabled, ok := enabledValue.(bool)
+			if !ok {
+				return "malformed Hysteria2 TLS enabled setting"
+			}
+			if !enabled {
+				return "unsupported Hysteria2 TLS setting: enabled=false"
+			}
+		}
+		if serverName, present := tlsRaw["server_name"]; present {
+			if _, ok := serverName.(string); !ok {
+				return "malformed Hysteria2 TLS server_name"
+			}
+		}
+		if insecure, present := tlsRaw["insecure"]; present {
+			if _, ok := insecure.(bool); !ok {
+				return "malformed Hysteria2 TLS insecure setting"
+			}
+		}
+	}
+	if obfsValue, ok := m["obfs"]; ok {
+		obfs, ok := obfsValue.(map[string]any)
+		if !ok {
+			return "malformed Hysteria2 obfs settings"
+		}
+		for key := range obfs {
+			if key != "type" && key != "password" {
+				return "unsupported Hysteria2 obfs setting: " + key
+			}
+		}
+		if obfsType, present := obfs["type"]; present {
+			if _, ok := obfsType.(string); !ok {
+				return "malformed Hysteria2 obfs type"
+			}
+		}
+		if obfsPassword, present := obfs["password"]; present {
+			password, ok := obfsPassword.(string)
+			if !ok {
+				return "malformed Hysteria2 obfs password"
+			}
+			if password != "" {
+				if typ, _ := obfs["type"].(string); typ == "" {
+					return "malformed Hysteria2 obfs password without type"
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func vlessLink(uuid, server string, port int, q url.Values, fragment string) string {
@@ -756,10 +917,11 @@ func redactLine(line string) string {
 func ExtractLinks(data []byte) []string {
 	var out []string
 	s := string(data)
+	lower := strings.ToLower(s)
 	for _, prefix := range []string{"vless://", "hysteria2://", "hy2://"} {
 		idx := 0
 		for {
-			pos := strings.Index(s[idx:], prefix)
+			pos := strings.Index(lower[idx:], prefix)
 			if pos == -1 {
 				break
 			}
@@ -788,5 +950,5 @@ func IsSubscriptionURL(urlStr string) bool {
 	if err != nil {
 		return false
 	}
-	return u.Scheme == "https" || u.Scheme == "http"
+	return strings.EqualFold(u.Scheme, "https") || strings.EqualFold(u.Scheme, "http")
 }

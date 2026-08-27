@@ -360,7 +360,7 @@ esac
 if [ -x "$INSTALL_DIR/$BINARY" ]; then
   install_completion
   echo "" >&2
-  echo "Installed $($INSTALL_DIR/$BINARY --version 2>/dev/null || echo "$BINARY") at $INSTALL_DIR/$BINARY" >&2
+  echo "Installed $("$INSTALL_DIR/$BINARY" --version 2>/dev/null || echo "$BINARY") at $INSTALL_DIR/$BINARY" >&2
   echo "Next: frostgate setup" >&2
 else
   echo "installation may have landed in GOPATH/bin; check PATH" >&2

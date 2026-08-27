@@ -128,6 +128,43 @@ func TestMeasureDirectDisablesAutomaticCompression(t *testing.T) {
 	}
 }
 
+func TestMeasureDirectStopsAtByteCapWithoutWaitingForEOF(t *testing.T) {
+	release := make(chan struct{})
+	done := make(chan struct{})
+	released := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		w.Header().Set("Content-Length", "1048576")
+		_, _ = w.Write(make([]byte, 4096))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	defer func() {
+		if !released {
+			close(release)
+		}
+		srv.Close()
+	}()
+
+	start := time.Now()
+	_, _, err := MeasureDirect(context.Background(), srv.URL, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("measurement waited for EOF after byte cap: %s", elapsed)
+	}
+	close(release)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("test server handler did not finish after release")
+	}
+}
+
 func TestMeasureViaSOCKSRespectsCancellationDuringHandshake(t *testing.T) {
 	for _, phase := range []string{"greeting", "connect-reply", "http"} {
 		t.Run(phase, func(t *testing.T) {

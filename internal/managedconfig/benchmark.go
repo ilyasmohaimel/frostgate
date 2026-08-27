@@ -49,6 +49,9 @@ func (m *Managed) IsLegacyManagedBenchmarkConfig(controller string, configuredOu
 	if _, ok := m.BenchmarkProxy(); ok || len(configuredOutbounds) == 0 {
 		return false
 	}
+	if !m.hasLegacyFrostgateShape() {
+		return false
+	}
 	if !sameController(m.clashController(), controller) {
 		return false
 	}
@@ -65,6 +68,26 @@ func (m *Managed) IsLegacyManagedBenchmarkConfig(controller string, configuredOu
 		}
 	}
 	return true
+}
+
+func (m *Managed) hasLegacyFrostgateShape() bool {
+	if m.Secret == "" {
+		return false
+	}
+	hasDirect, hasBlock := false, false
+	for _, raw := range rawOutbounds(m.Raw) {
+		outbound, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch inboundString(outbound, "tag") {
+		case directTag:
+			hasDirect = true
+		case blockTag:
+			hasBlock = true
+		}
+	}
+	return hasDirect && hasBlock
 }
 
 // EnsureBenchmarkProxy discovers a managed benchmark listener, or upgrades a

@@ -16,12 +16,14 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/routename"
 )
 
 type Options struct {
 	HomeDir string
+	Context context.Context
 	Stdin   *bufio.Reader
 	Stdout  *os.File
 	Stderr  *os.File
@@ -54,6 +56,9 @@ func ConfigDir(home string) string {
 }
 
 func RunInteractive(opts Options) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
 	if opts.HomeDir == "" {
 		opts.HomeDir = DefaultHomeDir()
 	}
@@ -149,7 +154,7 @@ func RunInteractive(opts Options) error {
 		}
 		setupErr = importFlow(opts, dir, sbPath, transaction)
 	case "2":
-		setupErr = existingControllerFlow(opts, dir)
+		setupErr = existingControllerFlow(opts, dir, transaction)
 	case "3":
 		setupErr = directOnlyFlow(opts, dir)
 	default:
@@ -163,6 +168,9 @@ func RunInteractive(opts Options) error {
 	}
 	if setupErr != nil {
 		return transaction.rollback(setupErr)
+	}
+	if opts.Context != nil && opts.Context.Err() != nil {
+		return transaction.rollback(opts.Context.Err())
 	}
 	cfg, err := config.Load(existingConfig)
 	if err != nil {
@@ -198,7 +206,7 @@ func prepareSingBoxForImport(opts Options) (string, error) {
 		}
 	}
 	if sbPath != "" {
-		ver := getSingBoxVersion(sbPath)
+		ver := getSingBoxVersionContext(opts.Context, sbPath)
 		fmt.Printf("sing-box found: %s (%s)\n", ver, sbPath)
 	}
 	return sbPath, nil
@@ -264,7 +272,8 @@ func tryInstallSingBox(opts Options) (string, error) {
 	case "linux":
 		if _, err := exec.LookPath("pacman"); err == nil {
 			fmt.Println("Attempting: sudo pacman -S --noconfirm sing-box")
-			cmd := exec.Command("sudo", "pacman", "-S", "--noconfirm", "sing-box")
+			cmd, cancel := process.CommandContext(opts.Context, process.InstallTimeout, "sudo", "pacman", "-S", "--noconfirm", "sing-box")
+			defer cancel()
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -294,28 +303,33 @@ func tryInstallSingBox(opts Options) (string, error) {
 		fmt.Printf("Downloading %s ...\n", url)
 		archive := filepath.Join(tmpDir, asset.Name)
 		var cmd *exec.Cmd
+		var cancel context.CancelFunc
 		if _, err := exec.LookPath("curl"); err == nil {
-			cmd = exec.Command("curl", "-fL", url, "-o", archive)
+			cmd, cancel = process.CommandContext(opts.Context, process.InstallTimeout, "curl", "-fL", url, "-o", archive)
 		} else if _, err := exec.LookPath("wget"); err == nil {
-			cmd = exec.Command("wget", "-qO", archive, url)
+			cmd, cancel = process.CommandContext(opts.Context, process.InstallTimeout, "wget", "-qO", archive, url)
 		} else {
 			return "", fmt.Errorf("neither curl nor wget found")
 		}
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			cancel()
 			return "", err
 		}
+		cancel()
 		if err := VerifySHA256(archive, asset.SHA256); err != nil {
 			return "", fmt.Errorf("download verification failed: %w", err)
 		}
-		ex := exec.Command("tar", "xzf", archive, "-C", tmpDir)
+		ex, cancel := process.CommandContext(opts.Context, process.InstallTimeout, "tar", "xzf", archive, "-C", tmpDir)
 		if err := ex.Run(); err != nil {
+			cancel()
 			return "", err
 		}
+		cancel()
 		bin := filepath.Join(tmpDir, strings.TrimSuffix(asset.Name, ".tar.gz"), "sing-box")
 		if _, err := os.Stat(bin); err != nil {
-			out, findErr := exec.Command("find", tmpDir, "-name", "sing-box", "-type", "f").Output()
+			out, findErr := process.Output(opts.Context, process.QuickTimeout, "find", tmpDir, "-name", "sing-box", "-type", "f")
 			if findErr != nil {
 				return "", fmt.Errorf("find sing-box binary in verified archive: %w", findErr)
 			}
@@ -325,7 +339,7 @@ func tryInstallSingBox(opts Options) (string, error) {
 			}
 			bin = matches[0]
 		}
-		if err := exec.Command(bin, "version").Run(); err != nil {
+		if err := process.Run(opts.Context, process.QuickTimeout, bin, "version"); err != nil {
 			return "", fmt.Errorf("downloaded sing-box failed version check: %w", err)
 		}
 		installDir := filepath.Join(opts.HomeDir, ".local", "bin")
@@ -361,7 +375,11 @@ func isInPath(dir string) bool {
 }
 
 func getSingBoxVersion(path string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	return getSingBoxVersionContext(context.Background(), path)
+}
+
+func getSingBoxVersionContext(parent context.Context, path string) string {
+	ctx, cancel := context.WithTimeout(parent, process.QuickTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
 	out, err := cmd.CombinedOutput()
@@ -494,7 +512,10 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 			return err
 		}
 		fmt.Printf("wrote %s (direct only)\n", fgPath)
-		return runValidation(dir)
+		return runValidationContext(opts.Context, dir)
+	}
+	if transaction != nil {
+		transaction.candidateManaged = true
 	}
 
 	// Controller secret
@@ -530,11 +551,13 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 
 	// Validate sing-box
 	if singBoxPath != "" {
-		cmd := exec.Command(singBoxPath, "check", "-c", singBoxConfigPath)
+		cmd, cancel := process.CommandContext(opts.Context, process.ValidationTimeout, singBoxPath, "check", "-c", singBoxConfigPath)
 		if out, err := cmd.CombinedOutput(); err != nil {
+			cancel()
 			fmt.Printf("sing-box check failed: %s\n", redact.String(string(out)))
 			return fmt.Errorf("sing-box check failed")
 		}
+		cancel()
 		fmt.Println("sing-box check passed")
 	}
 
@@ -570,7 +593,7 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 	// sidecar. A requested service installation is an activation step, not a
 	// substitute for candidate validation.
 	fmt.Println("\nValidating...")
-	if err := runValidation(dir, singBoxPath); err != nil {
+	if err := runValidationContext(opts.Context, dir, singBoxPath); err != nil {
 		fmt.Printf("Validation failed: %s\n", redact.Error(err))
 		return err
 	}
@@ -582,7 +605,7 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 			return err
 		}
 		if !isNo(offer) {
-			if err := installSystemdService(dir, singBoxPath, transaction); err != nil {
+			if err := installSystemdService(opts.Context, dir, singBoxPath, transaction); err != nil {
 				return fmt.Errorf("install requested systemd service: %w", err)
 			}
 			fmt.Println("systemd service installed and started")
@@ -610,7 +633,11 @@ func importFlow(opts Options, dir, singBoxPath string, transaction *setupTransac
 	return nil
 }
 
-func existingControllerFlow(opts Options, dir string) error {
+func existingControllerFlow(opts Options, dir string, transactions ...*setupTransaction) error {
+	var transaction *setupTransaction
+	if len(transactions) > 0 {
+		transaction = transactions[0]
+	}
 	fmt.Println("\nUse existing sing-box controller")
 	controller, err := prompt(opts.Stdin, "Controller URL [http://127.0.0.1:9090]: ")
 	if err != nil {
@@ -662,6 +689,9 @@ func existingControllerFlow(opts Options, dir string) error {
 		if err := WriteSecretFile(secretFile, secretToSave); err != nil {
 			return err
 		}
+		if transaction != nil {
+			transaction.preserveControllerSecret = true
+		}
 	}
 	testURL := config.DefaultTestURL
 	fgConfig := BuildExternalControllerConfig(tags, testURL, controller, secretFile)
@@ -680,7 +710,7 @@ func existingControllerFlow(opts Options, dir string) error {
 		return err
 	}
 	fmt.Printf("wrote %s\n", fgPath)
-	return runValidation(dir)
+	return runValidationContext(opts.Context, dir)
 }
 
 func directOnlyFlow(opts Options, dir string) error {
@@ -704,7 +734,7 @@ func directOnlyFlow(opts Options, dir string) error {
 		return err
 	}
 	fmt.Printf("wrote %s (direct only)\n", fgPath)
-	return runValidation(dir)
+	return runValidationContext(opts.Context, dir)
 }
 
 func addRouteFlow(opts Options, dir string) error {
@@ -737,7 +767,7 @@ func addRouteFlow(opts Options, dir string) error {
 	return nil
 }
 
-func installSystemdService(dir, binaryPath string, transaction *setupTransaction) error {
+func installSystemdService(ctx context.Context, dir, binaryPath string, transaction *setupTransaction) error {
 	if err := transaction.serviceInstallationAllowed(); err != nil {
 		return err
 	}
@@ -748,7 +778,7 @@ func installSystemdService(dir, binaryPath string, transaction *setupTransaction
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("inspect existing Frostgate systemd unit: %w", err)
 	}
-	if err := InstallSystemdServiceNamed(servicePath, "frostgate-singbox.service", binaryPath, dir, systemdRunnerFactory()); err != nil {
+	if err := InstallSystemdServiceNamedContext(ctx, servicePath, "frostgate-singbox.service", binaryPath, dir, systemdRunnerFactory()); err != nil {
 		return err
 	}
 	if transaction != nil {
@@ -758,6 +788,10 @@ func installSystemdService(dir, binaryPath string, transaction *setupTransaction
 }
 
 func runValidation(dir string, knownSingBoxPath ...string) error {
+	return runValidationContext(context.Background(), dir, knownSingBoxPath...)
+}
+
+func runValidationContext(ctx context.Context, dir string, knownSingBoxPath ...string) error {
 	fgPath := filepath.Join(dir, "config.yaml")
 	cfg, err := config.Load(fgPath)
 	if err != nil {
@@ -778,11 +812,13 @@ func runValidation(dir string, knownSingBoxPath ...string) error {
 	if sbPath != "" {
 		singBoxPath := filepath.Join(dir, "sing-box.json")
 		if _, err := os.Stat(singBoxPath); err == nil {
-			cmd := exec.Command(sbPath, "check", "-c", singBoxPath)
+			cmd, cancel := process.CommandContext(ctx, process.ValidationTimeout, sbPath, "check", "-c", singBoxPath)
 			if out, err := cmd.CombinedOutput(); err != nil {
+				cancel()
 				fmt.Printf("sing-box check failed: %s\n", redact.String(string(out)))
 				return err
 			}
+			cancel()
 		}
 	}
 	fmt.Printf("config check passed (%d endpoints)\n", len(cfg.Endpoints))

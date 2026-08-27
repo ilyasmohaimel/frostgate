@@ -379,3 +379,91 @@ func TestBenchRoutesCheckedPropagatesRestoreFailure(t *testing.T) {
 		t.Fatalf("switches = %v", ctrl.switches)
 	}
 }
+
+type concurrentSelector struct {
+	mu        sync.Mutex
+	now       string
+	active    int
+	overlap   bool
+	observed  map[string]string
+	selectErr error
+}
+
+func (c *concurrentSelector) GetSelectedOutbound(context.Context, string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now, nil
+}
+
+func (c *concurrentSelector) SelectOutbound(ctx context.Context, _, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.selectErr != nil {
+		return c.selectErr
+	}
+	c.now = target
+	return nil
+}
+
+func (c *concurrentSelector) measure(ctx context.Context, route string) (float64, error) {
+	c.mu.Lock()
+	if c.active != 0 {
+		c.overlap = true
+	}
+	c.active++
+	selected := c.now
+	c.observed[route] = selected
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.active--
+		c.mu.Unlock()
+	}()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(50 * time.Millisecond):
+		if selected != route {
+			return 0, fmt.Errorf("route %q measured while selector was %q", route, selected)
+		}
+		return 10, nil
+	}
+}
+
+func TestBenchRoutesCheckedSerializesConcurrentLifecycles(t *testing.T) {
+	ctrl := &concurrentSelector{now: "original", observed: map[string]string{}}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, route := range []string{"route-a", "route-b"} {
+		route := route
+		go func() {
+			<-start
+			_, err := BenchRoutesChecked(context.Background(), ctrl, "selector", "127.0.0.1:1", "http://example.test", 1, []string{route}, func(ctx context.Context, _ string, _ string, _ int64) (float64, error) {
+				return ctrl.measure(ctx, route)
+			})
+			errs <- err
+		}()
+	}
+	close(start)
+	for range []int{0, 1} {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.overlap {
+		t.Fatal("selector benchmark lifecycles overlapped")
+	}
+	if ctrl.now != "original" {
+		t.Fatalf("selector was not restored: %q", ctrl.now)
+	}
+	for _, route := range []string{"route-a", "route-b"} {
+		if ctrl.observed[route] != route {
+			t.Fatalf("route %q was measured under selector %q", route, ctrl.observed[route])
+		}
+	}
+}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/profile"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
@@ -26,9 +27,10 @@ type Check struct {
 }
 
 var (
-	doctorLookupTimeout = 5 * time.Second
-	doctorLookupHost    = net.DefaultResolver.LookupHost
-	systemdStatus       = getSystemdStatus
+	doctorLookupTimeout   = 5 * time.Second
+	doctorLookupHost      = net.DefaultResolver.LookupHost
+	systemdStatus         = getSystemdStatus
+	systemdCommandTimeout = process.QuickTimeout
 )
 
 func Run(cfgPath string, verbose bool) []Check {
@@ -123,69 +125,84 @@ func RunForProfile(cfgPath, managedDir string, verbose bool) []Check {
 		return out
 	}
 
-	// sing-box is required only when the selected profile has proxy routes.
-	sbPath, err := exec.LookPath("sing-box")
-	if err != nil {
-		// also check common alt
-		if _, err2 := os.Stat("/usr/local/bin/sing-box"); err2 == nil {
-			sbPath = "/usr/local/bin/sing-box"
-			err = nil
-		}
+	managed, managedErr := managedconfig.Load(managedDir)
+	managedLocal := managedErr == nil && managed.HasManagedSidecar()
+	if managedErr != nil {
+		out = append(out, Check{Name: "Managed state", Status: "FAIL", Detail: redact.Error(managedErr)})
 	}
-	if err != nil {
-		out = append(out, Check{Name: "sing-box", Status: "FAIL", Detail: "not found in PATH; install sing-box for singbox probes"})
-	} else {
-		ver := getSingBoxVersion(sbPath)
-		if ver == "" {
-			ver = "found"
+	if managedLocal {
+		// sing-box is required only when the selected profile proves ownership of
+		// a Frostgate-managed sidecar.
+		sbPath, sbErr := exec.LookPath("sing-box")
+		if sbErr != nil {
+			if _, statErr := os.Stat("/usr/local/bin/sing-box"); statErr == nil {
+				sbPath, sbErr = "/usr/local/bin/sing-box", nil
+			}
 		}
-		out = append(out, Check{Name: "sing-box", Status: "PASS", Detail: fmt.Sprintf("%s (%s)", ver, sbPath)})
-		if hasSBEndpoints {
-			u, parseErr := url.Parse(cfg.SingBox.Controller)
-			if parseErr != nil || u == nil || u.Hostname() == "" {
-				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: "invalid controller address"})
-			} else if !config.IsLoopbackHost(u.Hostname()) {
-				out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: fmt.Sprintf("controller %s is not loopback", redact.String(cfg.SingBox.Controller))})
-			} else {
-				out = append(out, Check{Name: "Controller bind", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
+		if sbErr != nil {
+			out = append(out, Check{Name: "sing-box", Status: "FAIL", Detail: "not found in PATH; install sing-box for singbox probes"})
+		} else {
+			ver := getSingBoxVersion(sbPath)
+			if ver == "" {
+				ver = "found"
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-			_, cerr := client.GetProxies(ctx)
-			cancel()
-			if cerr != nil {
-				out = append(out, Check{Name: "Controller", Status: "FAIL", Detail: redact.Error(cerr)})
-			} else {
-				out = append(out, Check{Name: "Controller", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
-				// check each outbound
-				ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-				proxies, err := client.GetProxies(ctx2)
-				cancel2()
-				if err == nil {
-					for _, ep := range cfg.Endpoints {
-						if ep.Type != config.ProbeSingBox {
-							continue
-						}
-						if _, ok := proxies[ep.Outbound]; ok {
-							out = append(out, Check{Name: ep.Name, Status: "PASS", Detail: fmt.Sprintf("outbound %q", ep.Outbound)})
-						} else {
-							out = append(out, Check{Name: ep.Name, Status: "FAIL", Detail: fmt.Sprintf("outbound %q not found", ep.Outbound)})
-						}
-					}
-				}
-			}
+			out = append(out, Check{Name: "sing-box", Status: "PASS", Detail: fmt.Sprintf("%s (%s)", ver, sbPath)})
+		}
+		if u, parseErr := url.Parse(cfg.SingBox.Controller); parseErr != nil || u == nil || u.Hostname() == "" {
+			out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: "invalid controller address"})
+		} else if !config.IsLoopbackHost(u.Hostname()) {
+			out = append(out, Check{Name: "Controller bind", Status: "FAIL", Detail: fmt.Sprintf("controller %s is not loopback", redact.String(cfg.SingBox.Controller))})
+		} else {
+			out = append(out, Check{Name: "Controller bind", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
 		}
 		defaultDir := setup.ConfigDir(setup.DefaultHomeDir())
 		managedCanonical := profile.CanonicalPath(managedDir)
 		defaultCanonical := profile.CanonicalPath(defaultDir)
 		identity := profile.ForPath(profile.CanonicalPath(resolved), managedCanonical != "" && managedCanonical == defaultCanonical)
 		servicePath := setup.ServiceUnitPath(identity.Service)
-		if _, err := os.Stat(servicePath); err == nil {
+		if _, statErr := os.Stat(servicePath); statErr == nil {
 			status := systemdStatus(identity.Service)
 			if strings.Contains(status, "active (running)") {
 				out = append(out, Check{Name: "Sidecar service", Status: "PASS", Detail: strings.TrimSuffix(identity.Service, ".service") + " active"})
 			} else if status != "" {
 				out = append(out, Check{Name: "Sidecar service", Status: "WARN", Detail: status})
+			}
+		}
+	} else {
+		out = append(out,
+			Check{Name: "sing-box", Status: "SKIP", Detail: "profile does not prove a Frostgate-managed sidecar"},
+			Check{Name: "Controller bind", Status: "SKIP", Detail: "external or manual controller ownership"},
+			Check{Name: "Sidecar service", Status: "SKIP", Detail: "external or manual sidecar ownership"},
+		)
+	}
+
+	// Controller reachability, authentication, and outbound existence are
+	// meaningful for managed, manual, and external controllers alike.
+	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	proxies, cerr := client.GetProxies(ctx)
+	cancel()
+	if cerr != nil {
+		out = append(out, Check{Name: "Controller", Status: "FAIL", Detail: redact.Error(cerr)})
+	} else {
+		out = append(out, Check{Name: "Controller", Status: "PASS", Detail: redact.String(cfg.SingBox.Controller)})
+		for _, ep := range cfg.Endpoints {
+			if ep.Type != config.ProbeSingBox {
+				continue
+			}
+			if _, ok := proxies[ep.Outbound]; ok {
+				out = append(out, Check{Name: ep.Name, Status: "PASS", Detail: fmt.Sprintf("outbound %q", ep.Outbound)})
+				timeout := cfg.TimeoutFor(ep)
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				_, delayErr := client.Delay(ctx, ep.Outbound, cfg.SingBox.TestURL, timeout)
+				cancel()
+				if delayErr != nil {
+					out = append(out, Check{Name: "End-to-end " + ep.Name, Status: "FAIL", Detail: redact.Error(delayErr)})
+				} else {
+					out = append(out, Check{Name: "End-to-end " + ep.Name, Status: "PASS", Detail: "proxy URL test passed"})
+				}
+			} else {
+				out = append(out, Check{Name: ep.Name, Status: "FAIL", Detail: fmt.Sprintf("outbound %q not found", ep.Outbound)})
 			}
 		}
 	}
@@ -246,10 +263,7 @@ func checkDNS() error {
 }
 
 func getSingBoxVersion(path string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "version")
-	out, err := cmd.CombinedOutput()
+	out, err := process.Output(context.Background(), process.QuickTimeout, path, "version")
 	if err != nil {
 		return ""
 	}
@@ -267,17 +281,13 @@ func hostOnly(addr string) string {
 }
 
 func getSystemdStatus(unit string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemctl", "--user", "is-active", unit)
-	out, err := cmd.CombinedOutput()
+	out, err := process.Output(context.Background(), systemdCommandTimeout, "systemctl", "--user", "is-active", unit)
 	if err != nil && len(out) == 0 {
 		return "systemctl unavailable"
 	}
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
-		cmd2 := exec.CommandContext(ctx, "systemctl", "--user", "status", unit, "--no-pager")
-		out2, statusErr := cmd2.CombinedOutput()
+		out2, statusErr := process.Output(context.Background(), systemdCommandTimeout, "systemctl", "--user", "status", unit, "--no-pager")
 		if statusErr != nil && len(out2) == 0 {
 			return "active (status unavailable)"
 		}

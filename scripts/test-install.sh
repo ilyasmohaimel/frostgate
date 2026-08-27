@@ -170,13 +170,10 @@ ln -sf "$SHIMS/curl" "$NOCHECKSUM_PATH/curl"
 CASE_N=0
 run_installer() { # each arg: VAR=VALUE exported for the run
   CASE_N=$((CASE_N+1))
-  ENVF="$WORK/envfile"
-  : > "$ENVF"
-  for kv in "$@"; do
-    echo "export $kv" >> "$ENVF"
-  done
   (
-    . "$ENVF"
+    for kv in "$@"; do
+      export "$kv"
+    done
     export HOME="$WORK/home"
     sh "$INSTALL_SH"
   ) > "$WORK/out.$CASE_N.log" 2> "$WORK/err.$CASE_N.log"
@@ -366,6 +363,17 @@ run_installer "$BASE_ENV" \
 ok=0
 "$WORK/custom-bin/frostgate" --version >/dev/null 2>&1 && ok=1
 check "custom INSTALL_DIR honored" $ok
+
+# --- Case 9b: an installation directory containing spaces is executable ---
+reset_env
+SUMS="$WORK/sums.9b"; make_sums "$GOOD_SUM" "$SUMS"
+SPACED_DIR="$WORK/custom bin"
+run_installer "$BASE_ENV" \
+  "INSTALL_DIR=$SPACED_DIR" \
+  "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=/dev/null"
+ok=0
+"$SPACED_DIR/frostgate" --version >/dev/null 2>&1 && grep -q "frostgate vTEST" "$LAST_ERR" && ok=1
+check "INSTALL_DIR containing spaces works" $ok
 
 # --- Case 10: PATH warning emitted when INSTALL_DIR not in PATH ---
 reset_env

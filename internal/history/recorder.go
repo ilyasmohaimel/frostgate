@@ -32,7 +32,7 @@ func OpenReadonly() (*DB, error) {
 }
 
 // Recorder owns the history lifecycle for one process: enabled flag,
-// retention, watch interval, lazy DB open, writes and pruning. When disabled
+// retention, watch interval, short-lived writes and pruning. When disabled
 // it must not create any file or directory.
 type Recorder struct {
 	mu            sync.Mutex
@@ -40,7 +40,6 @@ type Recorder struct {
 	retention     time.Duration
 	watchInterval time.Duration
 	profile       string
-	db            *DB
 	lastWrite     time.Time
 	lastPrune     time.Time
 	commit        func(*DB, []Record, time.Duration, bool) error
@@ -101,14 +100,11 @@ func (r *Recorder) write(recs []Record, throttled bool) (bool, error) {
 	if throttled && !r.lastWrite.IsZero() && now.Sub(r.lastWrite) < r.watchInterval {
 		return false, nil
 	}
-	if r.db == nil {
-		db, err := Open()
-		if err != nil {
-			return false, err
-		}
-		r.db = db
-		r.lastPrune = time.Time{}
+	db, err := Open()
+	if err != nil {
+		return false, err
 	}
+	defer db.Close()
 	prepared := make([]Record, len(recs))
 	for i, rec := range recs {
 		if rec.Profile == "" {
@@ -117,7 +113,7 @@ func (r *Recorder) write(recs []Record, throttled bool) (bool, error) {
 		prepared[i] = rec
 	}
 	shouldPrune := r.lastPrune.IsZero() || now.Sub(r.lastPrune) >= r.watchInterval
-	if err := r.commit(r.db, prepared, r.retention, shouldPrune); err != nil {
+	if err := r.commit(db, prepared, r.retention, shouldPrune); err != nil {
 		return false, err
 	}
 	r.lastWrite = now
@@ -127,17 +123,9 @@ func (r *Recorder) write(recs []Record, throttled bool) (bool, error) {
 	return true, nil
 }
 
-// Close releases the underlying DB if it was opened. Safe on a disabled or
-// never-used recorder.
+// Close is retained for API compatibility; writes no longer keep the DB open.
 func (r *Recorder) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.db == nil {
-		return nil
-	}
-	err := r.db.Close()
-	r.db = nil
-	return err
+	return nil
 }
 
 // FromProbeResults converts probe results into history records. downloadFor

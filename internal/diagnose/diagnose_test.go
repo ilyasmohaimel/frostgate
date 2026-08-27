@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -178,6 +180,46 @@ func TestGenericSingBoxRouteUsesGenericFailureHint(t *testing.T) {
 	}
 	if strings.Contains(e2e.Hint, "REALITY") || strings.Contains(e2e.Hint, "PBK") {
 		t.Fatalf("generic route hint leaked VLESS-specific advice: %+v", e2e)
+	}
+}
+
+func TestExternalControllerSkipsLocalOwnershipChecks(t *testing.T) {
+	ctrl := httptest.NewServer(newFakeCtrl(map[string]int{"external-route": 42}).handler())
+	defer ctrl.Close()
+	cfg := &config.Config{
+		Defaults:  config.Defaults{Timeout: config.Duration{Duration: time.Second}, Samples: 1},
+		SingBox:   config.SingBoxConfig{Controller: ctrl.URL, TestURL: "https://example.com/"},
+		Endpoints: []config.Endpoint{{Name: "external-route", Type: config.ProbeSingBox, Outbound: "external-route"}},
+	}
+	layers := DiagnoseAll(cfg, Options{})
+	if layer := findLayer(layers, "sing-box binary"); layer == nil || layer.Status != "SKIP" {
+		t.Fatalf("external controller local binary layer = %+v", layer)
+	}
+	if layer := findLayer(layers, "sing-box sidecar"); layer == nil || layer.Status != "SKIP" {
+		t.Fatalf("external controller sidecar layer = %+v", layer)
+	}
+	if layer := findLayer(layers, "Controller"); layer == nil || layer.Status != "PASS" {
+		t.Fatalf("external controller layer = %+v", layer)
+	}
+}
+
+func TestSidecarStatusIsBounded(t *testing.T) {
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexec /usr/bin/sleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	oldTimeout := diagnoseCommandTimeout
+	diagnoseCommandTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { diagnoseCommandTimeout = oldTimeout })
+	start := time.Now()
+	layer := checkSidecar("frostgate.service")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("diagnose systemctl was not bounded: %s (%+v)", elapsed, layer)
+	}
+	if layer.Status != "SKIP" {
+		t.Fatalf("bounded diagnose systemctl layer = %+v", layer)
 	}
 }
 

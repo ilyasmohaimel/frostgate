@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
 )
@@ -47,16 +48,24 @@ type Managed struct {
 type SidecarRunner struct {
 	// Validator validates the candidate config bytes. If nil, only JSON
 	// validity is checked. The default runner wires this to `sing-box check`.
-	Validator        func(candidate []byte) error
-	DaemonReload     func() error
-	Enable           func() error
-	Disable          func() error
-	Stop             func() error
-	Restart          func() error
-	IsActive         func() (bool, error)
-	ControllerReady  func(expectedOutbounds []string) (bool, error)
-	controllerSecret string
-	controllerAddr   string
+	Validator              func(candidate []byte) error
+	DaemonReload           func() error
+	Enable                 func() error
+	Disable                func() error
+	Stop                   func() error
+	Restart                func() error
+	IsActive               func() (bool, error)
+	ControllerReady        func(expectedOutbounds []string) (bool, error)
+	ValidatorContext       func(context.Context, []byte) error
+	DaemonReloadContext    func(context.Context) error
+	EnableContext          func(context.Context) error
+	DisableContext         func(context.Context) error
+	StopContext            func(context.Context) error
+	RestartContext         func(context.Context) error
+	IsActiveContext        func(context.Context) (bool, error)
+	ControllerReadyContext func(context.Context, []string) (bool, error)
+	controllerSecret       string
+	controllerAddr         string
 }
 
 // DefaultSidecarRunner shells out to systemctl for the user session and
@@ -75,6 +84,7 @@ func DefaultSidecarRunnerForService(controllerAddr, secret, service string) *Sid
 		controllerAddr:   controllerAddr,
 		controllerSecret: secret,
 		Validator:        SingBoxCheckValidator(),
+		ValidatorContext: SingBoxCheckValidatorContext(),
 		DaemonReload: func() error {
 			return runCmd("systemctl", "--user", "daemon-reload")
 		},
@@ -98,19 +108,32 @@ func DefaultSidecarRunnerForService(controllerAddr, secret, service string) *Sid
 			return string(out) == "active\n" || string(out) == "active", nil
 		},
 		ControllerReady: func(expectedOutbounds []string) (bool, error) {
-			deadline := time.Now().Add(6 * time.Second)
-			var lastErr error
-			for {
-				ready, err := verifyController(controllerAddr, secret, expectedOutbounds)
-				if err == nil && ready {
-					return true, nil
-				}
-				lastErr = err
-				if time.Now().After(deadline) {
-					return false, lastErr
-				}
-				time.Sleep(150 * time.Millisecond)
+			return controllerReady(context.Background(), controllerAddr, secret, expectedOutbounds)
+		},
+		DaemonReloadContext: func(ctx context.Context) error {
+			return process.Run(ctx, process.ServiceTimeout, "systemctl", "--user", "daemon-reload")
+		},
+		EnableContext: func(ctx context.Context) error {
+			return process.Run(ctx, process.ServiceTimeout, "systemctl", "--user", "enable", service)
+		},
+		DisableContext: func(ctx context.Context) error {
+			return process.Run(ctx, process.ServiceTimeout, "systemctl", "--user", "disable", service)
+		},
+		StopContext: func(ctx context.Context) error {
+			return process.Run(ctx, process.ServiceTimeout, "systemctl", "--user", "stop", service)
+		},
+		RestartContext: func(ctx context.Context) error {
+			return process.Run(ctx, process.ServiceTimeout, "systemctl", "--user", "restart", service)
+		},
+		IsActiveContext: func(ctx context.Context) (bool, error) {
+			out, err := process.Output(ctx, process.QuickTimeout, "systemctl", "--user", "is-active", service)
+			if err != nil {
+				return false, err
 			}
+			return string(out) == "active\n" || string(out) == "active", nil
+		},
+		ControllerReadyContext: func(ctx context.Context, expected []string) (bool, error) {
+			return controllerReady(ctx, controllerAddr, secret, expected)
 		},
 	}
 }
@@ -120,6 +143,12 @@ func DefaultSidecarRunnerForService(controllerAddr, secret, service string) *Sid
 // silently skipping validation.
 func SingBoxCheckValidator() func([]byte) error {
 	return func(candidate []byte) error {
+		return SingBoxCheckValidatorContext()(context.Background(), candidate)
+	}
+}
+
+func SingBoxCheckValidatorContext() func(context.Context, []byte) error {
+	return func(ctx context.Context, candidate []byte) error {
 		sb, err := lookPath("sing-box")
 		if err != nil {
 			return fmt.Errorf("sing-box not available; cannot validate managed config: %w", err)
@@ -135,7 +164,7 @@ func SingBoxCheckValidator() func([]byte) error {
 		if err := f.Close(); err != nil {
 			return errors.Join(err, os.Remove(path))
 		}
-		out, checkErr := outputCmd(sb, "check", "-c", path)
+		out, checkErr := process.Output(ctx, process.ValidationTimeout, sb, "check", "-c", path)
 		removeErr := os.Remove(path)
 		if checkErr != nil {
 			return errors.Join(fmt.Errorf("sing-box check failed: %s", strings.TrimSpace(string(out))), removeErr)
@@ -148,18 +177,38 @@ func SingBoxCheckValidator() func([]byte) error {
 }
 
 func runCmd(name string, args ...string) error {
-	c := exec.Command(name, args...)
-	return c.Run()
+	return process.Run(context.Background(), process.ServiceTimeout, name, args...)
 }
 
 func outputCmd(name string, args ...string) ([]byte, error) {
-	c := exec.Command(name, args...)
-	return c.Output()
+	return process.Output(context.Background(), process.QuickTimeout, name, args...)
+}
+
+func controllerReady(ctx context.Context, addr, secret string, expected []string) (bool, error) {
+	deadline := time.NewTimer(6 * time.Second)
+	defer deadline.Stop()
+	for {
+		ready, err := verifyControllerContext(ctx, addr, secret, expected)
+		if err == nil && ready {
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-deadline.C:
+			return false, err
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
 }
 
 func verifyController(addr, secret string, expected []string) (bool, error) {
+	return verifyControllerContext(context.Background(), addr, secret, expected)
+}
+
+func verifyControllerContext(parent context.Context, addr, secret string, expected []string) (bool, error) {
 	client := singbox.New(addr, secret)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(parent, time.Second)
 	defer cancel()
 	outbounds, err := client.Outbounds(ctx)
 	if err != nil {
@@ -735,13 +784,17 @@ func (m *Managed) AddHysteria(h *setup.Hysteria2Outbound) { m.Hysteria = append(
 // change Frostgate's config.yaml should use SaveTransactionWithConfig so both
 // files are rolled back together.
 func (m *Managed) SaveTransaction(runner *SidecarRunner) error {
-	return m.saveTransaction(runner, "", nil)
+	return m.saveTransaction(context.Background(), runner, "", nil)
 }
 
 // SaveTransactionWithConfig atomically installs the managed sing-box candidate
 // and a validated Frostgate configuration. If the sidecar cannot accept the
 // candidate, both files are restored.
 func (m *Managed) SaveTransactionWithConfig(runner *SidecarRunner, configPath string, configData []byte) error {
+	return m.SaveTransactionWithConfigContext(context.Background(), runner, configPath, configData)
+}
+
+func (m *Managed) SaveTransactionWithConfigContext(ctx context.Context, runner *SidecarRunner, configPath string, configData []byte) error {
 	if configPath == "" {
 		return fmt.Errorf("config path is required")
 	}
@@ -755,7 +808,7 @@ func (m *Managed) SaveTransactionWithConfig(runner *SidecarRunner, configPath st
 	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("config candidate must be a YAML mapping")
 	}
-	return m.saveTransaction(runner, configPath, configData)
+	return m.saveTransaction(ctx, runner, configPath, configData)
 }
 
 type transactionFile struct {
@@ -772,7 +825,13 @@ type fileSnapshot struct {
 	followSymlink bool
 }
 
-func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, configData []byte) error {
+func (m *Managed) saveTransaction(ctx context.Context, runner *SidecarRunner, configPath string, configData []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(m.Dir, 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
@@ -783,9 +842,15 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 	if !json.Valid(candidate) {
 		return fmt.Errorf("candidate is not valid JSON")
 	}
-	if runner != nil && runner.Validator != nil {
-		if err := runner.Validator(candidate); err != nil {
-			return fmt.Errorf("validation: %w", err)
+	if runner != nil {
+		var validationErr error
+		if runner.ValidatorContext != nil {
+			validationErr = runner.ValidatorContext(ctx, candidate)
+		} else if runner.Validator != nil {
+			validationErr = runner.Validator(candidate)
+		}
+		if validationErr != nil {
+			return fmt.Errorf("validation: %w", validationErr)
 		}
 	}
 
@@ -826,6 +891,12 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 		if !f.install {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("rollback files: %w", rollbackErr))
+			}
+			return err
+		}
 		if err := atomicWrite(f.path, f.candidate, 0o600, f.followSymlink); err != nil {
 			original := fmt.Errorf("install %s: %w", f.path, err)
 			if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
@@ -839,8 +910,14 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 		if rollbackErr := rollbackSnapshots(snapshots); rollbackErr != nil {
 			recovery = errors.Join(recovery, fmt.Errorf("rollback files: %w", rollbackErr))
 		}
-		if runner != nil && runner.Restart != nil {
-			if restartErr := runner.Restart(); restartErr != nil {
+		if runner != nil {
+			var restartErr error
+			if runner.RestartContext != nil {
+				restartErr = runner.RestartContext(context.Background())
+			} else if runner.Restart != nil {
+				restartErr = runner.Restart()
+			}
+			if restartErr != nil {
 				recovery = errors.Join(recovery, fmt.Errorf("restart restored sidecar: %w", restartErr))
 			}
 		}
@@ -852,37 +929,70 @@ func (m *Managed) saveTransaction(runner *SidecarRunner, configPath string, conf
 
 	// Restart sidecar + verify.
 	if runner != nil {
-		if runner.DaemonReload != nil {
-			if err := runner.DaemonReload(); err != nil {
-				return rollback(fmt.Errorf("daemon-reload failed: %w", err))
+		if err := ctx.Err(); err != nil {
+			return rollback(err)
+		}
+		if runner.DaemonReloadContext != nil || runner.DaemonReload != nil {
+			var reloadErr error
+			if runner.DaemonReloadContext != nil {
+				reloadErr = runner.DaemonReloadContext(ctx)
+			} else {
+				reloadErr = runner.DaemonReload()
+			}
+			if reloadErr != nil {
+				return rollback(fmt.Errorf("daemon-reload failed: %w", reloadErr))
 			}
 		}
-		if runner.Restart != nil {
-			if err := runner.Restart(); err != nil {
-				return rollback(fmt.Errorf("sidecar restart failed: %w", err))
+		if runner.RestartContext != nil || runner.Restart != nil {
+			var restartErr error
+			if runner.RestartContext != nil {
+				restartErr = runner.RestartContext(ctx)
+			} else {
+				restartErr = runner.Restart()
+			}
+			if restartErr != nil {
+				return rollback(fmt.Errorf("sidecar restart failed: %w", restartErr))
 			}
 		}
-		if runner.IsActive != nil {
-			active, err := runner.IsActive()
-			if err != nil {
-				return rollback(fmt.Errorf("is-active check error: %w", err))
+		if runner.IsActiveContext != nil || runner.IsActive != nil {
+			var active bool
+			var activeErr error
+			if runner.IsActiveContext != nil {
+				active, activeErr = runner.IsActiveContext(ctx)
+			} else {
+				active, activeErr = runner.IsActive()
+			}
+			if activeErr != nil {
+				return rollback(fmt.Errorf("is-active check error: %w", activeErr))
 			}
 			if !active {
 				return rollback(fmt.Errorf("sidecar not active after restart"))
 			}
 		}
-		if runner.ControllerReady != nil {
-			ok, err := runner.ControllerReady(m.ProxyTags())
-			if err != nil || !ok {
-				if err == nil {
-					err = fmt.Errorf("expected outbounds unavailable")
+		if runner.ControllerReadyContext != nil || runner.ControllerReady != nil {
+			var ok bool
+			var readyErr error
+			if runner.ControllerReadyContext != nil {
+				ok, readyErr = runner.ControllerReadyContext(ctx, m.ProxyTags())
+			} else {
+				ok, readyErr = runner.ControllerReady(m.ProxyTags())
+			}
+			if readyErr != nil || !ok {
+				if readyErr == nil {
+					readyErr = fmt.Errorf("expected outbounds unavailable")
 				}
-				return rollback(fmt.Errorf("controller verification failed: %w", err))
+				return rollback(fmt.Errorf("controller verification failed: %w", readyErr))
 			}
 		}
-		if runner.Enable != nil {
-			if err := runner.Enable(); err != nil {
-				return rollback(fmt.Errorf("sidecar enable failed: %w", err))
+		if runner.EnableContext != nil || runner.Enable != nil {
+			var enableErr error
+			if runner.EnableContext != nil {
+				enableErr = runner.EnableContext(ctx)
+			} else {
+				enableErr = runner.Enable()
+			}
+			if enableErr != nil {
+				return rollback(fmt.Errorf("sidecar enable failed: %w", enableErr))
 			}
 		}
 	}

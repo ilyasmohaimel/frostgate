@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/ilyasmohaimel/frostgate/internal/benchmark"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
+	"github.com/ilyasmohaimel/frostgate/internal/routename"
 )
 
 type Duration struct {
@@ -111,6 +114,20 @@ type Endpoint struct {
 // int field stays source-compatible while allowing an explicit priority: 0 to
 // override defaults.priority rather than being mistaken for an omission.
 func (e *Endpoint) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.MappingNode {
+		allowed := map[string]bool{
+			"name": true, "type": true, "host": true, "port": true,
+			"sni": true, "path": true, "url": true, "outbound": true,
+			"priority": true, "timeout": true, "samples": true,
+			"sample_interval": true, "healthy_latency": true,
+			"max_jitter": true, "max_loss": true, "expected_status": true,
+		}
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if !allowed[value.Content[i].Value] {
+				return fmt.Errorf("endpoint: unknown field %q", value.Content[i].Value)
+			}
+		}
+	}
 	type plain Endpoint
 	var decoded plain
 	if err := value.Decode(&decoded); err != nil {
@@ -191,6 +208,8 @@ type Config struct {
 const (
 	// MaxEndpoints is the supported maximum number of endpoints in one config.
 	MaxEndpoints = 32
+	// MaxSamples bounds the number of samples in one health-check snapshot.
+	MaxSamples = 100
 
 	DefaultTimeout           = 5 * time.Second
 	DefaultSamples           = 4
@@ -217,7 +236,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
 	var cfg Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parsing config %s: multiple YAML documents are not supported", path)
+		}
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 	if err := applyDefaults(&cfg); err != nil {
@@ -234,6 +262,9 @@ func Load(path string) (*Config, error) {
 		ep := &cfg.Endpoints[i]
 		if redact.String(ep.Name) != ep.Name {
 			return nil, fmt.Errorf("endpoint name contains sensitive content")
+		}
+		if err := routename.ValidateControlCharacters(ep.Name); err != nil {
+			return nil, fmt.Errorf("endpoint %q: %w", ep.Name, err)
 		}
 		if ep.Outbound != "" && redact.String(ep.Outbound) != ep.Outbound {
 			return nil, fmt.Errorf("endpoint %q outbound contains sensitive content", ep.Name)
@@ -300,7 +331,10 @@ func applyDefaults(cfg *Config) error {
 	if cfg.Defaults.Timeout.Duration < 0 || cfg.Defaults.Samples < 0 || cfg.Defaults.SampleInterval.Duration < 0 || cfg.Defaults.HealthyLatency.Duration < 0 || cfg.Defaults.MaxJitter.Duration < 0 {
 		return fmt.Errorf("default durations and samples must be non-negative")
 	}
-	if cfg.Defaults.MaxLoss != nil && (*cfg.Defaults.MaxLoss < 0 || *cfg.Defaults.MaxLoss > 100) {
+	if cfg.Defaults.Samples > MaxSamples {
+		return fmt.Errorf("defaults.samples must be 0-%d", MaxSamples)
+	}
+	if cfg.Defaults.MaxLoss != nil && (!finite(*cfg.Defaults.MaxLoss) || *cfg.Defaults.MaxLoss < 0 || *cfg.Defaults.MaxLoss > 100) {
 		return fmt.Errorf("defaults.max_loss must be 0-100")
 	}
 	if cfg.SingBox.Controller == "" {
@@ -313,7 +347,7 @@ func applyDefaults(cfg *Config) error {
 		if err := validateHTTPURL("singbox.test_url", cfg.SingBox.TestURL); err != nil {
 			return err
 		}
-		if err := validateHTTPURL("singbox.controller", cfg.SingBox.Controller); err != nil {
+		if err := validateControllerURL("singbox.controller", cfg.SingBox.Controller); err != nil {
 			return err
 		}
 		if cfg.SingBox.BenchmarkProxy != "" {
@@ -434,6 +468,9 @@ func normalize(e *Endpoint, cfg *Config) error {
 	if e.Samples < 0 {
 		return fmt.Errorf("invalid samples")
 	}
+	if e.Samples > MaxSamples {
+		return fmt.Errorf("samples must be 0-%d", MaxSamples)
+	}
 	if e.SampleInterval.Duration < 0 {
 		return fmt.Errorf("invalid sample_interval")
 	}
@@ -443,7 +480,7 @@ func normalize(e *Endpoint, cfg *Config) error {
 	if e.MaxJitter.Duration < 0 {
 		return fmt.Errorf("invalid max_jitter")
 	}
-	if e.MaxLoss != nil && (*e.MaxLoss < 0 || *e.MaxLoss > 100) {
+	if e.MaxLoss != nil && (!finite(*e.MaxLoss) || *e.MaxLoss < 0 || *e.MaxLoss > 100) {
 		return fmt.Errorf("max_loss must be 0-100")
 	}
 	if e.ExpectedStatus < 0 || e.ExpectedStatus > 599 {
@@ -460,7 +497,7 @@ func validateHTTPURL(field, raw string) error {
 	if err != nil {
 		return fmt.Errorf("%s invalid: %w", field, err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
 		return fmt.Errorf("%s must use http or https", field)
 	}
 	if u.Host == "" {
@@ -471,6 +508,26 @@ func validateHTTPURL(field, raw string) error {
 		if err != nil || port < 1 || port > 65535 {
 			return fmt.Errorf("%s has invalid port", field)
 		}
+	}
+	return nil
+}
+
+func validateControllerURL(field, raw string) error {
+	if err := validateHTTPURL(field, raw); err != nil {
+		return err
+	}
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return fmt.Errorf("%s invalid: %w", field, err)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain URL userinfo", field)
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("%s must not contain a query", field)
+	}
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return fmt.Errorf("%s must not contain a fragment", field)
 	}
 	return nil
 }
@@ -662,4 +719,16 @@ func (c *Config) PriorityFor(e Endpoint) int {
 		return *c.Defaults.Priority
 	}
 	return 0
+}
+
+func NextPriority(max int) (int, error) {
+	if max < 0 || max/10 >= math.MaxInt/10 {
+		return 0, fmt.Errorf("priority overflow: cannot allocate after %d", max)
+	}
+	next := ((max / 10) + 1) * 10
+	return next, nil
+}
+
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

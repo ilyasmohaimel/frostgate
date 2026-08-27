@@ -34,6 +34,71 @@ func TestBase64Subscription(t *testing.T) {
 	}
 }
 
+func TestBase64SubscriptionUppercaseSchemes(t *testing.T) {
+	plain := "VLESS://uuid@host:443?security=reality&sni=a&pbk=b#one\nHY2://pass@host2:443?sni=a#two\n"
+	b64 := base64.StdEncoding.EncodeToString([]byte(plain))
+	res := ParseSubscription([]byte(b64))
+	if len(res.Links) != 2 || len(res.Skipped) != 0 {
+		t.Fatalf("uppercase base64 links were not detected: %+v", res)
+	}
+}
+
+func TestExtractLinksAcceptsUppercaseSchemes(t *testing.T) {
+	links := ExtractLinks([]byte("VLESS://uuid@host:443?pbk=fixture-key\nHY2://pass@host:443\n"))
+	if len(links) != 2 || !strings.HasPrefix(links[0], "VLESS://") || !strings.HasPrefix(links[1], "HY2://") {
+		t.Fatalf("uppercase links were not extracted: %v", links)
+	}
+}
+
+func TestImportedNativePortsMustBeIntegersInRange(t *testing.T) {
+	for _, value := range []string{"443.9", "443.0", "4.43e2", "0", "-1", "65536", `"443"`} {
+		data := []byte(`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":` + value + `,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`)
+		result := ParseSubscription(data)
+		if len(result.Links) != 0 || len(result.Skipped) != 1 {
+			t.Fatalf("native port %s was accepted: %+v", value, result)
+		}
+	}
+}
+
+func TestNativeHysteriaUnsupportedSemanticsAreRejected(t *testing.T) {
+	for _, field := range []string{
+		`"up_mbps":10`,
+		`"down_mbps":100`,
+		`"tls":{"enabled":true,"server_name":"example.com","alpn":["h3"]}`,
+	} {
+		data := []byte(`{"outbounds":[{"type":"hysteria2","tag":"hy2","server":"203.0.113.10","server_port":443,"password":"fixture-password",` + field + `}]}`)
+		result := ParseSubscription(data)
+		if len(result.Links) != 0 || len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "unsupported") {
+			t.Fatalf("native Hysteria semantic %s was silently discarded: %+v", field, result)
+		}
+	}
+}
+
+func TestNativeImporterRejectsMalformedNestedSemantics(t *testing.T) {
+	for _, data := range []string{
+		`{"outbounds":[{"type":"hysteria2","server":"203.0.113.10","server_port":443,"password":"fixture-password","network":true}]}`,
+		`{"outbounds":[{"type":"hysteria2","server":"203.0.113.10","server_port":443,"password":"fixture-password","tls":{"enabled":"true"}}]}`,
+		`{"outbounds":[{"type":"hysteria2","server":"203.0.113.10","server_port":443,"password":"fixture-password","obfs":{"type":"salamander","password":123}}]}`,
+		`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","flow":true,"tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"fixture-key"}}}]}`,
+	} {
+		result := ParseSubscription([]byte(data))
+		if len(result.Links) != 0 || len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "malformed") {
+			t.Fatalf("malformed native semantics were accepted: %+v", result)
+		}
+	}
+	data := []byte(`{"outbounds":[{"type":"vless","server":"203.0.113.10","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"example.com","utls":{"enabled":false,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"fixture-key"}}}]}`)
+	result := ParseSubscription(data)
+	if len(result.Links) != 0 || len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0].Reason, "unsupported") {
+		t.Fatalf("disabled native uTLS was silently changed: %+v", result)
+	}
+}
+
+func TestSubscriptionURLSchemeIsCaseInsensitive(t *testing.T) {
+	if !IsSubscriptionURL("HTTP://example.test/sub") || !IsSubscriptionURL("HTTPS://example.test/sub") {
+		t.Fatal("HTTP schemes were treated case-sensitively")
+	}
+}
+
 func TestClashYAML(t *testing.T) {
 	yaml := `
 proxies:

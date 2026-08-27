@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -151,6 +152,70 @@ func TestClientUsesRequestContextRatherThanHiddenGlobalTimeout(t *testing.T) {
 	}
 	if c.HTTP.CheckRedirect == nil {
 		t.Fatal("controller client must retain explicit redirect policy")
+	}
+}
+
+func TestControllerURLJoiningPreservesBasePathAndTrailingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/clash/api/proxies/frostgate-selector" {
+			t.Fatalf("request path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"type":"selector","now":"route-a"}`))
+	}))
+	defer srv.Close()
+	for _, base := range []string{srv.URL + "/clash/api", srv.URL + "/clash/api/"} {
+		c := New(base, "")
+		if got, err := c.GetSelectedOutbound(context.Background(), "frostgate-selector"); err != nil || got != "route-a" {
+			t.Fatalf("base %q selected=%q err=%v", base, got, err)
+		}
+	}
+	if got, err := New("HTTP://[::1]:9090/", "").apiURL("proxies"); err != nil || got != "http://[::1]:9090/proxies" {
+		t.Fatalf("normalized IPv6 controller = %q err=%v", got, err)
+	}
+}
+
+func TestControllerURLRejectsUserinfoQueryAndFragment(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:password@127.0.0.1:9090",
+		"http://127.0.0.1:9090/?token=fixture",
+		"http://127.0.0.1:9090/?",
+		"http://127.0.0.1:9090/#fragment",
+		"http://127.0.0.1:9090/#",
+	} {
+		c := New(raw, "")
+		errText := ""
+		if _, err := c.GetProxies(context.Background()); err != nil {
+			errText = err.Error()
+		}
+		if errText == "" || strings.Contains(errText, "password") || strings.Contains(errText, "fixture") {
+			t.Fatalf("controller URL %q error=%q", raw, errText)
+		}
+	}
+}
+
+func TestControllerResponseBodyLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "normal", body: `{"proxies":{"route-a":{"type":"vless"}}}`, want: true},
+		{name: "malformed", body: "{", want: false},
+		{name: "oversized", body: strings.Repeat("x", int(MaxControllerResponseBytes)+1), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			_, err := New(srv.URL, "").GetProxies(context.Background())
+			if (err == nil) != tc.want {
+				t.Fatalf("GetProxies error=%v wantSuccess=%v", err, tc.want)
+			}
+			if tc.name == "oversized" && !strings.Contains(err.Error(), "exceeds") {
+				t.Fatalf("oversized error was not operationally clear: %v", err)
+			}
+		})
 	}
 }
 

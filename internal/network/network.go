@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ilyasmohaimel/frostgate/internal/directhttp"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 )
 
@@ -69,7 +70,7 @@ func checkHTTPS() Check {
 	if err != nil {
 		return Check{Name: "HTTPS", Status: "FAIL", Detail: redact.Error(err)}
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := directhttp.ClientWithTimeout(5 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return Check{Name: "HTTPS", Status: "FAIL", Detail: redact.Error(err)}
@@ -88,12 +89,8 @@ func checkCaptive() Check {
 	if err != nil {
 		return Check{Name: "Captive portal", Status: "SKIP", Detail: redact.Error(err)}
 	}
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := directhttp.ClientWithTimeout(5 * time.Second)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
 		return Check{Name: "Captive portal", Status: "SKIP", Detail: redact.Error(err)}
@@ -128,7 +125,7 @@ func checkDNS() Check {
 func checkDoH() Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := FetchDoHAnswers(ctx, http.DefaultClient, DefaultDoHURL, "www.gstatic.com")
+	_, err := FetchDoHAnswers(ctx, directhttp.ClientWithTimeout(5*time.Second), DefaultDoHURL, "www.gstatic.com")
 	if err != nil {
 		return Check{Name: "DoH resolver", Status: "FAIL", Detail: redact.Error(err)}
 	}
@@ -265,7 +262,7 @@ func CheckDNSVsDoH(host, dohBase string) Check {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	sys, sysErr := systemLookup(ctx, host)
-	doh, dohErr := FetchDoHAnswers(ctx, http.DefaultClient, dohBase, host)
+	doh, dohErr := FetchDoHAnswers(ctx, directhttp.ClientWithTimeout(6*time.Second), dohBase, host)
 	switch {
 	case sysErr != nil && dohErr != nil:
 		return Check{Name: "DNS vs DoH", Status: "UNAVAILABLE", Detail: "system and DoH lookups unavailable"}
@@ -305,7 +302,7 @@ func checkDestination(u string) Check {
 	if err != nil {
 		return Check{Name: name, Status: "FAIL", Detail: redact.Error(err)}
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := directhttp.ClientWithTimeout(5 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return Check{Name: name, Status: "FAIL", Detail: redact.Error(err)}

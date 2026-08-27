@@ -2,6 +2,9 @@ package doctor
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,6 +142,63 @@ func TestDoctorDNSUsesBoundedResolverContext(t *testing.T) {
 	start := time.Now()
 	if err := checkDNS(); err == nil || time.Since(start) > time.Second {
 		t.Fatalf("bounded doctor DNS error=%v elapsed=%s", err, time.Since(start))
+	}
+}
+
+func TestSystemdStatusIsBounded(t *testing.T) {
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexec /usr/bin/sleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	oldTimeout := systemdCommandTimeout
+	systemdCommandTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { systemdCommandTimeout = oldTimeout })
+	start := time.Now()
+	status := getSystemdStatus("frostgate.service")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("systemctl status was not bounded: %s (%q)", elapsed, status)
+	}
+	if status != "systemctl unavailable" {
+		t.Fatalf("bounded systemctl status = %q", status)
+	}
+}
+
+func TestExternalControllerDoesNotRequireLocalSingBox(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/delay") {
+			_ = json.NewEncoder(w).Encode(map[string]int{"delay": 7})
+			return
+		}
+		if r.URL.Path != "/proxies" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"proxies": map[string]any{
+			"external-route": map[string]any{"type": "vless"},
+		}})
+	}))
+	defer srv.Close()
+	t.Setenv("PATH", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("singbox:\n  controller: "+srv.URL+"\nendpoints:\n  - name: external-route\n    type: singbox\n    outbound: external-route\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checks := RunForProfile(path, filepath.Dir(path), false)
+	for _, check := range checks {
+		if check.Name == "sing-box" && check.Status != "SKIP" {
+			t.Fatalf("external controller evaluated local sing-box: %+v", check)
+		}
+		if check.Name == "Controller" && check.Status != "PASS" {
+			t.Fatalf("external controller was not checked successfully: %+v", check)
+		}
+		if check.Name == "external-route" && check.Status != "PASS" {
+			t.Fatalf("external outbound was not checked: %+v", check)
+		}
+		if check.Name == "End-to-end external-route" && check.Status != "PASS" {
+			t.Fatalf("external end-to-end route was not checked: %+v", check)
+		}
 	}
 }
 

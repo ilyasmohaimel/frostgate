@@ -1,12 +1,36 @@
 package setup
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type contextCancellingSystemd struct {
+	cancel context.CancelFunc
+	called bool
+}
+
+func (f *contextCancellingSystemd) Run(name string, args ...string) error {
+	return errors.New("non-context systemd call used")
+}
+
+func (f *contextCancellingSystemd) Output(name string, args ...string) ([]byte, error) {
+	return nil, errors.New("non-context systemd call used")
+}
+
+func (f *contextCancellingSystemd) RunContext(ctx context.Context, _ string, _ ...string) error {
+	f.called = true
+	f.cancel()
+	return ctx.Err()
+}
+
+func (f *contextCancellingSystemd) OutputContext(context.Context, string, ...string) ([]byte, error) {
+	return nil, errors.New("unexpected output call")
+}
 
 type fakeSystemd struct {
 	calls  []string
@@ -91,6 +115,19 @@ func TestInstallSystemdServiceSuccess(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `ExecStart="/bin/sing-box" run -c "/tmp/frostgate/sing-box.json"`) {
 		t.Fatalf("unexpected unit:\n%s", data)
+	}
+}
+
+func TestInstallSystemdServiceContextCancelsLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &contextCancellingSystemd{cancel: cancel}
+	path := filepath.Join(t.TempDir(), "frostgate.service")
+	err := InstallSystemdServiceNamedContext(ctx, path, "frostgate.service", "/bin/sing-box", "/tmp/frostgate", runner)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled service lifecycle error = %v", err)
+	}
+	if !runner.called {
+		t.Fatal("service lifecycle did not receive the caller context")
 	}
 }
 

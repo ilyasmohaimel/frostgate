@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -16,22 +17,101 @@ type Client struct {
 	Controller string
 	Secret     string
 	HTTP       *http.Client
+	base       *url.URL
+	parseErr   error
 }
+
+const MaxControllerResponseBytes int64 = 1 << 20
 
 func New(controller, secret string) *Client {
 	trimmed := controller
 	if trimmed == "" {
 		trimmed = "http://127.0.0.1:9090"
 	}
+	base, err := parseController(trimmed)
+	normalized := trimmed
+	if err == nil {
+		normalized = base.String()
+	}
 	return &Client{
-		Controller: trimmed,
+		Controller: normalized,
 		Secret:     secret,
 		// Request contexts are the single timeout authority. Callers that
 		// perform controller I/O must supply an explicit bounded context.
 		HTTP: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}},
+		base:     base,
+		parseErr: err,
 	}
+}
+
+func parseController(raw string) (*url.URL, error) {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid controller URL: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return nil, fmt.Errorf("controller URL must use http or https")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("controller URL must include a host")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("controller URL must not contain URL userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return nil, fmt.Errorf("controller URL must not contain a query")
+	}
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return nil, fmt.Errorf("controller URL must not contain a fragment")
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawPath = strings.TrimRight(u.RawPath, "/")
+	return u, nil
+}
+
+func (c *Client) ready() error {
+	if c == nil {
+		return fmt.Errorf("singbox controller is nil")
+	}
+	if c.parseErr != nil {
+		return c.parseErr
+	}
+	if c.base == nil {
+		return fmt.Errorf("singbox controller URL is not initialized")
+	}
+	return nil
+}
+
+func (c *Client) apiURL(segments ...string) (string, error) {
+	if err := c.ready(); err != nil {
+		return "", err
+	}
+	u := *c.base
+	escaped := strings.TrimRight(u.EscapedPath(), "/")
+	for _, segment := range segments {
+		escaped += "/" + url.PathEscape(segment)
+	}
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil {
+		return "", fmt.Errorf("invalid controller API path: %w", err)
+	}
+	u.Path = decoded
+	u.RawPath = escaped
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+// SelectorResource is a stable identity for the shared selector lock. It
+// intentionally excludes the controller secret.
+func (c *Client) SelectorResource(selector string) string {
+	if selector == "" {
+		selector = "frostgate-selector"
+	}
+	return c.Controller + "\x00" + selector
 }
 
 type delayResponse struct {
@@ -49,7 +129,10 @@ func (c *Client) authHeader(req *http.Request) {
 }
 
 func (c *Client) GetProxies(ctx context.Context) (map[string]json.RawMessage, error) {
-	u := c.Controller + "/proxies"
+	u, err := c.apiURL("proxies")
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -67,7 +150,7 @@ func (c *Client) GetProxies(ctx context.Context) (map[string]json.RawMessage, er
 		return nil, fmt.Errorf("singbox-api: unexpected status %d", resp.StatusCode)
 	}
 	var pr proxiesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+	if err := decodeJSONBody(resp, &pr, "proxies"); err != nil {
 		return nil, fmt.Errorf("singbox-api: malformed proxies response: %w", err)
 	}
 	return pr.Proxies, nil
@@ -98,7 +181,10 @@ func (c *Client) Outbounds(ctx context.Context) ([]string, error) {
 }
 
 func (c *Client) GetProxy(ctx context.Context, name string) (map[string]json.RawMessage, error) {
-	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(name))
+	u, err := c.apiURL("proxies", name)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -119,7 +205,7 @@ func (c *Client) GetProxy(ctx context.Context, name string) (map[string]json.Raw
 		return nil, fmt.Errorf("singbox-api: unexpected status %d", resp.StatusCode)
 	}
 	var raw map[string]json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := decodeJSONBody(resp, &raw, "proxy"); err != nil {
 		return nil, fmt.Errorf("singbox-api: malformed proxy response: %w", err)
 	}
 	return raw, nil
@@ -175,7 +261,10 @@ func (c *Client) SelectOutbound(ctx context.Context, selector, target string) er
 	if err != nil {
 		return fmt.Errorf("singbox-api: encode selector request: %w", err)
 	}
-	u := fmt.Sprintf("%s/proxies/%s", c.Controller, url.PathEscape(selector))
+	u, err := c.apiURL("proxies", selector)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -186,7 +275,7 @@ func (c *Client) SelectOutbound(ctx context.Context, selector, target string) er
 	if err != nil {
 		return fmt.Errorf("singbox controller unreachable: %w", categorizeErr(err))
 	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("singbox-api: unauthorized (bad secret)")
 	}
@@ -210,9 +299,19 @@ func (c *Client) Delay(ctx context.Context, outboundTag, testURL string, timeout
 	if testURL == "" {
 		testURL = "https://www.gstatic.com/generate_204"
 	}
-	escapedTag := url.PathEscape(outboundTag)
-	u := fmt.Sprintf("%s/proxies/%s/delay?url=%s&timeout=%d", c.Controller, escapedTag, url.QueryEscape(testURL), timeout.Milliseconds())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	u, err := c.apiURL("proxies", outboundTag, "delay")
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return 0, err
+	}
+	query := parsed.Query()
+	query.Set("url", testURL)
+	query.Set("timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
+	parsed.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -225,7 +324,7 @@ func (c *Client) Delay(ctx context.Context, outboundTag, testURL string, timeout
 	switch resp.StatusCode {
 	case http.StatusOK:
 		var dr delayResponse
-		if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		if err := decodeJSONBody(resp, &dr, "delay"); err != nil {
 			return 0, fmt.Errorf("singbox-api: malformed delay response: %w", err)
 		}
 		return delayDuration(dr.Delay)
@@ -240,6 +339,17 @@ func (c *Client) Delay(ctx context.Context, outboundTag, testURL string, timeout
 	default:
 		return 0, fmt.Errorf("singbox-api: status %d", resp.StatusCode)
 	}
+}
+
+func decodeJSONBody(resp *http.Response, target any, kind string) error {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxControllerResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > MaxControllerResponseBytes {
+		return fmt.Errorf("%s response exceeds %d-byte limit", kind, MaxControllerResponseBytes)
+	}
+	return json.Unmarshal(body, target)
 }
 
 func categorizeErr(err error) error {

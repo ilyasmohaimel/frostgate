@@ -12,6 +12,7 @@ import (
 	"github.com/ilyasmohaimel/frostgate/internal/config"
 	"github.com/ilyasmohaimel/frostgate/internal/managedconfig"
 	"github.com/ilyasmohaimel/frostgate/internal/probe"
+	"github.com/ilyasmohaimel/frostgate/internal/process"
 	"github.com/ilyasmohaimel/frostgate/internal/redact"
 	"github.com/ilyasmohaimel/frostgate/internal/setup"
 	"github.com/ilyasmohaimel/frostgate/internal/singbox"
@@ -33,8 +34,9 @@ type Options struct {
 }
 
 var (
-	diagnoseLookupTimeout = 5 * time.Second
-	diagnoseLookupHost    = net.DefaultResolver.LookupHost
+	diagnoseLookupTimeout  = 5 * time.Second
+	diagnoseLookupHost     = net.DefaultResolver.LookupHost
+	diagnoseCommandTimeout = process.QuickTimeout
 )
 
 func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
@@ -43,8 +45,7 @@ func DiagnoseAll(cfg *config.Config, opts Options) []Layer {
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
 	if hasSingBoxEndpoints(cfg) {
-		out = append(out, checkSingBox())
-		out = append(out, checkSidecar(opts.SidecarService))
+		out = append(out, localOwnershipLayers(opts)...)
 		out = append(out, checkController(cfg))
 	} else {
 		out = append(out,
@@ -80,8 +81,7 @@ func DiagnoseRoute(cfg *config.Config, routeName string, opts Options) []Layer {
 	out = append(out, checkDNS(cfg))
 	out = append(out, checkDirect(cfg))
 	if hasSingBoxEndpoints(cfg) {
-		out = append(out, checkSingBox())
-		out = append(out, checkSidecar(opts.SidecarService))
+		out = append(out, localOwnershipLayers(opts)...)
 		out = append(out, checkController(cfg))
 	} else {
 		out = append(out,
@@ -106,6 +106,16 @@ func hasSingBoxEndpoints(cfg *config.Config) bool {
 		}
 	}
 	return false
+}
+
+func localOwnershipLayers(opts Options) []Layer {
+	if opts.Managed != nil && opts.Managed.HasManagedSidecar() {
+		return []Layer{checkSingBox(), checkSidecar(opts.SidecarService)}
+	}
+	return []Layer{
+		{Name: "sing-box binary", Status: "SKIP", Detail: "profile does not prove a Frostgate-managed sidecar"},
+		{Name: "sing-box sidecar", Status: "SKIP", Detail: "external or manual sidecar ownership"},
+	}
 }
 
 // diagnoseProxyRoute emits evidence-based layers for a singbox-backed route.
@@ -248,7 +258,7 @@ func checkDirect(cfg *config.Config) Layer {
 	var direct *config.Endpoint
 	for i := range cfg.Endpoints {
 		ep := cfg.Endpoints[i]
-		if ep.Type == config.ProbeHTTP && strings.Contains(strings.ToLower(ep.Name), "direct") {
+		if ep.Type == config.ProbeHTTP && probe.IsDirectBaseline(ep) {
 			direct = &ep
 			break
 		}
@@ -256,7 +266,7 @@ func checkDirect(cfg *config.Config) Layer {
 	if direct == nil {
 		return Layer{Name: "Direct internet", Status: "SKIP", Detail: "no direct baseline"}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ProbeBudget(*direct))
 	defer cancel()
 	res := probe.ProbeEndpoint(ctx, cfg, *direct)
 	if res.Status == "down" {
@@ -274,7 +284,7 @@ func checkSingBox() Layer {
 }
 
 func getVersion(path string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), process.QuickTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version")
 	out, err := cmd.CombinedOutput()
@@ -298,8 +308,7 @@ func checkSidecar(service string) Layer {
 	if service == "" {
 		service = "frostgate-singbox.service"
 	}
-	cmd := exec.Command("systemctl", "--user", "is-active", service)
-	out, err := cmd.Output()
+	out, err := process.Output(context.Background(), diagnoseCommandTimeout, "systemctl", "--user", "is-active", service)
 	s := strings.TrimSpace(string(out))
 	if s == "active" {
 		return Layer{Name: "sing-box sidecar", Status: "PASS", Detail: strings.TrimSuffix(service, ".service") + " active"}
@@ -312,7 +321,7 @@ func checkSidecar(service string) Layer {
 
 func checkController(cfg *config.Config) Layer {
 	client := singbox.New(cfg.SingBox.Controller, cfg.SingBox.Secret)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), process.QuickTimeout)
 	defer cancel()
 	if _, err := client.GetProxies(ctx); err != nil {
 		if strings.Contains(err.Error(), "unauthorized") {
@@ -324,7 +333,7 @@ func checkController(cfg *config.Config) Layer {
 }
 
 func checkOutbound(client *singbox.Client, routeName, outbound string) Layer {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), process.QuickTimeout)
 	defer cancel()
 	if err := client.CheckOutbound(ctx, outbound); err != nil {
 		return Layer{Name: fmt.Sprintf("Outbound %s", routeName), Status: "FAIL", Detail: errString(err)}

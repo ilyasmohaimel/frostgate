@@ -114,6 +114,24 @@ func TestRecorderThrottlingRespectsWatchInterval(t *testing.T) {
 	}
 }
 
+func TestRecorderDoesNotRetainWritableDBAfterWrite(t *testing.T) {
+	withTempDataHome(t)
+	rec := NewRecorder(true, time.Hour, time.Minute)
+	if err := rec.Record([]Record{{Route: "route", Status: "up"}}); err != nil {
+		t.Fatal(err)
+	}
+	// A recorder may remain alive for the whole watch process, but its write
+	// handle must already be closed so another process can read history.
+	ro, err := OpenReadonly()
+	if err != nil {
+		t.Fatalf("readonly history open blocked behind recorder lifetime: %v", err)
+	}
+	defer ro.Close()
+	if records, err := ro.Query(0, "", ""); err != nil || len(records) != 1 {
+		t.Fatalf("readonly history query records=%v err=%v", records, err)
+	}
+}
+
 func TestOpenReadonlyNoCreate(t *testing.T) {
 	dataHome := withTempDataHome(t)
 	if _, err := OpenReadonly(); err != ErrNoHistory {

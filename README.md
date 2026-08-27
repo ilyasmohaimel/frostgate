@@ -128,7 +128,7 @@ frostgate benchmark --no-speed
 frostgate benchmark --network home
 ```
 
-The default download is 8 MiB per usable outbound from `https://speed.cloudflare.com/__down`. Approximate traffic is `benchmark.download_bytes × (unique usable outbounds + non-proxy endpoints)`. Use `--no-speed` on metered connections.
+The default download is 8 MiB per usable outbound from `https://speed.cloudflare.com/__down`. Approximate traffic is `benchmark.download_bytes × (unique usable proxy outbounds + explicit direct baselines)`. Use `--no-speed` on metered connections.
 
 Example:
 
@@ -237,7 +237,7 @@ endpoints:
     priority: 10
 ```
 
-`max_loss` is authoritative for partial loss from 0 to 100. A route is DOWN for loss only when every sample fails.
+`max_loss` is authoritative for partial loss from 0 to 100. A route is DOWN for loss only when every sample fails. `samples` is limited to 100 per snapshot.
 
 When a controller secret is configured, plaintext `http://` controllers are allowed only on loopback (`127.0.0.0/8`, `::1`, or `localhost`). Use HTTPS or a local tunnel for remote controllers.
 

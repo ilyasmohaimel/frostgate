@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/history"
 	"github.com/ilyasmohaimel/frostgate/internal/network"
 )
 
@@ -79,3 +84,41 @@ func TestNetworkCheckExitCodeReportsFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestCancelledWatchProbeIsNotRecordedAsOutage(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg := &config.Config{
+		Defaults: config.Defaults{
+			Timeout:        config.Duration{Duration: 5 * time.Second},
+			Samples:        1,
+			HealthyLatency: config.Duration{Duration: time.Second},
+			MaxJitter:      config.Duration{Duration: time.Second},
+		},
+		History:   config.HistoryConfig{Enabled: boolPtr(true)},
+		Endpoints: []config.Endpoint{{Name: "cancelled", Type: config.ProbeHTTP, URL: srv.URL}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	if code := watchJSON(ctx, cfg, history.DefaultProfile, time.Second, false); code != 0 {
+		t.Fatalf("cancelled watch code = %d", code)
+	}
+	if _, err := history.OpenReadonly(); !errors.Is(err, history.ErrNoHistory) {
+		t.Fatalf("cancelled watch created outage history: %v", err)
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }

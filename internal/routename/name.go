@@ -6,6 +6,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -29,14 +30,25 @@ func Validate(name string) error {
 	if len(name) > MaxLen {
 		return ErrTooLong
 	}
-	if strings.ContainsAny(name, "\n\r\t") {
-		return ErrControl
+	if err := ValidateControlCharacters(name); err != nil {
+		return err
 	}
 	if strings.ContainsAny(name, "/\\") {
 		return ErrSlash
 	}
 	if !valid.MatchString(name) {
 		return ErrInvalid
+	}
+	return nil
+}
+
+// ValidateControlCharacters applies the terminal-safe part of the naming
+// policy without imposing the ASCII route-tag policy on display names.
+func ValidateControlCharacters(name string) error {
+	for _, r := range name {
+		if unicode.IsControl(r) || r == 0x7f {
+			return ErrControl
+		}
 	}
 	return nil
 }

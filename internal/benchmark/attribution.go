@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/ilyasmohaimel/frostgate/internal/lockfile"
 )
 
 // SelectorController is the minimal clash-api surface needed to attribute
@@ -12,6 +14,12 @@ type SelectorController interface {
 	GetSelectedOutbound(ctx context.Context, selector string) (string, error)
 	SelectOutbound(ctx context.Context, selector, target string) error
 }
+
+type selectorResource interface {
+	SelectorResource(selector string) string
+}
+
+var fallbackSelectorGate = make(chan struct{}, 1)
 
 // MeasureSOCKSMbps adapts MeasureViaSOCKS to the single-return measure
 // signature used by BenchRoutes.
@@ -69,6 +77,14 @@ func BenchRoutesChecked(
 	if selector == "" {
 		selector = "frostgate-selector"
 	}
+	release, lockErr := acquireSelectorLock(ctx, ctrl, selector)
+	if lockErr != nil {
+		for _, route := range routes {
+			out = append(out, RouteThroughput{Route: route, NAReason: "selector lock unavailable"})
+		}
+		return out, fmt.Errorf("acquire selector lock: %w", lockErr)
+	}
+	defer release()
 	originalSelector, err := ctrl.GetSelectedOutbound(ctx, selector)
 	if err != nil || originalSelector == "" {
 		for _, route := range routes {
@@ -140,4 +156,23 @@ routeLoop:
 		return out, lifecycleErr
 	}
 	return out, nil
+}
+
+func acquireSelectorLock(ctx context.Context, ctrl SelectorController, selector string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if resource, ok := ctrl.(selectorResource); ok {
+		lock, err := lockfile.Acquire(ctx, "selector:"+resource.SelectorResource(selector))
+		if err != nil {
+			return nil, err
+		}
+		return func() { _ = lock.Close() }, nil
+	}
+	select {
+	case fallbackSelectorGate <- struct{}{}:
+		return func() { <-fallbackSelectorGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }

@@ -46,8 +46,6 @@ singbox:
   benchmark_proxy: 127.0.0.1:2080
 history:
   enabled: false
-custom_extension:
-  keep: true
 endpoints:
   - name: direct
     type: http
@@ -166,9 +164,6 @@ func TestInteractiveSetupAddPreservesManagedConfiguration(t *testing.T) {
 	var configDoc map[string]any
 	if err := yaml.Unmarshal(configData, &configDoc); err != nil {
 		t.Fatal(err)
-	}
-	if configDoc["custom_extension"].(map[string]any)["keep"] != true {
-		t.Fatal("unknown Frostgate config key was lost")
 	}
 	if configDoc["history"].(map[string]any)["enabled"] != false {
 		t.Fatal("history configuration was changed")
@@ -608,19 +603,15 @@ func TestManagedUnitRollbackRejectsReplacementSymlink(t *testing.T) {
 		}
 		return os.Symlink(target, path)
 	}
-	restore, created, err := writeManagedUnit(path, "/usr/bin/sing-box", dir)
-	if err != nil || created {
-		t.Fatalf("existing unit snapshot created:%v err:%v", created, err)
-	}
-	if err := restore(); err == nil || !strings.Contains(err.Error(), "symlinked systemd unit") {
-		t.Fatalf("symlink replacement was followed during rollback: %v", err)
+	if _, created, err := writeManagedUnit(path, "/usr/bin/sing-box", dir); err == nil || created || !strings.Contains(err.Error(), "does not prove Frostgate ownership") {
+		t.Fatalf("unowned unit was not rejected before replacement: created=%v err=%v", created, err)
 	}
 	got, err := os.ReadFile(target)
 	if err != nil || !bytes.Equal(got, outside) {
-		t.Fatalf("rollback changed replacement target: %q err=%v", got, err)
+		t.Fatalf("rejected unit changed replacement target: %q err=%v", got, err)
 	}
-	if link, err := os.Readlink(path); err != nil || link != target {
-		t.Fatalf("replacement symlink was overwritten: %q err=%v", link, err)
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("rejected unit was overwritten: %q err=%v", got, err)
 	}
 }
 
@@ -922,6 +913,59 @@ endpoints:
 	}
 	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, configData) {
 		t.Fatalf("external config changed: %q err=%v", got, err)
+	}
+}
+
+func TestAddRefusesUnownedDefaultSystemdUnit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	dir := setup.ConfigDir(home)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	secretPath := filepath.Join(dir, "controller-secret")
+	if err := os.WriteFile(secretPath, []byte("fixture-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sing-box.json"), []byte(existingManagedConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configData := strings.ReplaceAll(existingFrostgateConfig, "REPLACED_SECRET_FILE", secretPath)
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := setup.ServiceUnitPath("frostgate-singbox.service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte("[Unit]\nDescription=unrelated service\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSidecar, err := os.ReadFile(filepath.Join(dir, "sing-box.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &managedconfig.SidecarRunner{Validator: func([]byte) error {
+		t.Fatal("unowned unit reached sidecar transaction")
+		return nil
+	}}
+	if _, err := addManagedRoute(dir, configPath, "vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?security=reality&sni=example.com&pbk=fixture-key", "new-route", runner); err == nil || !strings.Contains(err.Error(), "does not prove Frostgate ownership") {
+		t.Fatalf("unowned default unit error = %v", err)
+	}
+	if got, err := os.ReadFile(configPath); err != nil || !bytes.Equal(got, beforeConfig) {
+		t.Fatalf("unowned unit changed Frostgate config: %q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "sing-box.json")); err != nil || !bytes.Equal(got, beforeSidecar) {
+		t.Fatalf("unowned unit changed managed state: %q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(unitPath); err != nil || string(got) != "[Unit]\nDescription=unrelated service\n" {
+		t.Fatalf("unowned unit changed: %q err=%v", got, err)
 	}
 }
 

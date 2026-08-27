@@ -55,11 +55,11 @@ func MeasureDirect(ctx context.Context, downloadURL string, bytes int64) (float6
 	if err != nil {
 		return 0, 0, err
 	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
 	}
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, boundedReadLimit(bytes, 1024*1024)))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, measurementReadLimit(bytes)))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -123,11 +123,11 @@ func MeasureViaSOCKS(ctx context.Context, socksAddr, downloadURL string, bytes i
 	if err != nil {
 		return 0, 0, err
 	}
-	defer func() { io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, 0, fmt.Errorf("http status %d", resp.StatusCode)
 	}
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, boundedReadLimit(bytes, 2*1024*1024)))
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, measurementReadLimit(bytes)))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -195,6 +195,13 @@ func boundedReadLimit(bytes, slack int64) int64 {
 		return math.MaxInt64
 	}
 	return bytes + slack
+}
+
+func measurementReadLimit(bytes int64) int64 {
+	if bytes <= 0 {
+		return DefaultBytes
+	}
+	return bytes
 }
 
 func hasBytesParam(u string) bool {

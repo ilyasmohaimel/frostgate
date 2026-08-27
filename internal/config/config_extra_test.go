@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -472,5 +473,116 @@ func TestProbeBudgetCoversEverySampleAndInterval(t *testing.T) {
 	cfg := &Config{Defaults: Defaults{Timeout: Duration{Duration: 5 * time.Second}, Samples: 4, SampleInterval: Duration{Duration: 150 * time.Millisecond}}}
 	if got, want := cfg.ProbeBudget(Endpoint{}), 21*time.Second+450*time.Millisecond; got != want {
 		t.Fatalf("ProbeBudget = %s, want %s", got, want)
+	}
+}
+
+func TestStrictConfigRejectsUnknownFieldsAtEveryOwnedLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"root", "unknown_root: true\n"},
+		{"defaults", "defaults:\n  timeuot: 1ns\n"},
+		{"singbox", "singbox:\n  controllr: http://127.0.0.1:9090\n"},
+		{"benchmark", "benchmark:\n  bytez: 1\n"},
+		{"history", "history:\n  retentoin: 1d\n"},
+		{"network_check", "network_check:\n  destiantions: []\n"},
+		{"endpoint", "endpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n    timeuot: 1s\n"},
+		{"nested_endpoint", "endpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n    options:\n      timeout: 1s\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeTemp(t, tc.body)); err == nil {
+				t.Fatal("unknown field was accepted")
+			} else if !strings.Contains(strings.ToLower(err.Error()), strings.TrimSuffix(strings.ToLower(tc.name), "_endpoint")) && tc.name != "nested_endpoint" {
+				// The exact decoder wording differs for custom Endpoint fields;
+				// all errors must still identify the offending field or its owned section.
+				if !strings.Contains(err.Error(), "unknown") && !strings.Contains(err.Error(), "not found") {
+					t.Fatalf("unclear unknown-field error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSampleCountLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value int
+		valid bool
+	}{
+		{"one", 1, true},
+		{"maximum", MaxSamples, true},
+		{"maximum-plus-one", MaxSamples + 1, false},
+		{"huge", math.MaxInt, false},
+		{"zero-defaults", 0, true},
+		{"negative", -1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf("defaults:\n  samples: %d\nendpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n", tc.value)
+			_, err := Load(writeTemp(t, body))
+			if (err == nil) != tc.valid {
+				t.Fatalf("samples=%d error=%v valid=%v", tc.value, err, tc.valid)
+			}
+		})
+	}
+	if _, err := Load(writeTemp(t, "endpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n    samples: 100\n")); err != nil {
+		t.Fatalf("endpoint maximum rejected: %v", err)
+	}
+}
+
+func TestConfigRejectsNonFiniteLossThresholds(t *testing.T) {
+	for _, value := range []string{".nan", ".inf", "-.inf"} {
+		for _, field := range []string{"defaults", "endpoint"} {
+			body := "endpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n"
+			if field == "defaults" {
+				body = "defaults:\n  max_loss: " + value + "\n" + body
+			} else {
+				body += "    max_loss: " + value + "\n"
+			}
+			if _, err := Load(writeTemp(t, body)); err == nil {
+				t.Fatalf("%s max_loss=%s was accepted", field, value)
+			}
+		}
+	}
+	for _, value := range []string{"0", "100", "12.5"} {
+		body := "defaults:\n  max_loss: " + value + "\nendpoints:\n  - name: route\n    type: tcp\n    host: example.com\n    port: 443\n"
+		if _, err := Load(writeTemp(t, body)); err != nil {
+			t.Fatalf("finite max_loss=%s rejected: %v", value, err)
+		}
+	}
+}
+
+func TestEndpointNamesRejectControlsButAcceptUnicode(t *testing.T) {
+	for _, name := range []string{"مرحبا", "中文 路由", "café 🚀", "route with spaces"} {
+		body := fmt.Sprintf("endpoints:\n  - name: %q\n    type: tcp\n    host: example.com\n    port: 443\n", name)
+		if _, err := Load(writeTemp(t, body)); err != nil {
+			t.Fatalf("safe endpoint name %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"bad\nname", "bad\rname", "bad\x1b[31m"} {
+		body := fmt.Sprintf("endpoints:\n  - name: %q\n    type: tcp\n    host: example.com\n    port: 443\n", name)
+		if _, err := Load(writeTemp(t, body)); err == nil {
+			t.Fatalf("control endpoint name %q was accepted", name)
+		}
+	}
+}
+
+func TestNextPriorityRejectsOverflow(t *testing.T) {
+	if got, err := NextPriority(20); err != nil || got != 30 {
+		t.Fatalf("NextPriority(20) = %d, %v", got, err)
+	}
+	if _, err := NextPriority(math.MaxInt); err == nil {
+		t.Fatal("MaxInt priority wrapped instead of failing")
+	}
+}
+
+func TestControllerValidationAcceptsUppercaseSchemeAndRejectsUserinfo(t *testing.T) {
+	valid := writeTemp(t, "singbox:\n  controller: HTTP://127.0.0.1:9090/\nendpoints:\n  - name: route\n    type: singbox\n    outbound: route\n")
+	if _, err := Load(valid); err != nil {
+		t.Fatalf("uppercase controller scheme rejected: %v", err)
+	}
+	invalid := writeTemp(t, "singbox:\n  controller: http://user:password@127.0.0.1:9090\nendpoints:\n  - name: route\n    type: singbox\n    outbound: route\n")
+	if _, err := Load(invalid); err == nil || strings.Contains(err.Error(), "password") {
+		t.Fatalf("userinfo controller result = %v", err)
 	}
 }

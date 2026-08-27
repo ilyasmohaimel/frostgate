@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/ilyasmohaimel/frostgate/internal/config"
+	"github.com/ilyasmohaimel/frostgate/internal/directhttp"
 	"github.com/ilyasmohaimel/frostgate/internal/health"
 	"github.com/ilyasmohaimel/frostgate/internal/metrics"
 	"github.com/ilyasmohaimel/frostgate/internal/ranking"
@@ -40,11 +42,11 @@ type Result struct {
 
 func (r Result) OK() bool { return r.Status != StatusDown }
 
-var httpClient = &http.Client{
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
+var httpClient = func() *http.Client {
+	client := directhttp.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return client
+}()
 
 func Run(ctx context.Context, cfg *config.Config) []Result {
 	results := make([]Result, 0, len(cfg.Endpoints))
@@ -233,8 +235,12 @@ func probeHTTP(ctx context.Context, e config.Endpoint, expectedStatus int) error
 	if urlStr == "" {
 		return fmt.Errorf("http probe missing url or host/port")
 	}
-	// Ensure scheme
-	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
+	// Ensure scheme without making scheme matching case-sensitive.
+	parsed, parseErr := url.Parse(urlStr)
+	if parseErr != nil {
+		return parseErr
+	}
+	if parsed.Scheme == "" {
 		urlStr = "https://" + urlStr
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
