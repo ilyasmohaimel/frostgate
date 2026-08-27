@@ -182,8 +182,8 @@ install_via_binary() {
   case "$OS/$ARCH" in
     linux/amd64) bin_name="${BINARY}-linux-amd64" ;;
     linux/arm64) bin_name="${BINARY}-linux-arm64" ;;
-    darwin/amd64) bin_name="${BINARY}-darwin-amd64" ;;
-    darwin/arm64) bin_name="${BINARY}-darwin-arm64" ;;
+    darwin/amd64) bin_name="${BINARY}-macos-amd64" ;;
+    darwin/arm64) bin_name="${BINARY}-macos-arm64" ;;
     *) echo "no prebuilt binary for $OS/$ARCH (only Linux and macOS amd64/arm64 are published); trying go install" >&2; return 2 ;;
   esac
   if [ "$VERSION" = "latest" ]; then

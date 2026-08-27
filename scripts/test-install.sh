@@ -234,13 +234,13 @@ check "wget binary path verifies and installs" $ok
 
 # --- Case 1c: macOS arm64 uses the published prebuilt binary ---
 reset_env
-SUMS="$WORK/sums.1c"; make_sums "$GOOD_SUM" "$SUMS" frostgate-darwin-arm64
+SUMS="$WORK/sums.1c"; make_sums "$GOOD_SUM" "$SUMS" frostgate-macos-arm64
 LOG="$WORK/darwin.log"; : > "$LOG"
 run_installer "PATH=$DARWINSHIMS" \
   "INSTALL_DIR=$WORK/bin" \
   "FT_MODE=ok" "FT_SUMS=$SUMS" "FT_BINARY=$FIXTURE/good-binary" "FT_LOG=$LOG"
 ok=0
-"$WORK/bin/frostgate" --version >/dev/null 2>&1 && grep -q "frostgate-darwin-arm64" "$LOG" && ok=1
+"$WORK/bin/frostgate" --version >/dev/null 2>&1 && grep -q "frostgate-macos-arm64" "$LOG" && ok=1
 check "macOS arm64 prebuilt binary installs" $ok
 
 # --- Case 2: checksum mismatch -> fail closed, old binary preserved ---

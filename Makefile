@@ -28,13 +28,13 @@ check: fmt vet test race ## fmt, vet, test, race, build
 run: ## Build and run
 	go run $(LDFLAGS) $(PKG)
 
-dist: ## Cross-compile static binaries (linux/amd64, linux/arm64, darwin/amd64, darwin/arm64)
+dist: ## Cross-compile static binaries (linux/amd64, linux/arm64, macos/amd64, macos/arm64)
 	mkdir -p dist
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-amd64 $(PKG)
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-linux-arm64 $(PKG)
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-darwin-amd64 $(PKG)
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-darwin-arm64 $(PKG)
-	cd dist && sha256sum $(BINARY)-linux-amd64 $(BINARY)-linux-arm64 $(BINARY)-darwin-amd64 $(BINARY)-darwin-arm64 > SHA256SUMS && cat SHA256SUMS
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-macos-amd64 $(PKG)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/$(BINARY)-macos-arm64 $(PKG)
+	cd dist && sha256sum $(BINARY)-linux-amd64 $(BINARY)-linux-arm64 $(BINARY)-macos-amd64 $(BINARY)-macos-arm64 > SHA256SUMS && cat SHA256SUMS
 
 clean: ## Remove build artifacts
 	rm -f $(BINARY) $(BINARY).exe /tmp/frostgate-check
